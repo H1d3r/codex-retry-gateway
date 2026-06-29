@@ -323,6 +323,10 @@ macOS / Linux: ~/.codex-retry-gateway
 
 ## 已验证事项
 
+- GitHub Actions `macos-smoke`
+  - 已新增 `macos-latest` 冒烟工作流
+  - 在 GitHub macOS runner 上直接执行 `node ./scripts/test-launch-ui-unix.mjs`
+  - 用来补足“本地没有 mac”时的 Unix 入口持续验证
 - `test-gateway-e2e.ps1`
   - 已通过
   - 验证 `/responses`、`/chat/completions`、`/v1/responses`、`/v1/chat/completions`
