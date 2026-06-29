@@ -648,6 +648,26 @@
      - `node .\scripts\test-gateway-e2e.mjs`
      - `node .\scripts\test-install-restore.mjs`
 
+33. 管理页运行状态脚注会把大量透传路径完整展开，导致 UI 爆长
+   - 现象：
+     - 当 gateway 代理真实前端站点时
+     - `运行状态` 脚注会把 `/assets/*`、`/login`、`/logo.png`、`/api/v1/settings/public` 等透传路径全部平铺出来
+     - 整块说明文字会被撑得很长，阅读体验很差
+   - 根因：
+     - 管理页脚注里的 `formatPathCounts()` 直接把所有路径计数 `join('，')`
+     - 没有做条目数收敛或摘要化
+   - 处理：
+     - 保留路径分布提示，但只展示按次数排序后的前 `3` 项
+     - 剩余条目统一收敛成 `其余 N 项`
+     - 进行中的代理请求路径说明继续保留，不改统计口径
+   - 验证：
+     - `node .\scripts\test-gateway-e2e.mjs`
+       - 新增“运行状态脚注应对过多透传路径做摘要收敛”断言
+       - 新增“不应把所有透传路径完整展开”断言
+       - 新增“进行中的代理请求路径仍应展示”断言
+     - `node --check .\gateway.mjs`
+     - `git diff --check`
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

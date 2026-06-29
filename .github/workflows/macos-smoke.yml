@@ -1,0 +1,28 @@
+name: macos-smoke
+
+on:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  pull_request:
+
+jobs:
+  launch-ui-unix-smoke:
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify Node.js version
+        run: node --version
+
+      - name: Run Unix launch-ui smoke test
+        run: node ./scripts/test-launch-ui-unix.mjs

@@ -3450,7 +3450,15 @@ function buildManagementHtml() {
         if (entries.length === 0) {
           return '无';
         }
-        return entries.map((entry) => entry[0] + ' x' + String(entry[1])).join('，');
+        const visibleEntries = entries.slice(0, 3);
+        const hiddenCount = entries.length - visibleEntries.length;
+        const visibleText = visibleEntries
+          .map((entry) => entry[0] + ' x' + String(entry[1]))
+          .join('，');
+        if (hiddenCount <= 0) {
+          return visibleText;
+        }
+        return visibleText + '，其余 ' + String(hiddenCount) + ' 项';
       }
 
       function escapeHtml(value) {

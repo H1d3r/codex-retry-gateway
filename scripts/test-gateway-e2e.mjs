@@ -418,15 +418,22 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     },
     metrics: {
       started_at: "2026-06-28T00:00:00.000Z",
-      total_proxy_request_count: 6,
+      total_proxy_request_count: 15,
       inspected_response_count: 4,
-      bypassed_proxy_request_count: 2,
+      bypassed_proxy_request_count: 9,
       bypassed_proxy_path_counts: {
         "/v1/models": 2,
+        "/assets/index-mL8x2mJx.js": 2,
+        "/assets/vendor-misc-DB0Q8XAf.css": 2,
+        "/login": 1,
+        "/logo.png": 1,
+        "/api/v1/settings/public": 1,
       },
       failed_proxy_request_count: 0,
-      active_proxy_request_count: 0,
-      active_proxy_path_counts: {},
+      active_proxy_request_count: 2,
+      active_proxy_path_counts: {
+        "/responses": 2,
+      },
       reasoning_516_count: 0,
       reasoning_516_ratio: 0,
       matched_response_count: 2,
@@ -619,6 +626,18 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   assert(
     elements.statsFootnote.textContent.includes("/v1/models"),
     "运行状态脚注应提示未纳入检查的透传路径",
+  );
+  assert(
+    elements.statsFootnote.textContent.includes("其余 3 项"),
+    "运行状态脚注应对过多透传路径做摘要收敛",
+  );
+  assert(
+    !elements.statsFootnote.textContent.includes("/api/v1/settings/public"),
+    "运行状态脚注不应把所有透传路径完整展开",
+  );
+  assert(
+    elements.statsFootnote.textContent.includes("/responses x2"),
+    "运行状态脚注应继续提示进行中的代理请求路径",
   );
   assert(
     elements.probeEnabledValue.textContent.includes("已开启"),

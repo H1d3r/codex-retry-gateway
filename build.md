@@ -102,6 +102,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\test-gateway-e2e.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\test-install-restore.ps1
 ```
 
+## GitHub Actions 验证
+
+- 工作流：`.github/workflows/macos-smoke.yml`
+- 目的：在 `macos-latest` runner 上补一层真实 macOS / Unix 入口冒烟
+- 当前命令：
+
+```bash
+node ./scripts/test-launch-ui-unix.mjs
+```
+
 ## 本机真实验证命令
 
 ```powershell
