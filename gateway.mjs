@@ -3130,6 +3130,145 @@ function buildManagementHtml() {
         font-family: "Cascadia Code", "Consolas", monospace;
         font-size: 0.92em;
       }
+
+      html[data-theme="dark"] {
+        color-scheme: dark;
+        --bg: #06111d;
+        --panel: #132236;
+        --panel-strong: #17283d;
+        --ink: #f4f8ff;
+        --muted: #94a3b8;
+        --accent: #20e6c3;
+        --accent-soft: rgba(32, 230, 195, 0.12);
+        --warn: #fb7185;
+        --line: rgba(148, 163, 184, 0.18);
+        --shadow: none;
+      }
+
+      html[data-theme="dark"] body {
+        background: #06111d;
+      }
+
+      html[data-theme="dark"] .hero,
+      html[data-theme="dark"] .card {
+        background: var(--panel);
+        border-color: var(--line);
+        box-shadow: none;
+        backdrop-filter: none;
+      }
+
+      html[data-theme="dark"] .hero {
+        background: #132236;
+      }
+
+      html[data-theme="dark"] .stat,
+      html[data-theme="dark"] .inline-toggle,
+      html[data-theme="dark"] .checkbox-chip,
+      html[data-theme="dark"] .table-wrap {
+        background: var(--panel-strong);
+        border-color: rgba(148, 163, 184, 0.16);
+      }
+
+      html[data-theme="dark"] .eyebrow,
+      html[data-theme="dark"] .tg-link {
+        color: var(--accent);
+        background: rgba(32, 230, 195, 0.08);
+        border-color: rgba(32, 230, 195, 0.2);
+      }
+
+      html[data-theme="dark"] input,
+      html[data-theme="dark"] textarea,
+      html[data-theme="dark"] select {
+        color: var(--ink);
+        background: #0b1728;
+        border-color: rgba(148, 163, 184, 0.22);
+      }
+
+      html[data-theme="dark"] input:focus,
+      html[data-theme="dark"] textarea:focus {
+        outline: 2px solid rgba(32, 230, 195, 0.28);
+        border-color: rgba(32, 230, 195, 0.5);
+      }
+
+      html[data-theme="dark"] .primary {
+        color: #03131f;
+        background: var(--accent);
+      }
+
+      html[data-theme="dark"] .secondary {
+        color: #fecdd3;
+        background: rgba(251, 113, 133, 0.12);
+        border: 1px solid rgba(251, 113, 133, 0.24);
+      }
+
+      html[data-theme="dark"] .log-output,
+      html[data-theme="dark"] .evidence-log-output {
+        background: #06111d;
+        border-color: rgba(32, 230, 195, 0.16);
+        color: #c7f9ef;
+      }
+
+      html[data-theme="dark"] th,
+      html[data-theme="dark"] td {
+        color: #cbd5e1;
+        border-bottom-color: rgba(148, 163, 184, 0.12);
+      }
+
+      html[data-theme="dark"] th {
+        color: var(--ink);
+        background: rgba(148, 163, 184, 0.08);
+      }
+
+      html[data-theme="dark"] .risk-note {
+        color: #cbd5e1;
+        background: #0f1d2f;
+        border-color: rgba(148, 163, 184, 0.14);
+      }
+
+      html[data-theme="dark"] .message[data-tone="error"] {
+        color: #fb7185;
+      }
+
+      .theme-toggle {
+        position: fixed;
+        left: 18px;
+        bottom: 18px;
+        z-index: 20;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 42px;
+        padding: 0 14px;
+        border-radius: 12px;
+        border: 1px solid rgba(31, 29, 26, 0.12);
+        background: rgba(255, 251, 245, 0.94);
+        color: var(--ink);
+        box-shadow: 0 10px 28px rgba(47, 34, 14, 0.16);
+        font-size: 14px;
+        font-weight: 800;
+      }
+
+      html[data-theme="dark"] .theme-toggle {
+        color: #e2e8f0;
+        background: #101827;
+        border-color: rgba(148, 163, 184, 0.14);
+        box-shadow: none;
+      }
+
+      .theme-toggle-icon {
+        color: #f59e0b;
+        font-size: 17px;
+        line-height: 1;
+      }
+
+      @media (max-width: 720px) {
+        .theme-toggle {
+          left: 12px;
+          bottom: 12px;
+          min-height: 38px;
+          padding: 0 12px;
+        }
+      }
     </style>
   </head>
   <body>
@@ -3146,7 +3285,7 @@ function buildManagementHtml() {
       </section>
 
       <div class="grid">
-        <section class="card">
+        <section class="card" id="statusSection">
           <div class="card-inner">
             <h2>运行状态</h2>
             <div class="stats">
@@ -3173,7 +3312,7 @@ function buildManagementHtml() {
           </div>
         </section>
 
-        <section class="card">
+        <section class="card" id="rulesSection">
           <div class="card-inner">
             <h2>拦截规则</h2>
             <form id="configForm">
@@ -3230,7 +3369,7 @@ function buildManagementHtml() {
           </div>
         </section>
 
-        <section class="card wide-card">
+        <section class="card wide-card" id="logsSection">
           <div class="card-inner">
             <h2>实时日志</h2>
             <p class="live-meta" id="logsMeta">正在读取日志...</p>
@@ -3238,7 +3377,7 @@ function buildManagementHtml() {
           </div>
         </section>
 
-        <section class="card wide-card">
+        <section class="card wide-card" id="modelSection">
           <div class="card-inner">
             <h2>模型家族一致性（被动探针）</h2>
             <p class="risk-note">
@@ -3282,7 +3421,7 @@ function buildManagementHtml() {
           </div>
         </section>
 
-        <section class="card wide-card">
+        <section class="card wide-card" id="probeSection">
           <div class="card-inner">
             <h2>主动探针</h2>
             <p class="risk-note">
@@ -3361,6 +3500,10 @@ function buildManagementHtml() {
         </section>
       </div>
     </div>
+    <button class="theme-toggle" id="themeToggleButton" type="button" aria-label="切换深浅色模式">
+      <span class="theme-toggle-icon" id="themeToggleIcon">☾</span>
+      <span id="themeToggleText">深色模式</span>
+    </button>
 
     <script>
       const ui = ${JSON.stringify(uiConfig)};
@@ -3416,7 +3559,11 @@ function buildManagementHtml() {
         statsFootnote: document.getElementById('statsFootnote'),
         logsMeta: document.getElementById('logsMeta'),
         logsOutput: document.getElementById('logsOutput'),
+        themeToggleButton: document.getElementById('themeToggleButton'),
+        themeToggleIcon: document.getElementById('themeToggleIcon'),
+        themeToggleText: document.getElementById('themeToggleText'),
       };
+      const themeStorageKey = 'codexRetryGatewayTheme';
       let hasLoadedForm = false;
       let lastLogSeq = 0;
       let lastGatewayStartedAt = null;
@@ -3428,6 +3575,50 @@ function buildManagementHtml() {
       let probeSamplesSignature = '';
       const openSuspiciousEvidenceSampleKeys = new Set();
       const openProbeEvidenceSampleKeys = new Set();
+
+      function applyTheme(theme) {
+        const nextTheme = theme === 'dark' ? 'dark' : 'light';
+        const themeRoot = document.documentElement || document.body;
+        if (themeRoot?.dataset) {
+          themeRoot.dataset.theme = nextTheme;
+        }
+        if (refs.themeToggleIcon) {
+          refs.themeToggleIcon.textContent = nextTheme === 'dark' ? '☀' : '☾';
+        }
+        if (refs.themeToggleText) {
+          refs.themeToggleText.textContent = nextTheme === 'dark' ? '浅色模式' : '深色模式';
+        }
+        if (refs.themeToggleButton) {
+          refs.themeToggleButton.setAttribute(
+            'aria-label',
+            nextTheme === 'dark' ? '切换到浅色模式' : '切换到深色模式',
+          );
+        }
+      }
+
+      function getStoredTheme() {
+        try {
+          return window.localStorage.getItem(themeStorageKey);
+        } catch {
+          return null;
+        }
+      }
+
+      function storeTheme(theme) {
+        try {
+          window.localStorage.setItem(themeStorageKey, theme);
+        } catch {
+          // 浏览器禁用本地存储时，当前页面仍可正常切换主题。
+        }
+      }
+
+      function toggleTheme() {
+        const themeRoot = document.documentElement || document.body;
+        const currentTheme = themeRoot?.dataset?.theme === 'dark' ? 'dark' : 'light';
+        const nextTheme = currentTheme === 'dark' ? 'light' : 'dark';
+        applyTheme(nextTheme);
+        storeTheme(nextTheme);
+      }
 
       function buildProbeSampleKey(sample) {
         return JSON.stringify({
@@ -4049,6 +4240,10 @@ function buildManagementHtml() {
       }
 
       refs.form.addEventListener('submit', saveConfig);
+      applyTheme(getStoredTheme());
+      if (refs.themeToggleButton) {
+        refs.themeToggleButton.addEventListener('click', toggleTheme);
+      }
       refs.interceptStreamingInput.addEventListener('change', () => {
         syncInterceptModeValueFromForm();
         if (!refs.interceptStreamingInput.checked && !refs.interceptNonStreamingInput.checked) {
