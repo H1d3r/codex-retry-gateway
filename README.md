@@ -1,5 +1,7 @@
 # Codex Retry Gateway
 
+TG群：  https://t.me/AI_INPUT_IM
+
 一个不依赖 `cc-switch` 路由模式的独立本地网关。
 
 项目真源说明：
