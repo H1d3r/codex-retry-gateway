@@ -3172,7 +3172,8 @@ async function run() {
         uiHtml.includes('value="final_answer_only_high_xhigh"') &&
         uiHtml.includes("final answer only") &&
         uiHtml.includes("reasoning_tokens 长度（推荐）") &&
-        uiHtml.includes("final answer only（实验）") &&
+        uiHtml.includes("final answer only（实验，排除 0）") &&
+        uiHtml.includes("排除普通 reasoning_tokens=0") &&
         uiHtml.includes("不建议替代 516 主拦截"),
       "管理页缺少 reasoning_tokens 推荐主规则与 final answer only 实验规则提示",
     );
@@ -4144,7 +4145,7 @@ async function run() {
       "保存 final answer only 模式后，配置日志应明确显示 intercept_rule_mode",
     );
 
-    const finalOnlyHighResponse = await fetch(
+    const finalOnlyHighZeroResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
       {
         method: "POST",
@@ -4158,8 +4159,42 @@ async function run() {
       },
     );
     assert(
-      finalOnlyHighResponse.status === 502,
-      `high final answer only 应被拦截: ${finalOnlyHighResponse.status}`,
+      finalOnlyHighZeroResponse.status === 200,
+      `普通 high final answer only reasoning_tokens=0 应放行观察: ${finalOnlyHighZeroResponse.status}`,
+    );
+    const finalOnlyHighNullResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          reasoning: { effort: "high" },
+          test_omit_reasoning_tokens: true,
+          test_include_final_answer_only: true,
+        }),
+      },
+    );
+    assert(
+      finalOnlyHighNullResponse.status === 502,
+      `high final answer only reasoning_tokens=null 仍应被拦截: ${finalOnlyHighNullResponse.status}`,
+    );
+    const finalOnlyHighPositiveResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          reasoning: { effort: "high" },
+          test_reasoning_tokens: 85,
+          test_include_final_answer_only: true,
+        }),
+      },
+    );
+    assert(
+      finalOnlyHighPositiveResponse.status === 502,
+      `high final answer only reasoning_tokens=85 仍应被拦截: ${finalOnlyHighPositiveResponse.status}`,
     );
     const compactionFinalOnlyZeroResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
@@ -4273,7 +4308,7 @@ async function run() {
       compactionExemptPattern?.status === "observe_only",
       `非 0 的 context_compaction 候选组合不应标记 context_compaction_exempt: ${JSON.stringify(compactionExemptPattern)}`,
     );
-    const finalOnlyHighStreamResponse = await fetch(
+    const finalOnlyHighStreamZeroResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
       {
         method: "POST",
@@ -4288,8 +4323,26 @@ async function run() {
       },
     );
     assert(
-      finalOnlyHighStreamResponse.status === 502,
-      `流式 high final answer only 应被拦截: ${finalOnlyHighStreamResponse.status}`,
+      finalOnlyHighStreamZeroResponse.status === 200,
+      `流式 high final answer only reasoning_tokens=0 应放行观察: ${finalOnlyHighStreamZeroResponse.status}`,
+    );
+    const finalOnlyHighStreamPositiveResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          reasoning: { effort: "high" },
+          stream: true,
+          test_reasoning_tokens: 85,
+          test_include_final_answer_only: true,
+        }),
+      },
+    );
+    assert(
+      finalOnlyHighStreamPositiveResponse.status === 502,
+      `流式 high final answer only reasoning_tokens=85 仍应被拦截: ${finalOnlyHighStreamPositiveResponse.status}`,
     );
     const finalOnlyMediumResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
@@ -5212,11 +5265,11 @@ async function run() {
       "gpt-5.4 家族 rebuild_suspected_count 统计不正确",
     );
     assert(
-      familyBreakdown["gpt-5.5"]?.consistency?.total_checked === 18,
+      familyBreakdown["gpt-5.5"]?.consistency?.total_checked === 21,
       `gpt-5.5 家族 total_checked 统计不正确: ${familyBreakdown["gpt-5.5"]?.consistency?.total_checked}`,
     );
     assert(
-      familyBreakdown["gpt-5.5"]?.consistency?.matched === 17,
+      familyBreakdown["gpt-5.5"]?.consistency?.matched === 20,
       "gpt-5.5 家族 matched 统计不正确",
     );
     assert(
@@ -5228,7 +5281,7 @@ async function run() {
       "gpt-5.5 家族 unknown 统计不正确",
     );
     assert(
-      Math.abs(familyBreakdown["gpt-5.5"]?.consistency?.match_ratio - 17 / 18) <
+      Math.abs(familyBreakdown["gpt-5.5"]?.consistency?.match_ratio - 20 / 21) <
         1e-9,
       "gpt-5.5 家族声明一致率统计不正确",
     );

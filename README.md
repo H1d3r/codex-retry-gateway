@@ -16,7 +16,8 @@ TG群：[https://t.me/AI_INPUT_IM](https://t.me/AI_INPUT_IM)
 - 非流式命中默认集合 `reasoning_tokens = 516 / 1034 / 1552` 时，默认先在网关内部重试，超过上限后才返回 `502`
 - 流式命中时默认先缓存并判断；一旦命中默认集合 `516 / 1034 / 1552`，默认先在网关内部重试，超过上限后才统一返回 `502`
 - 拦截规则支持二选一：默认并推荐 `reasoning_tokens` 长度模式；`final_answer_only_high_xhigh` 仅作为实验收窄规则，不建议替代默认 516/1034/1552 主拦截
-- 只有显式 `context_compaction` 且 `reasoning_tokens=0` 的压缩响应可豁免拦截；`remote_compaction_v2` 仅是 beta feature 标记，普通 turn 仍按当前规则命中并内部重试
+- `final_answer_only_high_xhigh` 排除普通 `reasoning_tokens=0`，这类样本只观察落盘；`reasoning_tokens=null/缺失` 或非 0 的 high/xhigh final answer only 仍可命中实验规则
+- 只有显式 `context_compaction` 且 `reasoning_tokens=0` 的压缩响应可豁免拦截；`remote_compaction_v2` 仅是 beta feature 标记，普通 turn 的 516/1034/1552 仍按 `reasoning_tokens` 主规则命中并内部重试
 - 默认同时拦截 root 路径和 `/v1` 路径：
   - `/responses`
   - `/chat/completions`
@@ -226,7 +227,7 @@ Issue #11 收口说明：
 - 日常恢复优先用 UI；`restore-codex-config.ps1` 作为脚本级应急回滚入口保留
 - UI 恢复不会再额外拉起恢复子进程，而是由当前 gateway 直接完成恢复并退出
 - 统计口径默认按“本次 gateway 启动以来”累计
-- 当前规则命中总数表示命中当前拦截规则的次数，不等于实际拦截次数；默认规则是 `reasoning_equals`，切到 `final_answer_only_high_xhigh` 后则按 high/xhigh 的 final answer only 结构计数
+- 当前规则命中总数表示命中当前拦截规则的次数，不等于实际拦截次数；默认规则是 `reasoning_equals`，切到 `final_answer_only_high_xhigh` 后则按 high/xhigh 的 final answer only 结构计数，并排除普通 `reasoning_tokens=0`
 - 实际拦截占比 = 实际拦截总数 / 被检查响应总数
 - 关闭某一类拦截后，该类命中仍会继续计入规则命中与模型一致性观测，但不会计入实际拦截
 - `guard_retry_attempts` 对命中当前拦截规则且会被实际拦截的响应生效；开启 `retry_upstream_capacity_errors` 后，也对指定上游 capacity 错误生效
@@ -328,7 +329,7 @@ macOS / Linux: ~/.codex-retry-gateway/config/config.json
 - `intercept_rule_mode`
   - 默认并推荐 `reasoning_tokens`
   - `reasoning_tokens`：稳定主规则，命中 `reasoning_equals` 即视为当前规则命中；真实使用中 516 拦截仍可能直接影响任务正确性
-  - `final_answer_only_high_xhigh`：实验收窄规则，仅当 `reasoning.effort` 为 `high` / `xhigh`，且响应结构是 `final answer only`、未观察到 commentary、无 tool call、无 reasoning item 时命中；它可能漏掉仍影响正确性的 516 样本，不建议替代默认 516/1034/1552 主拦截
+  - `final_answer_only_high_xhigh`：实验收窄规则，仅当 `reasoning.effort` 为 `high` / `xhigh`，响应结构是 `final answer only`、未观察到 commentary、无 tool call、无 reasoning item，且 `reasoning_tokens` 为 `null/缺失` 或非 0 时命中；普通 `reasoning_tokens=0` 只观察落盘，不触发该实验规则
   - 两个模式二选一；效果不确定或以任务正确性优先时，使用 `reasoning_tokens`
   - `request_kind=context_compaction` 只有在 `reasoning_tokens=0` 时豁免；`516/1034/1552` 等命中值仍按当前规则处理，并受 `guard_retry_attempts` 控制
 - `intercept_streaming`

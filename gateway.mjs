@@ -6480,9 +6480,9 @@ function buildManagementHtml() {
                 </div>
                 <div class="inline-toggle rule-mode-toggle">
                   <input id="interceptRuleModeFinalOnlyInput" name="intercept_rule_mode" type="radio" value="final_answer_only_high_xhigh" />
-                  <label for="interceptRuleModeFinalOnlyInput">final answer only（实验）</label>
+                  <label for="interceptRuleModeFinalOnlyInput">final answer only（实验，排除 0）</label>
                 </div>
-                <div class="hint">推荐使用 reasoning_tokens；final answer only 仅作实验收窄规则，可能漏掉仍影响正确性的 516 样本，不建议替代 516 主拦截。</div>
+                <div class="hint">推荐使用 reasoning_tokens；final answer only 仅作实验收窄规则，排除普通 reasoning_tokens=0，可能漏掉仍影响正确性的 516 样本，不建议替代 516 主拦截。</div>
               </div>
 
               <div class="field">
@@ -9068,7 +9068,7 @@ async function handleManagementRequest(runtime, req, res, requestUrl) {
     scheduleActiveProbes(runtime);
     const ruleTarget =
       nextConfig.intercept_rule_mode === INTERCEPT_RULE_MODE_FINAL_ONLY_HIGH_XHIGH
-        ? "final_answer_only_high_xhigh efforts=high,xhigh"
+        ? "final_answer_only_high_xhigh efforts=high,xhigh exclude_reasoning_tokens=0"
         : `reasoning_equals=${nextConfig.reasoning_equals.join(",")}`;
     runtime.logger(
       `[config] updated intercept_rule_mode=${nextConfig.intercept_rule_mode} rule_target=${ruleTarget} retry_upstream_capacity_errors=${nextConfig.retry_upstream_capacity_errors !== false} endpoints=${nextConfig.endpoints.join(",")}`,
@@ -9314,6 +9314,10 @@ function isContextCompactionExemptReasoning(reasoning) {
   return reasoning === 0;
 }
 
+function shouldInterceptFinalAnswerOnlyReasoning(reasoning) {
+  return reasoning !== 0;
+}
+
 function buildInterceptRuleMatch(config, reasoning, reasoningSample, structure) {
   const mode = normalizeInterceptRuleMode(config?.intercept_rule_mode);
   if (
@@ -9333,12 +9337,14 @@ function buildInterceptRuleMatch(config, reasoning, reasoningSample, structure) 
   if (mode === INTERCEPT_RULE_MODE_FINAL_ONLY_HIGH_XHIGH) {
     const effort = normalizeReasoningEffort(reasoningSample?.request_reasoning_effort);
     const finalAnswerOnly = isFinalAnswerOnlyStructure(structure);
+    const reasoningAllowed = shouldInterceptFinalAnswerOnlyReasoning(reasoning);
     return {
       mode,
-      matched: finalAnswerOnly && FINAL_ONLY_INTERCEPT_EFFORTS.has(effort),
+      matched: finalAnswerOnly && reasoningAllowed && FINAL_ONLY_INTERCEPT_EFFORTS.has(effort),
       reasonForLog:
         `final_answer_only=${finalAnswerOnly ? "true" : "false"} ` +
-        `effort=${effort || "unknown"} reasoning_tokens=${reasoning}`,
+        `effort=${effort || "unknown"} reasoning_tokens=${reasoning} ` +
+        `zero_reasoning_excluded=${reasoning === 0 ? "true" : "false"}`,
       blockedReasoning: reasoning,
     };
   }
