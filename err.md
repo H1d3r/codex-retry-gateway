@@ -129,6 +129,42 @@
   - 只有 `context_compaction + reasoning_tokens=0` 才写 `intercept_exempt_reason=context_compaction`
   - `null`、`18`、`516/1034/1552` 等其它值不走压缩豁免，仍按当前拦截规则处理
 
+## 2026-07-02 final answer only 实验规则普通 0 误伤风险过高
+
+### 现象
+
+- 用户反馈 `final_answer_only_high_xhigh` 可能出现“要么大量拦截，要么几乎不拦截”的极端表现。
+- 本机样本显示普通 high/xhigh 请求里也会出现 `final_answer_only=true + reasoning_tokens=0`。
+- 当前没有足够公开证据证明普通 `reasoning_tokens=0` 一定等价于降智；把 0 纳入实验硬拦截会明显提高误伤风险。
+
+### 根因
+
+- 旧实验规则只要求：
+  - `reasoning.effort=high/xhigh`
+  - `final_answer_only=true`
+  - 未观察到 commentary / tool call / reasoning item
+- 该规则没有区分 `reasoning_tokens=0` 与 `reasoning_tokens=null/非 0`。
+- `reasoning_tokens=0` 在压缩和普通 turn 中都可能出现，单独作为硬拦截依据证据不足。
+
+### 处理
+
+- `final_answer_only_high_xhigh` 规则排除普通 `reasoning_tokens=0`：
+  - 普通 `0 + final_answer_only + high/xhigh` 只观察落盘，不触发该实验规则。
+  - `null/缺失 + final_answer_only + high/xhigh` 仍可命中。
+  - 非 0 `reasoning_tokens + final_answer_only + high/xhigh` 仍可命中。
+- 既有 `context_compaction + reasoning_tokens=0` 压缩豁免保持不变。
+- `reasoning_tokens` 主规则不变，516/1034/1552 仍按默认主规则处理。
+
+### 验证
+
+- 红测：
+  - `node .\scripts\test-gateway-e2e.mjs`
+  - 先失败在 `普通 high final answer only reasoning_tokens=0 应放行观察: 502`
+- 修复后：
+  - `node --check .\gateway.mjs`
+  - `node --check .\scripts\test-gateway-e2e.mjs`
+  - `node .\scripts\test-gateway-e2e.mjs`
+
 ## 2026-07-01 新增 final answer only 规则样本后，模型家族精确统计需要同步
 
 ### 现象
