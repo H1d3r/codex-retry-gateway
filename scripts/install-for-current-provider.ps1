@@ -2,13 +2,36 @@ param(
   [string]$CodexConfigPath = "$HOME\.codex\config.toml",
   [string]$StateRoot = "$HOME\.codex-retry-gateway",
   [string]$ListenHost = "127.0.0.1",
-  [int]$ListenPort = 4610
+  [int]$ListenPort = 4610,
+  [switch]$InternalFromLaunchUi
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot "common.ps1")
+
+if (-not $InternalFromLaunchUi) {
+  $null = & (Join-Path $PSScriptRoot "launch-ui.ps1") `
+    -CodexConfigPath $CodexConfigPath `
+    -StateRoot $StateRoot `
+    -ListenHost $ListenHost `
+    -ListenPort $ListenPort `
+    -NoOpen
+  $resultPaths = Get-GatewayStatePaths -StateRoot $StateRoot
+  $resultState = Read-JsonFile -Path $resultPaths.StatePath
+  $resultGatewayConfig = Read-JsonFile -Path $resultPaths.ConfigPath
+  if ($null -eq $resultState -or $null -eq $resultGatewayConfig) {
+    throw "Gateway install completed without readable state/config files."
+  }
+  Write-Output "Installed Codex Retry Gateway"
+  Write-Output "provider=$([string]$resultState.provider_name)"
+  Write-Output "upstream=$([string]$resultState.original_base_url)"
+  Write-Output "gateway=$(Get-GatewayBaseUrlFromConfig -GatewayConfig $resultGatewayConfig)"
+  Write-Output "config=$($resultPaths.ConfigPath)"
+  Write-Output "backup=$([string]$resultState.latest_backup_path)"
+  return
+}
 
 function Get-OptionalPropertyValue {
   param(
@@ -43,11 +66,20 @@ if (-not (Test-Path -LiteralPath $CodexConfigPath)) {
 $providerContext = Get-CodexProviderContext -CodexConfigPath $CodexConfigPath
 $localGatewayBaseUrl = "http://{0}:{1}" -f $ListenHost, $ListenPort
 $existingState = Read-JsonFile -Path $paths.StatePath
+$existingGatewayConfig = Read-JsonFile -Path $paths.ConfigPath
+$existingStateMatchesProvider = Test-GatewayInstallIdentity `
+  -State $existingState `
+  -ProviderName $providerContext.ProviderName `
+  -CodexConfigPath $CodexConfigPath
 
 $originalBaseUrl = $providerContext.CurrentBaseUrl
 if ($providerContext.CurrentBaseUrl -eq $localGatewayBaseUrl) {
-  if ($null -eq $existingState -or [string]::IsNullOrWhiteSpace([string]$existingState.original_base_url)) {
-    throw "Provider already points to the local gateway, but original_base_url is missing from state."
+  if (
+    $null -eq $existingState -or
+    [string]::IsNullOrWhiteSpace([string]$existingState.original_base_url) -or
+    (-not $existingStateMatchesProvider)
+  ) {
+    throw "Provider already points to the local gateway, but no matching install state can supply original_base_url."
   }
   $originalBaseUrl = [string]$existingState.original_base_url
 }
@@ -56,10 +88,28 @@ if ($originalBaseUrl -eq $localGatewayBaseUrl) {
   throw "A real upstream_base_url could not be determined."
 }
 
-$backupPath = Join-Path $paths.BackupDir ("config-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".toml")
-Copy-Item -LiteralPath $CodexConfigPath -Destination $backupPath -Force
+$existingBackupProperty = if ($existingState) { $existingState.PSObject.Properties["latest_backup_path"] } else { $null }
+$backupPath = if (
+  $existingStateMatchesProvider -and
+  $null -ne $existingBackupProperty -and
+  -not [string]::IsNullOrWhiteSpace([string]$existingBackupProperty.Value) -and
+  (Test-Path -LiteralPath ([string]$existingBackupProperty.Value) -PathType Leaf)
+) {
+  [string]$existingBackupProperty.Value
+} else {
+  ""
+}
+if ([string]::IsNullOrWhiteSpace($backupPath) -and $providerContext.CurrentBaseUrl -ne $localGatewayBaseUrl) {
+  $backupTimestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+  $backupSuffix = 0
+  do {
+    $backupSuffixText = if ($backupSuffix -eq 0) { "" } else { "-$backupSuffix" }
+    $backupPath = Join-Path $paths.BackupDir ("config-$backupTimestamp$backupSuffixText.toml")
+    $backupSuffix += 1
+  } while (Test-Path -LiteralPath $backupPath)
+  Copy-Item -LiteralPath $CodexConfigPath -Destination $backupPath
+}
 
-$existingGatewayConfig = Read-JsonFile -Path $paths.ConfigPath
 $defaultEndpoints = @("/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions")
 $mergedEndpoints = @()
 foreach ($endpoint in @(
@@ -117,8 +167,10 @@ try {
     -LogPath $paths.LogPath `
     -RestartIfRunning
 
+  $installedAt = (Get-Date).ToString("o")
   $state = [ordered]@{
-    installed_at        = (Get-Date).ToString("o")
+    installed_at        = $installedAt
+    last_started_at     = $installedAt
     codex_config_path   = $CodexConfigPath
     provider_name       = $providerContext.ProviderName
     original_base_url   = $originalBaseUrl

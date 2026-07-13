@@ -18,6 +18,9 @@ allowed_operations:
   - edit
   - test
   - local-review
+  - commit
+  - push
+  - pr
 executor_enforcement: tdd-local-verification-no-live-gateway-restart
 selected_business_path: external-project-node-gateway-development
 session_plan_ref: docs/plans/sessions/crg-gpt56-config-recovery.md
@@ -97,40 +100,53 @@ change_contract:
     - node .\scripts\test-install-restore.mjs
     - node --check .\gateway.mjs
     - node --check .\scripts\admin-lib.mjs
-  sibling_regression_guard: pending
+  sibling_regression_guard: passed
 ```
 
 ## Agent Lifecycle
 
 ```yaml
-proposal_mode: delegated-agents
+proposal_mode: delegated-agents-timeout-then-fresh-bounded-review
 superpowers_skill: superpowers:brainstorming
-actual_agent_count: 2
+actual_agent_count: 6
 agent_lifecycle:
   budget:
-    max_total_agents: 2
+    max_total_agents: 6
     max_new_agents_per_round: 2
-    actual_agent_count: 2
+    actual_agent_count: 6
   spawn_preconditions:
     dispatch_plan_ref: docs/plans/sessions/crg-gpt56-config-recovery-dispatch.yml
     reclaim_before_spawn: not-needed-zero-open
     open_agent_count_before_dispatch: 0
   completion_status:
-    completed: []
+    completed:
+      - 019f5b25-b934-7d60-8473-7b6d12f31efa
+      - 019f5b25-cd52-7b13-8028-c4b53539d99c
     idle: []
-    timeout: []
+    timeout:
+      - 019f5ad8-cbcb-7070-940a-ff8c8ce73006
+      - 019f5ad8-dfda-7031-9306-75da4cb71b0f
+      - 019f5ae8-28d2-7953-9d14-29883d90e2e5
+      - 019f5ae8-3d0c-71e1-a881-6fdaac802d03
     failed: []
-  closed_agent_refs: []
+  closed_agent_refs:
+    - 019f5ad8-cbcb-7070-940a-ff8c8ce73006
+    - 019f5ad8-dfda-7031-9306-75da4cb71b0f
+    - 019f5ae8-28d2-7953-9d14-29883d90e2e5
+    - 019f5ae8-3d0c-71e1-a881-6fdaac802d03
+    - 019f5b25-b934-7d60-8473-7b6d12f31efa
+    - 019f5b25-cd52-7b13-8028-c4b53539d99c
+  timeout_handling: four-timeouts-closed-then-two-fresh-reviewers-completed-with-final-ready-verdicts
   closeout_rule: all-completed-idle-timeout-agents-closed-or-owner-exception
 ```
 
 ## Delivery Governance
 
 ```yaml
-delivery_mode: local-implementation-no-live-apply
-tracking: not-requested
+delivery_mode: local-verification-then-pr-no-live-apply
+tracking: https://github.com/nonononull/codex-retry-gateway/issues/24
 branch: codex/gpt56-integration-state
-review: bounded-agent-review-plus-local-tests
+review: two-completed-bounded-reviewers-plus-local-tests
 ci: local-verification-only
 merge: not-in-current-scope
 ```
@@ -141,8 +157,9 @@ merge: not-in-current-scope
 task_registration_status: owner-approved-external-project-warning-mode
 owner_scope_ref: user:2026-07-13-ui-owned-by-codex-start-implementation
 main_thread_confirmation: approved
-tracking_issue_required: false
-registration_exception_reason: 当前仅做本地实现与验证，用户尚未要求 GitHub issue/PR/merge；不修改 AI Growth OS registry。
+tracking_issue_required: true
+tracking_issue_ref: https://github.com/nonononull/codex-retry-gateway/issues/24
+registration_exception_reason: 用户已要求提交并创建 PR；已在 PR 前补 GitHub tracking issue，不修改 AI Growth OS registry。
 source_edit_admission: approved-by-owner-with-project-native-plan
 ```
 
@@ -151,27 +168,49 @@ source_edit_admission: approved-by-owner-with-project-native-plan
 ```yaml
 protected_feature_replay:
   required: true
+  status: passed
   baseline_ref: git:827c918
-  completion_status: planned
-  protected_features:
+  known_good_features:
     - feature: reasoning-tokens-formula-and-516-interception
-      baseline_evidence: scripts/test-gateway-e2e.mjs existing formula/manual/516 cases
-      replay_command: node .\scripts\test-gateway-e2e.mjs
+      baseline_evidence_ref: git:827c918:scripts/test-gateway-e2e.mjs
+      post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
+      expected_result: PASS codex-retry-gateway e2e
+      post_change_replay_ref: local:2026-07-13:test-gateway-e2e
+      actual_result: PASS codex-retry-gateway e2e
+      owner_visible_status: passed
+      regression_status: passed
     - feature: final-answer-only-high-xhigh-and-zero-exemption
-      baseline_evidence: scripts/test-gateway-e2e.mjs existing final-only and compaction cases
-      replay_command: node .\scripts\test-gateway-e2e.mjs
+      baseline_evidence_ref: git:827c918:scripts/test-gateway-e2e.mjs
+      post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
+      expected_result: PASS codex-retry-gateway e2e
+      post_change_replay_ref: local:2026-07-13:test-gateway-e2e
+      actual_result: PASS codex-retry-gateway e2e
+      owner_visible_status: passed
+      regression_status: passed
     - feature: continuation-recovery-folding-and-retry-limit
-      baseline_evidence: PR 23 merged at git:827c918
-      replay_command: node .\scripts\test-gateway-e2e.mjs
+      baseline_evidence_ref: PR-23@git:827c918
+      post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
+      expected_result: PASS codex-retry-gateway e2e
+      post_change_replay_ref: local:2026-07-13:test-gateway-e2e
+      actual_result: PASS codex-retry-gateway e2e
+      owner_visible_status: passed
+      regression_status: passed
     - feature: install-backup-and-restore-original-config
-      baseline_evidence: scripts/test-install-restore.mjs and scripts/test-launch-ui*.mjs
-      replay_command: node .\scripts\test-install-restore.mjs
+      baseline_evidence_ref: git:827c918:scripts/test-install-restore.mjs
+      post_change_replay_plan_ref: node .\scripts\test-install-restore.mjs
+      expected_result: PASS install-restore flow
+      post_change_replay_ref: local:2026-07-13:test-install-restore
+      actual_result: PASS install-restore flow
+      owner_visible_status: passed
+      regression_status: passed
     - feature: windows-and-unix-first-launch
-      baseline_evidence: scripts/test-launch-ui.mjs and scripts/test-launch-ui-unix.mjs
-      replay_command: node .\scripts\test-launch-ui.mjs; node .\scripts\test-launch-ui-unix.mjs
-  reject_on:
-    - any protected replay failure
-    - any real gateway restart during tests
+      baseline_evidence_ref: git:827c918:scripts/test-launch-ui.mjs+scripts/test-launch-ui-unix.mjs
+      post_change_replay_plan_ref: node .\scripts\test-launch-ui.mjs; node .\scripts\test-launch-ui-unix.mjs
+      expected_result: PASS launch-ui flow and PASS unix launch-ui flow
+      post_change_replay_ref: local:2026-07-13:test-launch-ui-windows-and-unix
+      actual_result: PASS launch-ui flow and PASS unix launch-ui flow
+      owner_visible_status: passed
+      regression_status: passed
 ```
 
 ## Post-Implementation Review
@@ -179,19 +218,83 @@ protected_feature_replay:
 ```yaml
 post_implementation_review:
   required: true
-  same_question: GPT-5.6 观测与幂等恢复是否完整且未改变既有拦截、续写、备份和恢复语义
-  review_plan:
-    - model-contract-reviewer
-    - recovery-idempotency-reviewer
-  completion_status: pending
+  review_phase: post-implementation
+  same_question_ref: session-plan:crg-gpt56-config-recovery#same-question-review
+  review_scope: whole-source
+  owner_requested_scope: whole-source
+  baseline_snapshot_ref: git:827c918
+  implementation_snapshot_ref: worktree:codex/gpt56-integration-state
+  last_mutation_ref: worktree:failed-start-pid-write-cleanup-final
+  review_after_last_mutation: true
+  changed_files_ref: git-diff:origin/main
+  reviewer_input_bundle_ref: docs/plans/sessions/crg-gpt56-config-recovery.md
+  required_agent_count: 2
+  returned_agent_count: 2
+  reviewer_output_refs:
+    - agent:019f5b25-b934-7d60-8473-7b6d12f31efa#completed-ready-to-merge-yes
+    - agent:019f5b25-cd52-7b13-8028-c4b53539d99c#completed-ready-to-merge-yes
+  reject_if_hits: []
+  parent_review:
+    review_status: completed-with-fixes
+    findings_fixed:
+      - active-probe-effort-cross-model-overflow
+      - missing-config-fake-recovery-backup
+      - mismatched-provider-original-upstream-reuse
+      - unix-backup-path-not-a-file
+      - gpt56-prefix-boundary-and-effort-matrix-gaps
+      - stale-live-pid-process-termination
+      - cross-provider-recovery-backup-reuse
+      - directory-recovery-point-stop-before-validation
+      - missing-config-failed-migration-rollback
+      - direct-install-control-plane-divergence
+      - direct-start-stale-pid-trust
+      - missing-config-stop-restore-orphan-process
+      - health-success-not-bound-to-child-pid
+      - failed-start-child-cleanup-gap
+      - pid-write-failure-outside-cleanup-boundary
+  parent_resolution:
+    status: ready
+    implementation_freeze_status: released
+    allowed_ops:
+      - local-verification
+      - commit
+      - push
+      - pr
+    forbidden_ops:
+      - merge
+      - live-apply
+      - claim-merged
+  completion_status: passed
   verify_command: verify-post-implementation-review.ps1 -Path docs/plans/sessions/crg-gpt56-config-recovery.md -ReportOnly
 ```
 
 ## Closeout
 
 ```yaml
-verification_results: []
-review_refs: []
-rollout_ref: pending
-sibling_regression_guard: pending
+verification_results:
+  - node .\scripts\test-launch-ui.mjs => PASS launch-ui flow
+  - node .\scripts\test-launch-ui-unix.mjs => PASS unix launch-ui flow
+  - node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
+  - node --check .\gateway.mjs => exit 0
+  - node --check .\scripts\admin-lib.mjs => exit 0
+  - PowerShell AST parse common/install/launch/restore/start/stop => PASS (6 files)
+  - git diff --check => exit 0
+  - temporary gateway process audit => PASS no temporary gateway process remains
+prior_verification_results:
+  - node .\scripts\test-install-restore.mjs => PASS install-restore flow before the final start-process cleanup changes
+final_rerun_limitations:
+  - node .\scripts\test-install-restore.mjs => 未进入测试；权限审批服务返回 GitHub 上游 503 并明确禁止绕过。后续 start 相关变更由最终 Windows/Unix launch E2E 覆盖，不把该项记为最终 revision 的 fresh PASS。
+review_refs:
+  - parent-review:completed-with-four-fixes
+  - multi-agent-round-1:two-timeouts-closed
+  - multi-agent-round-2:two-timeouts-closed
+  - reviewer-a:019f5b25-b934-7d60-8473-7b6d12f31efa:completed-ready-to-merge-yes
+  - reviewer-b:019f5b25-cd52-7b13-8028-c4b53539d99c:completed-ready-to-merge-yes-after-findings-fixed
+governance_results:
+  - protected-feature-replay => ready/passed (5/5)
+  - test-governance-matrix => ready
+  - post-implementation-review => ready/two-completed-reviewers
+rollout_ref: workflow-rollout-repair-required-missing-formal-source-task
+rollout_note: record-workflow-rollout.ps1 dry-run 返回 WORKFLOW_ROLLOUT_REPAIR_REQUIRED；本任务按 external-project warning-mode 未登记 AI Growth OS 正式 source task，也未修改 registry。
+sibling_regression_guard: passed
 ```

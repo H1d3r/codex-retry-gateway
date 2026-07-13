@@ -26,18 +26,40 @@ $currentBaseUrl = [string]$providerContext.CurrentBaseUrl
 $requestedGatewayBaseUrl = Get-GatewayBaseUrl -ListenHost $ListenHost -ListenPort $ListenPort
 $existingState = Read-JsonFile -Path $paths.StatePath
 $existingGatewayConfig = Read-JsonFile -Path $paths.ConfigPath
-$stateGatewayBaseUrl = if ($existingState -and -not [string]::IsNullOrWhiteSpace([string]$existingState.gateway_base_url)) { [string]$existingState.gateway_base_url } else { $null }
-$configGatewayBaseUrl = Get-GatewayBaseUrlFromConfig -GatewayConfig $existingGatewayConfig
-$managedGatewayBaseUrls = @($requestedGatewayBaseUrl)
-foreach ($candidate in @($stateGatewayBaseUrl, $configGatewayBaseUrl)) {
-  if ([string]::IsNullOrWhiteSpace([string]$candidate)) {
-    continue
-  }
-  if ($managedGatewayBaseUrls -notcontains [string]$candidate) {
-    $managedGatewayBaseUrls += [string]$candidate
+$installIdentityMatches = Test-GatewayInstallIdentity `
+  -State $existingState `
+  -ProviderName $providerContext.ProviderName `
+  -CodexConfigPath $CodexConfigPath
+if ($null -eq $existingGatewayConfig -and $installIdentityMatches -and (Test-Path -LiteralPath $paths.PidPath)) {
+  $runtimePidRaw = (Get-Content -LiteralPath $paths.PidPath -Raw).Trim()
+  $runtimePid = 0
+  $gatewayBaseUrlProperty = $existingState.PSObject.Properties["gateway_base_url"]
+  if (
+    [int]::TryParse($runtimePidRaw, [ref]$runtimePid) -and
+    (Test-ProcessAlive -ProcessId $runtimePid) -and
+    $null -ne $gatewayBaseUrlProperty -and
+    -not [string]::IsNullOrWhiteSpace([string]$gatewayBaseUrlProperty.Value)
+  ) {
+    try {
+      $runtimeStatusResponse = Invoke-WebRequest `
+        -Uri (([string]$gatewayBaseUrlProperty.Value).TrimEnd("/") + "/__codex_retry_gateway/api/status") `
+        -UseBasicParsing `
+        -TimeoutSec 2
+      $runtimeStatus = $runtimeStatusResponse.Content | ConvertFrom-Json
+      $runtimeProcessIdProperty = $runtimeStatus.PSObject.Properties["process_id"]
+      $runtimeConfigProperty = $runtimeStatus.PSObject.Properties["config"]
+      if (
+        $null -ne $runtimeProcessIdProperty -and
+        [int]$runtimeProcessIdProperty.Value -eq $runtimePid -and
+        $null -ne $runtimeConfigProperty
+      ) {
+        $existingGatewayConfig = $runtimeConfigProperty.Value
+      }
+    } catch {
+      $existingGatewayConfig = $null
+    }
   }
 }
-
 $originalBaseUrl = if ($existingState -and -not [string]::IsNullOrWhiteSpace([string]$existingState.original_base_url)) {
   [string]$existingState.original_base_url
 } elseif ($existingGatewayConfig -and -not [string]::IsNullOrWhiteSpace([string]$existingGatewayConfig.upstream_base_url)) {
@@ -49,7 +71,7 @@ $originalBaseUrl = if ($existingState -and -not [string]::IsNullOrWhiteSpace([st
 $canReuseExistingInstall =
   ($null -ne $existingGatewayConfig) -and
   (-not [string]::IsNullOrWhiteSpace([string]$originalBaseUrl)) -and
-  ($managedGatewayBaseUrls -contains $currentBaseUrl)
+  $installIdentityMatches
 
 $mode = "install"
 
@@ -58,98 +80,187 @@ if (-not $canReuseExistingInstall) {
     -CodexConfigPath $CodexConfigPath `
     -StateRoot $StateRoot `
     -ListenHost $ListenHost `
-    -ListenPort $ListenPort
+    -ListenPort $ListenPort `
+    -InternalFromLaunchUi
 } else {
   $mode = "reuse"
   $previousCodexConfigContent = Get-Content -LiteralPath $CodexConfigPath -Raw
   $previousGatewayConfigContent = if (Test-Path -LiteralPath $paths.ConfigPath) { Get-Content -LiteralPath $paths.ConfigPath -Raw } else { $null }
+  $previousGatewayRuntimeConfigContent = ($existingGatewayConfig | ConvertTo-Json -Depth 20) + "`n"
   $previousStateContent = if (Test-Path -LiteralPath $paths.StatePath) { Get-Content -LiteralPath $paths.StatePath -Raw } else { $null }
+  $providerConfigWritten = $false
+  $gatewayConfigWritten = $false
+  $stateWritten = $false
+  $gatewayLifecycleAttempted = $false
+  $previousGatewayHealthy = $false
+  $latestBackupProperty = if ($existingState) { $existingState.PSObject.Properties["latest_backup_path"] } else { $null }
+  $recoveryBackupPath = if (
+    $null -ne $latestBackupProperty -and
+    -not [string]::IsNullOrWhiteSpace([string]$latestBackupProperty.Value)
+  ) {
+    [string]$latestBackupProperty.Value
+  } else {
+    ""
+  }
+  $recoveryBackupCreated = $false
 
   try {
-    $existingGatewayConfig.listen_host = $ListenHost
-    $existingGatewayConfig.listen_port = $ListenPort
-    if ([string]::IsNullOrWhiteSpace([string]$existingGatewayConfig.health_path)) {
-      $existingGatewayConfig.health_path = "/__codex_retry_gateway/health"
+    $reusableGatewayConfig = $existingGatewayConfig | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $reusableGatewayConfig.listen_host = $ListenHost
+    $reusableGatewayConfig.listen_port = $ListenPort
+    if ([string]::IsNullOrWhiteSpace([string]$reusableGatewayConfig.health_path)) {
+      $reusableGatewayConfig.health_path = "/__codex_retry_gateway/health"
     }
-    $existingInterceptRuleMode = if ($null -ne $existingGatewayConfig.PSObject.Properties["intercept_rule_mode"]) {
-      [string]$existingGatewayConfig.intercept_rule_mode
+    $existingInterceptRuleMode = if ($null -ne $reusableGatewayConfig.PSObject.Properties["intercept_rule_mode"]) {
+      [string]$reusableGatewayConfig.intercept_rule_mode
     } else {
       ""
     }
     $legacyContinuationRuleMode = $existingInterceptRuleMode.Trim().ToLowerInvariant() -eq "continuation_recovery"
-    if ($null -eq $existingGatewayConfig.PSObject.Properties["stream_action"] -or [string]::IsNullOrWhiteSpace([string]$existingGatewayConfig.stream_action)) {
-      if ($null -eq $existingGatewayConfig.PSObject.Properties["stream_action"]) {
-        $existingGatewayConfig | Add-Member -NotePropertyName "stream_action" -NotePropertyValue "continuation_recovery"
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["stream_action"] -or [string]::IsNullOrWhiteSpace([string]$reusableGatewayConfig.stream_action)) {
+      if ($null -eq $reusableGatewayConfig.PSObject.Properties["stream_action"]) {
+        $reusableGatewayConfig | Add-Member -NotePropertyName "stream_action" -NotePropertyValue "continuation_recovery"
       } else {
-        $existingGatewayConfig.stream_action = "continuation_recovery"
+        $reusableGatewayConfig.stream_action = "continuation_recovery"
       }
     } elseif ($legacyContinuationRuleMode) {
-      $existingGatewayConfig.stream_action = "continuation_recovery"
+      $reusableGatewayConfig.stream_action = "continuation_recovery"
     }
-    if ($null -eq $existingGatewayConfig.PSObject.Properties["continuation_marker_text"] -or [string]::IsNullOrWhiteSpace([string]$existingGatewayConfig.continuation_marker_text)) {
-      if ($null -eq $existingGatewayConfig.PSObject.Properties["continuation_marker_text"]) {
-        $existingGatewayConfig | Add-Member -NotePropertyName "continuation_marker_text" -NotePropertyValue "Continue thinking..."
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["continuation_marker_text"] -or [string]::IsNullOrWhiteSpace([string]$reusableGatewayConfig.continuation_marker_text)) {
+      if ($null -eq $reusableGatewayConfig.PSObject.Properties["continuation_marker_text"]) {
+        $reusableGatewayConfig | Add-Member -NotePropertyName "continuation_marker_text" -NotePropertyValue "Continue thinking..."
       } else {
-        $existingGatewayConfig.continuation_marker_text = "Continue thinking..."
+        $reusableGatewayConfig.continuation_marker_text = "Continue thinking..."
       }
     }
-    if ($null -eq $existingGatewayConfig.PSObject.Properties["intercept_rule_mode"]) {
-      $existingGatewayConfig | Add-Member -NotePropertyName "intercept_rule_mode" -NotePropertyValue "reasoning_tokens"
-    } elseif ([string]$existingGatewayConfig.intercept_rule_mode -ne "final_answer_only_high_xhigh") {
-      $existingGatewayConfig.intercept_rule_mode = "reasoning_tokens"
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["intercept_rule_mode"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "intercept_rule_mode" -NotePropertyValue "reasoning_tokens"
+    } elseif ([string]$reusableGatewayConfig.intercept_rule_mode -ne "final_answer_only_high_xhigh") {
+      $reusableGatewayConfig.intercept_rule_mode = "reasoning_tokens"
     }
-    if ($null -eq $existingGatewayConfig.PSObject.Properties["reasoning_match_mode"]) {
-      $existingGatewayConfig | Add-Member -NotePropertyName "reasoning_match_mode" -NotePropertyValue "formula_518n_minus_2"
-    } elseif ([string]$existingGatewayConfig.reasoning_match_mode -ne "manual") {
-      $existingGatewayConfig.reasoning_match_mode = "formula_518n_minus_2"
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["reasoning_match_mode"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "reasoning_match_mode" -NotePropertyValue "formula_518n_minus_2"
+    } elseif ([string]$reusableGatewayConfig.reasoning_match_mode -ne "manual") {
+      $reusableGatewayConfig.reasoning_match_mode = "formula_518n_minus_2"
     }
-    if ($null -eq $existingGatewayConfig.PSObject.Properties["intercept_streaming"]) {
-      $existingGatewayConfig | Add-Member -NotePropertyName "intercept_streaming" -NotePropertyValue $true
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["intercept_streaming"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "intercept_streaming" -NotePropertyValue $true
     }
-    if ($null -eq $existingGatewayConfig.PSObject.Properties["intercept_non_streaming"]) {
-      $existingGatewayConfig | Add-Member -NotePropertyName "intercept_non_streaming" -NotePropertyValue $true
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["intercept_non_streaming"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "intercept_non_streaming" -NotePropertyValue $true
     }
-    if ($null -eq $existingGatewayConfig.PSObject.Properties["guard_retry_attempts"]) {
-      $existingGatewayConfig | Add-Member -NotePropertyName "guard_retry_attempts" -NotePropertyValue 5
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["guard_retry_attempts"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "guard_retry_attempts" -NotePropertyValue 5
     }
-    if ($null -eq $existingGatewayConfig.PSObject.Properties["retry_upstream_capacity_errors"]) {
-      $existingGatewayConfig | Add-Member -NotePropertyName "retry_upstream_capacity_errors" -NotePropertyValue $true
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["retry_upstream_capacity_errors"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "retry_upstream_capacity_errors" -NotePropertyValue $true
     } else {
-      $existingGatewayConfig.retry_upstream_capacity_errors = [bool]$existingGatewayConfig.retry_upstream_capacity_errors
+      $reusableGatewayConfig.retry_upstream_capacity_errors = [bool]$reusableGatewayConfig.retry_upstream_capacity_errors
     }
     if (
-      $null -eq $existingGatewayConfig.PSObject.Properties["request_body_limit_bytes"] -or
-      [int]$existingGatewayConfig.request_body_limit_bytes -le 0 -or
-      [int]$existingGatewayConfig.request_body_limit_bytes -eq 10485760
+      $null -eq $reusableGatewayConfig.PSObject.Properties["request_body_limit_bytes"] -or
+      [int]$reusableGatewayConfig.request_body_limit_bytes -le 0 -or
+      [int]$reusableGatewayConfig.request_body_limit_bytes -eq 10485760
     ) {
-      if ($null -eq $existingGatewayConfig.PSObject.Properties["request_body_limit_bytes"]) {
-        $existingGatewayConfig | Add-Member -NotePropertyName "request_body_limit_bytes" -NotePropertyValue 104857600
+      if ($null -eq $reusableGatewayConfig.PSObject.Properties["request_body_limit_bytes"]) {
+        $reusableGatewayConfig | Add-Member -NotePropertyName "request_body_limit_bytes" -NotePropertyValue 104857600
       } else {
-        $existingGatewayConfig.request_body_limit_bytes = 104857600
+        $reusableGatewayConfig.request_body_limit_bytes = 104857600
       }
     }
-    if ((-not [bool]$existingGatewayConfig.intercept_streaming) -and (-not [bool]$existingGatewayConfig.intercept_non_streaming)) {
-      $existingGatewayConfig.intercept_streaming = $true
-      $existingGatewayConfig.intercept_non_streaming = $true
+    if ((-not [bool]$reusableGatewayConfig.intercept_streaming) -and (-not [bool]$reusableGatewayConfig.intercept_non_streaming)) {
+      $reusableGatewayConfig.intercept_streaming = $true
+      $reusableGatewayConfig.intercept_non_streaming = $true
     }
-    Write-JsonFile -Path $paths.ConfigPath -Value $existingGatewayConfig
+
+    $existingGatewayConfigJson = $existingGatewayConfig | ConvertTo-Json -Depth 20 -Compress
+    $reusableGatewayConfigJson = $reusableGatewayConfig | ConvertTo-Json -Depth 20 -Compress
+    $gatewayConfigChanged = $existingGatewayConfigJson -cne $reusableGatewayConfigJson
+    $gatewayConfigNeedsWrite = $null -eq $previousGatewayConfigContent -or $gatewayConfigChanged
+
+    $gatewayProcessAlive = $false
+    $gatewayPidValue = 0
+    if (Test-Path -LiteralPath $paths.PidPath) {
+      $gatewayPidRaw = (Get-Content -LiteralPath $paths.PidPath -Raw).Trim()
+      if ([int]::TryParse($gatewayPidRaw, [ref]$gatewayPidValue)) {
+        $gatewayProcessAlive = Test-ProcessAlive -ProcessId $gatewayPidValue
+      }
+    }
+    if ($gatewayProcessAlive) {
+      $previousGatewayHealthy = Test-GatewayProcessIdentity -ProcessId $gatewayPidValue -GatewayConfig $existingGatewayConfig
+      if (-not $previousGatewayHealthy) {
+        Remove-Item -LiteralPath $paths.PidPath -Force -ErrorAction SilentlyContinue
+      }
+    }
+
+    $managedGatewayBaseUrls = @($requestedGatewayBaseUrl)
+    if (
+      $existingState -and
+      $null -ne $existingState.PSObject.Properties["gateway_base_url"] -and
+      -not [string]::IsNullOrWhiteSpace([string]$existingState.gateway_base_url)
+    ) {
+      $managedGatewayBaseUrls += [string]$existingState.gateway_base_url
+    }
+    $existingConfigGatewayBaseUrl = Get-GatewayBaseUrlFromConfig -GatewayConfig $existingGatewayConfig
+    if (-not [string]::IsNullOrWhiteSpace([string]$existingConfigGatewayBaseUrl)) {
+      $managedGatewayBaseUrls += [string]$existingConfigGatewayBaseUrl
+    }
+    $recoveryBackupUsable =
+      (-not [string]::IsNullOrWhiteSpace($recoveryBackupPath)) -and
+      (Test-Path -LiteralPath $recoveryBackupPath -PathType Leaf)
+    if ((-not $recoveryBackupUsable) -and ($managedGatewayBaseUrls -notcontains $currentBaseUrl)) {
+      $backupTimestamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+      $backupSuffix = 0
+      do {
+        $backupSuffixText = if ($backupSuffix -eq 0) { "" } else { "-$backupSuffix" }
+        $recoveryBackupPath = Join-Path $paths.BackupDir ("config-$backupTimestamp$backupSuffixText.toml")
+        $backupSuffix += 1
+      } while (Test-Path -LiteralPath $recoveryBackupPath)
+      Copy-Item -LiteralPath $CodexConfigPath -Destination $recoveryBackupPath
+      $recoveryBackupCreated = $true
+    }
+
+    if ($gatewayConfigChanged -and $previousGatewayHealthy) {
+      $gatewayLifecycleAttempted = $true
+      $temporaryIdentityConfigWritten = $false
+      try {
+        if (-not (Test-Path -LiteralPath $paths.ConfigPath)) {
+          Write-Utf8NoBomFile -Path $paths.ConfigPath -Content $previousGatewayRuntimeConfigContent
+          $temporaryIdentityConfigWritten = $true
+        }
+        & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet
+      } finally {
+        if ($temporaryIdentityConfigWritten) {
+          Remove-Item -LiteralPath $paths.ConfigPath -Force -ErrorAction SilentlyContinue
+        }
+      }
+    }
+
+    if ($gatewayConfigNeedsWrite) {
+      Write-JsonFile -Path $paths.ConfigPath -Value $reusableGatewayConfig
+      $gatewayConfigWritten = $true
+    }
 
     if ($currentBaseUrl -ne $requestedGatewayBaseUrl) {
       Set-CodexProviderBaseUrl `
         -CodexConfigPath $CodexConfigPath `
         -ProviderName $providerContext.ProviderName `
         -NewBaseUrl $requestedGatewayBaseUrl
+      $providerConfigWritten = $true
     }
 
-    & (Join-Path $PSScriptRoot "start-gateway.ps1") `
-      -StateRoot $StateRoot `
-      -ConfigPath $paths.ConfigPath `
-      -LogPath $paths.LogPath `
-      -RestartIfRunning
+    $gatewayLifecycleChanged = (-not $previousGatewayHealthy) -or $gatewayConfigChanged
+    if ($gatewayLifecycleChanged) {
+      $gatewayLifecycleAttempted = $true
+      & (Join-Path $PSScriptRoot "start-gateway.ps1") `
+        -StateRoot $StateRoot `
+        -ConfigPath $paths.ConfigPath `
+        -LogPath $paths.LogPath
+    }
 
     $statePayload = [ordered]@{
       installed_at        = if ($existingState -and $existingState.installed_at) { [string]$existingState.installed_at } else { (Get-Date).ToString("o") }
-      last_started_at     = (Get-Date).ToString("o")
+      last_started_at     = if ($gatewayLifecycleChanged) { (Get-Date).ToString("o") } elseif ($existingState -and $existingState.last_started_at) { [string]$existingState.last_started_at } elseif ($existingState -and $existingState.installed_at) { [string]$existingState.installed_at } else { (Get-Date).ToString("o") }
       codex_config_path   = $CodexConfigPath
       provider_name       = $providerContext.ProviderName
       original_base_url   = $originalBaseUrl
@@ -157,20 +268,96 @@ if (-not $canReuseExistingInstall) {
       gateway_config_path = $paths.ConfigPath
       gateway_log_path    = $paths.LogPath
       gateway_pid_path    = $paths.PidPath
-      latest_backup_path  = if ($existingState -and $existingState.latest_backup_path) { [string]$existingState.latest_backup_path } else { "" }
+      latest_backup_path  = $recoveryBackupPath
       state_root          = $paths.StateRoot
     }
-    Write-JsonFile -Path $paths.StatePath -Value $statePayload
+    $existingStateJson = if ($existingState) { $existingState | ConvertTo-Json -Depth 20 -Compress } else { "" }
+    $statePayloadJson = $statePayload | ConvertTo-Json -Depth 20 -Compress
+    if ($existingStateJson -cne $statePayloadJson) {
+      Write-JsonFile -Path $paths.StatePath -Value $statePayload
+      $stateWritten = $true
+    }
   } catch {
-    Write-Utf8NoBomFile -Path $CodexConfigPath -Content $previousCodexConfigContent
-    if ($null -ne $previousGatewayConfigContent) {
-      Write-Utf8NoBomFile -Path $paths.ConfigPath -Content $previousGatewayConfigContent
+    $launchError = $_
+    $rollbackErrors = New-Object System.Collections.Generic.List[string]
+
+    if ($gatewayLifecycleAttempted) {
+      try {
+        & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet
+      } catch {
+        $rollbackErrors.Add($_.Exception.Message)
+      }
     }
-    if ($null -ne $previousStateContent) {
-      Write-Utf8NoBomFile -Path $paths.StatePath -Content $previousStateContent
+
+    if ($providerConfigWritten) {
+      try {
+        Write-Utf8NoBomFile -Path $CodexConfigPath -Content $previousCodexConfigContent
+      } catch {
+        $rollbackErrors.Add($_.Exception.Message)
+      }
     }
-    & (Join-Path $PSScriptRoot "stop-gateway.ps1") -StateRoot $StateRoot -Quiet
-    throw
+
+    if ($gatewayConfigWritten) {
+      try {
+        if ($null -eq $previousGatewayConfigContent) {
+          Remove-Item -LiteralPath $paths.ConfigPath -Force -ErrorAction SilentlyContinue
+        } else {
+          Write-Utf8NoBomFile -Path $paths.ConfigPath -Content $previousGatewayConfigContent
+        }
+      } catch {
+        $rollbackErrors.Add($_.Exception.Message)
+      }
+    }
+
+    if ($stateWritten) {
+      try {
+        if ($null -eq $previousStateContent) {
+          Remove-Item -LiteralPath $paths.StatePath -Force -ErrorAction SilentlyContinue
+        } else {
+          Write-Utf8NoBomFile -Path $paths.StatePath -Content $previousStateContent
+        }
+      } catch {
+        $rollbackErrors.Add($_.Exception.Message)
+      }
+    }
+
+    if ($recoveryBackupCreated) {
+      try {
+        Remove-Item -LiteralPath $recoveryBackupPath -Force -ErrorAction Stop
+      } catch {
+        $rollbackErrors.Add($_.Exception.Message)
+      }
+    }
+
+    if ($gatewayLifecycleAttempted -and $previousGatewayHealthy) {
+      $temporaryRollbackConfigWritten = $false
+      try {
+        if (-not (Test-Path -LiteralPath $paths.ConfigPath)) {
+          Write-Utf8NoBomFile -Path $paths.ConfigPath -Content $previousGatewayRuntimeConfigContent
+          $temporaryRollbackConfigWritten = $true
+        }
+        & (Join-Path $PSScriptRoot "start-gateway.ps1") `
+          -StateRoot $StateRoot `
+          -ConfigPath $paths.ConfigPath `
+          -LogPath $paths.LogPath `
+          -RestartIfRunning
+      } catch {
+        $rollbackErrors.Add($_.Exception.Message)
+      } finally {
+        if ($temporaryRollbackConfigWritten) {
+          try {
+            Remove-Item -LiteralPath $paths.ConfigPath -Force -ErrorAction Stop
+          } catch {
+            $rollbackErrors.Add($_.Exception.Message)
+          }
+        }
+      }
+    }
+
+    if ($rollbackErrors.Count -gt 0) {
+      throw ("Gateway launch failed: {0}`nRollback errors: {1}" -f $launchError.Exception.Message, ($rollbackErrors -join " | "))
+    }
+    throw $launchError
   }
 }
 

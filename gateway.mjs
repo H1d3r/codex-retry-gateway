@@ -147,7 +147,13 @@ const REASONING_POINTERS = [
   "/response/usage/output_tokens_details/reasoning_tokens",
   "/response/usage/completion_tokens_details/reasoning_tokens",
 ];
-const TRACKED_LOCAL_MODEL_FAMILIES = new Set(["gpt-5.4", "gpt-5.5"]);
+const TRACKED_LOCAL_MODEL_FAMILIES = new Set([
+  "gpt-5.4",
+  "gpt-5.5",
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+]);
 const SUSPICIOUS_SAMPLE_LIMIT = 50;
 const SUSPICIOUS_SAMPLE_EVIDENCE_LIMIT = 6;
 const LOG_ENTRY_LIMIT = 2000;
@@ -157,7 +163,23 @@ const LONG_CONTEXT_PROBE_TOKEN_TOLERANCE = 1024;
 const LONG_CONTEXT_PROBE_MAX_BUDGET_ATTEMPTS = 2;
 const DEFAULT_ACTIVE_PROBE_REASONING_EFFORT = "medium";
 const DEFAULT_ACTIVE_PROBE_USER_AGENT = "codex-retry-gateway/active-probe";
-const SUPPORTED_REASONING_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+const REASONING_EFFORT_LEVELS = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+];
+const SUPPORTED_REASONING_EFFORTS = new Set(REASONING_EFFORT_LEVELS);
+const ACTIVE_PROBE_REASONING_EFFORT_BOUNDS = new Map([
+  ["gpt-5.4", ["low", "xhigh"]],
+  ["gpt-5.5", ["low", "xhigh"]],
+  ["gpt-5.6-sol", ["low", "ultra"]],
+  ["gpt-5.6-terra", ["low", "ultra"]],
+  ["gpt-5.6-luna", ["low", "max"]],
+]);
 const PROBE_IMAGE_DATA_URL =
   "data:image/png;base64," +
   "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAGwSURBVHhe7ZdRjoMwDEQ5Xg6U4+QuXIWbZLWifHQyZhfIuKrsJ+XHpRV+nkC69OAsWIhGCsBCNFIAFqKRArAQjRSAhWikACxEIwVgIRopAAvRSAFYULO10pdlMVbpbcNvaHEWsPY6NP2+irMBXwFrHRoeVmndU4GrgLWShofluw0cBbD4116JFM9t4CeAxb+uxkOx9hW/L8JNAIt//e1ya70MAl6fOeAkgMd/73HrreBnezo88BFgxP/gk9vAQQCf8NuAP7gN9AJoczhdLsljG8gF0HiTxuh1g6j5iAXwyZL+jaQY105EK4A2ZU2Vy2JpmYlUAI31SUP0evHRWCiAT/SkfyMx2qOxTgB795vxP+DSlP8QZQLY0ff+0m0DkQB29H22VNtAI4DG/+ESbQOJgLnxP5ZmGwgE8PifPv0Rx7fBfAE0/n89/RG/t8FkAcaNXxr/Dj8UXUzSP5grwIjurZs2fuuOzDOmCuBTuxr/AyNNt3+PM1GAccMPJsaF3kyUwUQB30kKwEI0UgAWopECsBCNFICFaKQALEQjBWAhGikAC9FIAViIRgrAQjTCC/gBCi0Q+LleBhsAAAAASUVORK5CYII=";
@@ -364,6 +386,11 @@ function normalizeModelFamily(modelName) {
   if (value.startsWith("gpt-5.5-nano")) {
     return "gpt-5.5-nano";
   }
+  for (const family of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    if (value === family || value.startsWith(`${family}-`)) {
+      return family;
+    }
+  }
   if (value.startsWith("gpt-5.4")) {
     return "gpt-5.4";
   }
@@ -424,6 +451,18 @@ function normalizeReasoningEffort(value) {
     return null;
   }
   return normalized;
+}
+
+function resolveActiveProbeReasoningEffort(modelName, value) {
+  const effort = normalizeReasoningEffort(value) || DEFAULT_ACTIVE_PROBE_REASONING_EFFORT;
+  const bounds = ACTIVE_PROBE_REASONING_EFFORT_BOUNDS.get(normalizeModelFamily(modelName));
+  if (!bounds) {
+    return effort;
+  }
+  const effortIndex = REASONING_EFFORT_LEVELS.indexOf(effort);
+  const minIndex = REASONING_EFFORT_LEVELS.indexOf(bounds[0]);
+  const maxIndex = REASONING_EFFORT_LEVELS.indexOf(bounds[1]);
+  return REASONING_EFFORT_LEVELS[Math.min(maxIndex, Math.max(minIndex, effortIndex))];
 }
 
 function normalizeInterceptRuleMode(value) {
@@ -4390,7 +4429,8 @@ function applyActiveProbePayloadProfile(payload, profile) {
   const clonedPayload = {
     ...payload,
   };
-  const effort = normalizeReasoningEffort(profile?.reasoning?.effort) || DEFAULT_ACTIVE_PROBE_REASONING_EFFORT;
+  // 主动探针不能把一个模型的 effort 画像直接套给能力上下界不同的目标模型。
+  const effort = resolveActiveProbeReasoningEffort(clonedPayload.model, profile?.reasoning?.effort);
   clonedPayload.reasoning = {
     ...(payload.reasoning && typeof payload.reasoning === "object" ? payload.reasoning : {}),
     effort,
@@ -4706,8 +4746,12 @@ async function runLongContextProbe(runtime, targetModel, targetFamily) {
     `start type=long_context family=${targetFamily} endpoint=${endpointPath} target_input_tokens=${targetInputTokens} budget_source=response_usage`,
   );
   const requestProfile = getActiveProbeRequestProfile(runtime);
+  const profiledReasoningEffort = resolveActiveProbeReasoningEffort(
+    targetModel,
+    requestProfile.reasoning?.effort,
+  );
   probeLog(
-    `profile type=long_context family=${targetFamily} user_agent=${requestProfile.headers["user-agent"] || "-"} reasoning_effort=${requestProfile.reasoning?.effort || "-"}`,
+    `profile type=long_context family=${targetFamily} user_agent=${requestProfile.headers["user-agent"] || "-"} reasoning_effort=${profiledReasoningEffort}`,
   );
 
   const finalizeSample = (classified, attempt, extra = {}) => {
@@ -5331,7 +5375,7 @@ async function restoreRuntimeState(runtime, state) {
   const backupPath = state?.latest_backup_path;
   const codexConfigPath = state?.codex_config_path;
 
-  if (!backupPath || !fs.existsSync(backupPath)) {
+  if (!backupPath || !fs.existsSync(backupPath) || !fs.statSync(backupPath).isFile()) {
     throw new Error(`未找到可恢复备份: ${backupPath || "unknown"}`);
   }
   if (!codexConfigPath) {
@@ -6785,11 +6829,11 @@ function buildManagementHtml() {
             <div class="range-bar">
               <div class="field">
                 <label for="reasoningAnalysisModelFamilyInput">模型家族</label>
-                <input id="reasoningAnalysisModelFamilyInput" type="text" value="gpt-5.4,gpt-5.5" />
+                <input id="reasoningAnalysisModelFamilyInput" type="text" value="gpt-5.4,gpt-5.5,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna" />
               </div>
               <div class="field">
                 <label for="reasoningAnalysisEffortInput">reasoning.effort</label>
-                <input id="reasoningAnalysisEffortInput" type="text" value="low,medium,high,xhigh" />
+                <input id="reasoningAnalysisEffortInput" type="text" value="minimal,low,medium,high,xhigh,max,ultra" />
               </div>
               <div class="field">
                 <label for="reasoningAnalysisTokenInput">reasoning_tokens</label>
@@ -7211,6 +7255,18 @@ function buildManagementHtml() {
                             <input id="probeTargetFamily55Input" type="checkbox" />
                             <span>gpt-5.5</span>
                           </label>
+                          <label class="checkbox-chip" for="probeTargetFamily56SolInput">
+                            <input id="probeTargetFamily56SolInput" type="checkbox" />
+                            <span>gpt-5.6-sol</span>
+                          </label>
+                          <label class="checkbox-chip" for="probeTargetFamily56TerraInput">
+                            <input id="probeTargetFamily56TerraInput" type="checkbox" />
+                            <span>gpt-5.6-terra</span>
+                          </label>
+                          <label class="checkbox-chip" for="probeTargetFamily56LunaInput">
+                            <input id="probeTargetFamily56LunaInput" type="checkbox" />
+                            <span>gpt-5.6-luna</span>
+                          </label>
                         </div>
                       </div>
                       <div class="inline-toggle">
@@ -7288,6 +7344,9 @@ function buildManagementHtml() {
         logMatchInput: document.getElementById('logMatchInput'),
         probeTargetFamily54Input: document.getElementById('probeTargetFamily54Input'),
         probeTargetFamily55Input: document.getElementById('probeTargetFamily55Input'),
+        probeTargetFamily56SolInput: document.getElementById('probeTargetFamily56SolInput'),
+        probeTargetFamily56TerraInput: document.getElementById('probeTargetFamily56TerraInput'),
+        probeTargetFamily56LunaInput: document.getElementById('probeTargetFamily56LunaInput'),
         probeAutoEnabledInput: document.getElementById('probeAutoEnabledInput'),
         probeIntervalMinutesInput: document.getElementById('probeIntervalMinutesInput'),
         saveButton: document.getElementById('saveButton'),
@@ -7833,6 +7892,15 @@ function buildManagementHtml() {
         if (refs.probeTargetFamily55Input.checked) {
           targetFamilies.push('gpt-5.5');
         }
+        if (refs.probeTargetFamily56SolInput.checked) {
+          targetFamilies.push('gpt-5.6-sol');
+        }
+        if (refs.probeTargetFamily56TerraInput.checked) {
+          targetFamilies.push('gpt-5.6-terra');
+        }
+        if (refs.probeTargetFamily56LunaInput.checked) {
+          targetFamilies.push('gpt-5.6-luna');
+        }
         const intervalMinutes = Number.parseInt(refs.probeIntervalMinutesInput.value, 10);
         const safeMinutes = Number.isInteger(intervalMinutes) && intervalMinutes > 0 ? intervalMinutes : 15;
         return {
@@ -7851,7 +7919,13 @@ function buildManagementHtml() {
       }
 
       function hasSelectedProbeTargetFamilies() {
-        return refs.probeTargetFamily54Input.checked || refs.probeTargetFamily55Input.checked;
+        return [
+          refs.probeTargetFamily54Input,
+          refs.probeTargetFamily55Input,
+          refs.probeTargetFamily56SolInput,
+          refs.probeTargetFamily56TerraInput,
+          refs.probeTargetFamily56LunaInput,
+        ].some((input) => input.checked);
       }
 
       async function persistActiveProbeConfigFromControls() {
@@ -7974,6 +8048,9 @@ function buildManagementHtml() {
         const targetFamilies = Array.isArray(activeProbe?.target_families) ? activeProbe.target_families : [];
         refs.probeTargetFamily54Input.checked = targetFamilies.includes('gpt-5.4');
         refs.probeTargetFamily55Input.checked = targetFamilies.includes('gpt-5.5');
+        refs.probeTargetFamily56SolInput.checked = targetFamilies.includes('gpt-5.6-sol');
+        refs.probeTargetFamily56TerraInput.checked = targetFamilies.includes('gpt-5.6-terra');
+        refs.probeTargetFamily56LunaInput.checked = targetFamilies.includes('gpt-5.6-luna');
         refs.probeAutoEnabledInput.checked = Boolean(activeProbe?.enabled);
         const intervalMs = Number(activeProbe?.interval_ms ?? 15 * 60 * 1000);
         refs.probeIntervalMinutesInput.value = String(
@@ -9036,6 +9113,7 @@ async function handleManagementRequest(runtime, req, res, requestUrl) {
     await getLocalConfigModel(runtime);
     jsonResponse(res, 200, {
       ok: true,
+      process_id: process.pid,
       listen: `${runtime.config.listen_host}:${runtime.config.listen_port}`,
       config: runtime.config,
       state,
@@ -10566,6 +10644,7 @@ async function proxyRequest(runtime, req, res) {
     res.end(
       JSON.stringify({
         ok: true,
+        process_id: process.pid,
         listen: `${config.listen_host}:${config.listen_port}`,
         upstream_base_url: config.upstream_base_url,
         ui_path: UI_PATH,

@@ -3,7 +3,7 @@
 import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -12,11 +12,39 @@ const scriptsRoot = import.meta.dirname;
 const installScript = path.join(scriptsRoot, "install-for-current-provider.ps1");
 const launchUiScript = path.join(scriptsRoot, "launch-ui.ps1");
 const restoreScript = path.join(scriptsRoot, "restore-codex-config.ps1");
+const stopScript = path.join(scriptsRoot, "stop-gateway.ps1");
 
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
   }
+}
+
+function isProcessAlive(processId) {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function stopProcessById(processId) {
+  if (!isProcessAlive(processId)) {
+    return;
+  }
+  process.kill(processId);
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline && isProcessAlive(processId)) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (isProcessAlive(processId)) {
+    process.kill(processId, "SIGKILL");
+  }
+}
+
+async function mtimeNs(filePath) {
+  return (await stat(filePath, { bigint: true })).mtimeNs;
 }
 
 async function getFreePort() {
@@ -202,6 +230,88 @@ async function run() {
       gatewayConfig.stream_action === "continuation_recovery",
       "Gateway config default stream_action should be continuation_recovery",
     );
+    const gatewayConfigPath = path.join(stateRoot, "config", "config.json");
+    const gatewayStatePath = path.join(stateRoot, "state.json");
+    const gatewayPidPath = path.join(stateRoot, "gateway.pid");
+    const backupDir = path.join(stateRoot, "backups");
+    const installedCodexConfigRaw = await readFile(codexConfigPath, "utf8");
+    const installedGatewayConfigRaw = await readFile(gatewayConfigPath, "utf8");
+    const installedStateRaw = await readFile(gatewayStatePath, "utf8");
+    const installedGatewayPid = (await readFile(gatewayPidPath, "utf8")).trim();
+    const installedBackups = (await readdir(backupDir)).sort();
+    const installedMtimes = {
+      codex: await mtimeNs(codexConfigPath),
+      gatewayConfig: await mtimeNs(gatewayConfigPath),
+      state: await mtimeNs(gatewayStatePath),
+      pid: await mtimeNs(gatewayPidPath),
+      backupDir: await mtimeNs(backupDir),
+    };
+
+    await runPowerShellScript(installScript, [
+      "-CodexConfigPath",
+      codexConfigPath,
+      "-StateRoot",
+      stateRoot,
+      "-ListenPort",
+      String(gatewayPort),
+    ]);
+    assert(
+      (await readFile(gatewayPidPath, "utf8")).trim() === installedGatewayPid,
+      "Repeated manual install restarted an already healthy gateway",
+    );
+    assert(
+      (await readFile(codexConfigPath, "utf8")) === installedCodexConfigRaw,
+      "Repeated manual install rewrote Codex config",
+    );
+    assert(
+      (await readFile(gatewayConfigPath, "utf8")) === installedGatewayConfigRaw,
+      "Repeated manual install rewrote gateway config",
+    );
+    assert(
+      (await readFile(gatewayStatePath, "utf8")) === installedStateRaw,
+      "Repeated manual install rewrote gateway state",
+    );
+    assert(
+      JSON.stringify((await readdir(backupDir)).sort()) === JSON.stringify(installedBackups),
+      "Repeated manual install created or replaced an unnecessary backup",
+    );
+    assert((await mtimeNs(codexConfigPath)) === installedMtimes.codex, "Repeated manual install touched Codex config mtime");
+    assert((await mtimeNs(gatewayConfigPath)) === installedMtimes.gatewayConfig, "Repeated manual install touched gateway config mtime");
+    assert((await mtimeNs(gatewayStatePath)) === installedMtimes.state, "Repeated manual install touched state mtime");
+    assert((await mtimeNs(gatewayPidPath)) === installedMtimes.pid, "Repeated manual install touched PID mtime");
+    assert((await mtimeNs(backupDir)) === installedMtimes.backupDir, "Repeated manual install touched backup directory mtime");
+
+    const runtimeConfigBeforeDirectRecovery = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json()).then((payload) => payload.config);
+    await rm(gatewayConfigPath, { force: true });
+    await runPowerShellScript(installScript, [
+      "-CodexConfigPath",
+      codexConfigPath,
+      "-StateRoot",
+      stateRoot,
+      "-ListenPort",
+      String(gatewayPort),
+    ]);
+    assert(
+      (await readFile(gatewayPidPath, "utf8")).trim() === installedGatewayPid,
+      "Direct install restarted a healthy gateway while recovering missing config.json",
+    );
+    assert(
+      JSON.stringify(JSON.parse(await readFile(gatewayConfigPath, "utf8"))) ===
+        JSON.stringify(runtimeConfigBeforeDirectRecovery),
+      "Direct install did not recover the running gateway's complete runtime config",
+    );
+    assert(
+      (await readFile(codexConfigPath, "utf8")) === installedCodexConfigRaw,
+      "Direct install rewrote Codex config while recovering missing config.json",
+    );
+    assert(
+      (await readFile(gatewayStatePath, "utf8")) === installedStateRaw,
+      "Direct install rewrote state while recovering missing config.json",
+    );
+    await writeFile(gatewayConfigPath, installedGatewayConfigRaw, "utf8");
+
     await mkdir(path.join(legacyStateRoot, "config"), { recursive: true });
     const legacyGatewayConfig = {
       ...gatewayConfig,
@@ -284,7 +394,7 @@ async function run() {
     delete gatewayConfig.retry_upstream_capacity_errors;
     gatewayConfig.request_body_limit_bytes = 10 * 1024 * 1024;
     await writeFile(
-      path.join(stateRoot, "config", "config.json"),
+      gatewayConfigPath,
       `${JSON.stringify(gatewayConfig, null, 2)}\n`,
       "utf8",
     );
@@ -381,6 +491,21 @@ async function run() {
     assert(uiHtml.includes('href="https://t.me/AI_INPUT_IM"'), "Management UI HTML did not include Telegram group link");
     assert(uiHtml.includes("实时日志"), "Management UI HTML did not include live log panel");
     assert(uiHtml.includes("主动探针"), "Management UI HTML did not include active probe panel");
+    assert(
+      uiHtml.includes('id="reasoningAnalysisEffortInput" type="text" value="minimal,low,medium,high,xhigh,max,ultra"'),
+      "Management UI reasoning analysis did not expose every supported effort",
+    );
+    assert(
+      uiHtml.includes('id="reasoningAnalysisModelFamilyInput" type="text" value="gpt-5.4,gpt-5.5,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna"'),
+      "Management UI reasoning analysis did not expose every tracked model family",
+    );
+    for (const controlId of [
+      "probeTargetFamily56SolInput",
+      "probeTargetFamily56TerraInput",
+      "probeTargetFamily56LunaInput",
+    ]) {
+      assert(uiHtml.includes(`id="${controlId}"`), `Management UI active probe is missing ${controlId}`);
+    }
 
     const statusResponse = await fetch(`http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`);
     const statusPayload = await statusResponse.json();
@@ -572,7 +697,7 @@ async function run() {
       `Blank continuation_marker_text should reset to default: ${JSON.stringify(resetMarkerPayload.config?.continuation_marker_text)}`,
     );
     const resetMarkerGatewayConfig = JSON.parse(
-      await readFile(path.join(stateRoot, "config", "config.json"), "utf8"),
+      await readFile(gatewayConfigPath, "utf8"),
     );
     assert(
       resetMarkerGatewayConfig.continuation_marker_text === "Continue thinking...",
@@ -649,6 +774,40 @@ async function run() {
     });
     assert(blockedAfterSave.status === 200, `仅流式模式下非流式命中应透传: ${blockedAfterSave.status}`);
 
+    const stateBeforeDirectoryRestore = await readFile(gatewayStatePath, "utf8");
+    await writeFile(
+      gatewayStatePath,
+      `${JSON.stringify(
+        {
+          ...JSON.parse(stateBeforeDirectoryRestore),
+          latest_backup_path: backupDir,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    let directoryRestoreFailed = false;
+    try {
+      await runPowerShellScript(restoreScript, [
+        "-CodexConfigPath",
+        codexConfigPath,
+        "-StateRoot",
+        stateRoot,
+      ]);
+    } catch {
+      directoryRestoreFailed = true;
+    }
+    assert(directoryRestoreFailed, "Directory recovery point was accepted as a restorable file");
+    const healthAfterDirectoryRestore = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/health`,
+    );
+    assert(
+      healthAfterDirectoryRestore.status === 200,
+      "Invalid directory recovery point stopped the running gateway before validation",
+    );
+    await writeFile(gatewayStatePath, stateBeforeDirectoryRestore, "utf8");
+
     const restoreViaUiResponse = await fetch(`http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/restore`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -673,8 +832,140 @@ async function run() {
       "Restore script did not recover original base_url",
     );
 
+    const backupsBeforeMissingConfigRecovery = (await readdir(backupDir)).sort();
+    await writeFile(codexConfigPath, installedCodexConfigRaw, "utf8");
+    await writeFile(
+      gatewayStatePath,
+      `${JSON.stringify(
+        {
+          ...JSON.parse(installedStateRaw),
+          latest_backup_path: "",
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await rm(gatewayConfigPath, { force: true });
+    await runPowerShellScript(installScript, [
+      "-CodexConfigPath",
+      codexConfigPath,
+      "-StateRoot",
+      stateRoot,
+      "-ListenPort",
+      String(gatewayPort),
+    ]);
+    const rebuiltState = JSON.parse(await readFile(gatewayStatePath, "utf8"));
+    const rebuiltGatewayConfig = JSON.parse(await readFile(gatewayConfigPath, "utf8"));
+    assert(rebuiltState.latest_backup_path === "", "Missing config recovery created a fake gateway-routed backup");
+    assert(
+      JSON.stringify((await readdir(backupDir)).sort()) === JSON.stringify(backupsBeforeMissingConfigRecovery),
+      "Missing config recovery changed the backup directory",
+    );
+    assert(
+      rebuiltGatewayConfig.upstream_base_url === `http://127.0.0.1:${upstreamPort}`,
+      "Missing config recovery did not rebuild the original upstream",
+    );
+
+    const providerABackupPath = JSON.parse(installedStateRaw).latest_backup_path;
+    await writeFile(
+      gatewayStatePath,
+      `${JSON.stringify({ ...rebuiltState, latest_backup_path: providerABackupPath }, null, 2)}\n`,
+      "utf8",
+    );
+    const providerBUpstreamBaseUrl = `http://127.0.0.1:${upstreamPort}/provider-b`;
+    const providerBConfigRaw = [
+      'model_provider = "provider-b"',
+      "",
+      "[model_providers.provider-b]",
+      'name = "Provider B"',
+      `base_url = "${providerBUpstreamBaseUrl}"`,
+      'wire_api = "responses"',
+      "",
+    ].join("\n");
+    const backupsBeforeProviderSwitch = (await readdir(backupDir)).sort();
+    await writeFile(codexConfigPath, providerBConfigRaw, "utf8");
+    await runPowerShellScript(installScript, [
+      "-CodexConfigPath",
+      codexConfigPath,
+      "-StateRoot",
+      stateRoot,
+      "-ListenPort",
+      String(gatewayPort),
+    ]);
+    const providerBState = JSON.parse(await readFile(gatewayStatePath, "utf8"));
+    const backupsAfterProviderSwitch = (await readdir(backupDir)).sort();
+    assert(providerBState.provider_name === "provider-b", "Provider B install did not replace provider identity");
+    assert(
+      providerBState.latest_backup_path !== providerABackupPath,
+      "Provider B reused Provider A's recovery backup",
+    );
+    assert(
+      backupsAfterProviderSwitch.length === backupsBeforeProviderSwitch.length + 1,
+      "Provider B install did not create exactly one provider-specific backup",
+    );
+    assert(
+      (await readFile(providerBState.latest_backup_path, "utf8")) === providerBConfigRaw,
+      "Provider B recovery backup did not preserve Provider B config bytes",
+    );
+
+    const mismatchedProviderConfigRaw = [
+      'model_provider = "provider-c"',
+      "",
+      "[model_providers.provider-c]",
+      'name = "Mismatched Provider"',
+      `base_url = "http://127.0.0.1:${gatewayPort}"`,
+      'wire_api = "responses"',
+      "",
+    ].join("\n");
+    await writeFile(codexConfigPath, mismatchedProviderConfigRaw, "utf8");
+    const stateBeforeMismatchedProvider = await readFile(gatewayStatePath, "utf8");
+    let mismatchedProviderInstallFailed = false;
+    try {
+      await runPowerShellScript(installScript, [
+        "-CodexConfigPath",
+        codexConfigPath,
+        "-StateRoot",
+        stateRoot,
+        "-ListenPort",
+        String(gatewayPort),
+      ]);
+    } catch {
+      mismatchedProviderInstallFailed = true;
+    }
+    assert(mismatchedProviderInstallFailed, "Mismatched provider reused another provider's original upstream");
+    assert(
+      (await readFile(gatewayStatePath, "utf8")) === stateBeforeMismatchedProvider,
+      "Mismatched provider attempt changed install state",
+    );
+
+    const gatewayPidBeforeMissingConfigRestore = Number.parseInt(
+      (await readFile(gatewayPidPath, "utf8")).trim(),
+      10,
+    );
+    await rm(gatewayConfigPath, { force: true });
+    await runPowerShellScript(restoreScript, [
+      "-CodexConfigPath",
+      codexConfigPath,
+      "-StateRoot",
+      stateRoot,
+    ]);
+    const gatewayStoppedByMissingConfigRestore = !isProcessAlive(gatewayPidBeforeMissingConfigRestore);
+    if (!gatewayStoppedByMissingConfigRestore) {
+      await stopProcessById(gatewayPidBeforeMissingConfigRestore);
+    }
+    assert(
+      gatewayStoppedByMissingConfigRestore,
+      "Restore with missing config.json left the verified gateway process running without state",
+    );
+
     process.stdout.write("PASS install-restore flow\n");
   } finally {
+    try {
+      await runPowerShellScript(stopScript, ["-StateRoot", stateRoot, "-Quiet"]);
+    } catch {
+      // 测试清理阶段允许忽略停止失败，避免覆盖主失败原因。
+    }
     upstream.close();
     await once(upstream, "close");
     await rm(tempRoot, { recursive: true, force: true });

@@ -29,7 +29,14 @@ bash ./scripts/launch-ui.sh
 说明：
 
 - 第一次运行会自动安装并接管当前 Codex provider
-- 再次运行会自动拉起或重启 gateway，并重新打开 UI
+- 再次运行会先核对 provider、配置、PID 与 health：无变化且健康时零写入、零重启；停止时拉起；配置迁移时才重启
+- provider 漂移时只恢复 gateway 接管；恢复备份缺失且当前 provider 指向真实上游时，会先保存该真实配置；切换 provider 时不会复用另一 provider 的备份
+- PID 必须与 health 返回的 `process_id` 一致才允许停止；陈旧 PID 不会终止无关存活进程
+- 手工 install 与 launch 共用恢复控制面；直接 start 也先验证 PID；新进程 health 必须回报自己的 `process_id`
+- 新 child 从 PID 写入开始进入 start 清理事务；写入/启动验证失败时自行终止，确认退出后才清理仍指向该 child 的 PID 文件
+- `config.json` 丢失但旧 gateway 健康时会从状态接口恢复运行时配置；目录型恢复点会在停机前被拒绝
+- stop/restore 遇到缺失配置时会从 state 地址恢复进程身份，无法验证时不会删除 PID/state 或继续恢复
+- 配置迁移启动失败会恢复旧文件，并在迁移前实例健康时按旧配置重新拉起
 - 不依赖 `cc-switch` 安装本体，也不依赖 `cc-switch` 路由模式
 - macOS / Linux 入口依赖 `bash` 和 `Node.js 18+`
 - 推荐显式使用 `bash ...sh`，避免跨平台复制后可执行位丢失
@@ -150,6 +157,20 @@ reasoning 统计落盘说明：
 - 严格流式拦截会缓存 SSE，请求体也会先读入内存；高并发或大响应场景需要额外压测、日志轮转和内存上限治理。
 
 ## 本地验证
+
+直接运行 Node 测试入口：
+
+```powershell
+node .\scripts\test-gateway-e2e.mjs
+node .\scripts\test-launch-ui.mjs
+node .\scripts\test-launch-ui-unix.mjs
+node .\scripts\test-install-restore.mjs
+node --check .\gateway.mjs
+node --check .\scripts\admin-lib.mjs
+git diff --check
+```
+
+PowerShell 包装入口：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\test-launch-ui.ps1

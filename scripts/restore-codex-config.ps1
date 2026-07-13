@@ -15,7 +15,7 @@ if ($null -eq $state) {
 }
 
 $backupPath = [string]$state.latest_backup_path
-if ([string]::IsNullOrWhiteSpace($backupPath) -or -not (Test-Path -LiteralPath $backupPath)) {
+if ([string]::IsNullOrWhiteSpace($backupPath) -or -not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
   throw "A restorable backup file was not found: $backupPath"
 }
 

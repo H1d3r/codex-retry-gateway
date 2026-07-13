@@ -15,6 +15,7 @@ export const DEFAULT_REQUEST_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
 export const LEGACY_REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_INTERCEPT_RULE_MODE = "reasoning_tokens";
 export const FINAL_ONLY_HIGH_XHIGH_INTERCEPT_RULE_MODE = "final_answer_only_high_xhigh";
+export const MANUAL_REASONING_MATCH_MODE = "manual";
 export const FORMULA_518N_MINUS_2_REASONING_MATCH_MODE = "formula_518n_minus_2";
 export const DEFAULT_REASONING_MATCH_MODE = FORMULA_518N_MINUS_2_REASONING_MATCH_MODE;
 export const DEFAULT_CONTINUATION_MARKER_TEXT = "Continue thinking...";
@@ -35,9 +36,9 @@ function normalizeInterceptRuleMode(value) {
 
 function normalizeReasoningMatchMode(value) {
   const normalized = `${value || ""}`.trim().toLowerCase();
-  return normalized === FORMULA_518N_MINUS_2_REASONING_MATCH_MODE
-    ? FORMULA_518N_MINUS_2_REASONING_MATCH_MODE
-    : DEFAULT_REASONING_MATCH_MODE;
+  return normalized === MANUAL_REASONING_MATCH_MODE
+    ? MANUAL_REASONING_MATCH_MODE
+    : FORMULA_518N_MINUS_2_REASONING_MATCH_MODE;
 }
 
 function normalizeContinuationMarkerText(value) {
@@ -142,6 +143,113 @@ export async function readJsonFile(filePath) {
 
 export async function writeJsonFile(filePath, value) {
   await writeUtf8File(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function cloneJsonValue(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function jsonValuesEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function isFilePath(filePath) {
+  if (typeof filePath !== "string" || !filePath.trim()) {
+    return false;
+  }
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function installStateMatchesProvider(state, providerName, codexConfigPath) {
+  if (!state?.provider_name || !state?.codex_config_path) {
+    return false;
+  }
+  const normalizePath = (value) => {
+    const resolved = path.resolve(`${value}`);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  return (
+    `${state.provider_name}` === `${providerName}` &&
+    normalizePath(state.codex_config_path) === normalizePath(codexConfigPath)
+  );
+}
+
+async function readLiveGatewayPid(pidPath) {
+  if (!fs.existsSync(pidPath)) {
+    return null;
+  }
+  const raw = (await readFile(pidPath, "utf8")).trim();
+  const processId = Number.parseInt(raw, 10);
+  return Number.isInteger(processId) && isProcessAlive(processId) ? processId : null;
+}
+
+async function isGatewayHealthy(gatewayConfig, expectedProcessId = null, timeoutMs = 1500) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const baseUrl = getGatewayBaseUrlFromConfig(gatewayConfig);
+    if (!baseUrl) {
+      return false;
+    }
+    const response = await fetch(`${baseUrl}${gatewayConfig.health_path || DEFAULT_HEALTH_PATH}`, {
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return false;
+    }
+    if (expectedProcessId === null) {
+      return true;
+    }
+    const payload = await response.json();
+    return Number(payload?.process_id) === expectedProcessId;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readGatewayRuntimeConfig(baseUrl, expectedProcessId, timeoutMs = 1500) {
+  if (!baseUrl || !Number.isInteger(expectedProcessId)) {
+    return null;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(
+      `${`${baseUrl}`.replace(/\/+$/, "")}/__codex_retry_gateway/api/status`,
+      { signal: controller.signal },
+    );
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json();
+    if (Number(payload?.process_id) !== expectedProcessId || !payload?.config) {
+      return null;
+    }
+    return cloneJsonValue(payload.config);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function createUniqueBackupPath(backupDir) {
+  const timestamp = new Date().toISOString().replace(/\D/g, "");
+  let suffix = 0;
+  while (true) {
+    const suffixText = suffix === 0 ? "" : `-${suffix}`;
+    const candidate = path.join(backupDir, `config-${timestamp}${suffixText}.toml`);
+    if (!fs.existsSync(candidate)) {
+      return candidate;
+    }
+    suffix += 1;
+  }
 }
 
 export async function getCodexProviderContext(codexConfigPath) {
@@ -254,6 +362,7 @@ export async function waitGatewayHealth({
   listenPort,
   healthPath,
   timeoutSeconds = 10,
+  expectedProcessId = null,
 }) {
   const deadline = Date.now() + timeoutSeconds * 1000;
   const healthUrl = `${getGatewayBaseUrl(listenHost, listenPort)}${healthPath}`;
@@ -262,7 +371,13 @@ export async function waitGatewayHealth({
     try {
       const response = await fetch(healthUrl, { signal: AbortSignal.timeout(2000) });
       if (response.status === 200) {
-        return response;
+        if (expectedProcessId === null) {
+          return response;
+        }
+        const payload = await response.json();
+        if (Number(payload?.process_id) === expectedProcessId) {
+          return response;
+        }
       }
     } catch {
       // ignore and retry
@@ -303,7 +418,11 @@ function openUrl(url) {
   child.unref();
 }
 
-export async function stopGateway({ stateRoot = DEFAULT_STATE_ROOT, quiet = false }) {
+export async function stopGateway({
+  stateRoot = DEFAULT_STATE_ROOT,
+  quiet = false,
+  gatewayConfig: expectedGatewayConfig = null,
+}) {
   const paths = getGatewayStatePaths(stateRoot);
   if (!fs.existsSync(paths.pidPath)) {
     return quiet ? null : "No running gateway PID file was found.";
@@ -317,6 +436,16 @@ export async function stopGateway({ stateRoot = DEFAULT_STATE_ROOT, quiet = fals
 
   const gatewayPid = Number.parseInt(pidRaw, 10);
   if (Number.isInteger(gatewayPid) && isProcessAlive(gatewayPid)) {
+    let gatewayConfig = expectedGatewayConfig || await readJsonFile(paths.configPath);
+    if (!gatewayConfig) {
+      const state = await readJsonFile(paths.statePath);
+      gatewayConfig = await readGatewayRuntimeConfig(state?.gateway_base_url, gatewayPid);
+    }
+    const verifiedGatewayProcess =
+      gatewayConfig && await isGatewayHealthy(gatewayConfig, gatewayPid);
+    if (!verifiedGatewayProcess) {
+      throw new Error(`Gateway PID could not be verified and was not stopped: ${gatewayPid}`);
+    }
     try {
       process.kill(gatewayPid);
     } catch {
@@ -341,11 +470,48 @@ export async function stopGateway({ stateRoot = DEFAULT_STATE_ROOT, quiet = fals
   return quiet ? null : `Gateway stopped. PID=${gatewayPid}`;
 }
 
+export async function cleanupFailedGatewayStart({ processId, pidPath }) {
+  if (Number.isInteger(processId) && isProcessAlive(processId)) {
+    try {
+      process.kill(processId);
+    } catch {
+      // 忽略第一次终止失败。
+    }
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && isProcessAlive(processId)) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (isProcessAlive(processId)) {
+      try {
+        process.kill(processId, "SIGKILL");
+      } catch {
+        // 忽略强制终止失败。
+      }
+      const hardKillDeadline = Date.now() + 1000;
+      while (Date.now() < hardKillDeadline && isProcessAlive(processId)) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+  }
+
+  if (!isProcessAlive(processId) && fs.existsSync(pidPath)) {
+    try {
+      const currentPid = Number.parseInt((await readFile(pidPath, "utf8")).trim(), 10);
+      if (currentPid === processId) {
+        await rm(pidPath, { force: true });
+      }
+    } catch {
+      // 无法安全归属时保留 PID 文件。
+    }
+  }
+}
+
 export async function startGateway({
   stateRoot = DEFAULT_STATE_ROOT,
   configPath,
   logPath,
   restartIfRunning = false,
+  writePidFile = writeUtf8File,
 }) {
   const paths = getGatewayStatePaths(stateRoot);
   const effectiveConfigPath = configPath || paths.configPath;
@@ -357,25 +523,29 @@ export async function startGateway({
 
   await ensureDirectory(path.dirname(effectiveLogPath));
 
+  const gatewayConfig = await readJsonFile(effectiveConfigPath);
+  if (!gatewayConfig) {
+    throw new Error(`Gateway config file could not be read: ${effectiveConfigPath}`);
+  }
+
   if (fs.existsSync(paths.pidPath)) {
     const existingPidRaw = (await readFile(paths.pidPath, "utf8")).trim();
     if (existingPidRaw) {
       const existingPid = Number.parseInt(existingPidRaw, 10);
       if (Number.isInteger(existingPid) && isProcessAlive(existingPid)) {
-        if (restartIfRunning) {
-          await stopGateway({ stateRoot, quiet: true });
+        if (await isGatewayHealthy(gatewayConfig, existingPid)) {
+          if (restartIfRunning) {
+            await stopGateway({ stateRoot, quiet: true });
+          } else {
+            return `Gateway is already running. PID=${existingPid}`;
+          }
         } else {
-          return `Gateway is already running. PID=${existingPid}`;
+          await rm(paths.pidPath, { force: true });
         }
       } else {
         await rm(paths.pidPath, { force: true });
       }
     }
-  }
-
-  const gatewayConfig = await readJsonFile(effectiveConfigPath);
-  if (!gatewayConfig) {
-    throw new Error(`Gateway config file could not be read: ${effectiveConfigPath}`);
   }
 
   const gatewayRoot = getGatewayRoot();
@@ -392,24 +562,33 @@ export async function startGateway({
   });
   child.unref();
 
-  await writeUtf8File(paths.pidPath, `${child.pid}`);
+  try {
+    await writePidFile(paths.pidPath, `${child.pid}`);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    if (!isProcessAlive(child.pid)) {
+      const logTail = await readTail(effectiveLogPath, 20);
+      throw new Error(`Gateway exited right after startup. PID=${child.pid}\n${logTail}`);
+    }
 
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  if (!isProcessAlive(child.pid)) {
-    const logTail = await readTail(effectiveLogPath, 20);
-    throw new Error(`Gateway exited right after startup. PID=${child.pid}\n${logTail}`);
+    await waitGatewayHealth({
+      listenHost: `${gatewayConfig.listen_host}`,
+      listenPort: Number.parseInt(`${gatewayConfig.listen_port}`, 10),
+      healthPath: `${gatewayConfig.health_path || DEFAULT_HEALTH_PATH}`,
+      expectedProcessId: child.pid,
+    });
+  } catch (error) {
+    try {
+      await cleanupFailedGatewayStart({ processId: child.pid, pidPath: paths.pidPath });
+    } catch {
+      // 保留原始启动错误。
+    }
+    throw error;
   }
-
-  await waitGatewayHealth({
-    listenHost: `${gatewayConfig.listen_host}`,
-    listenPort: Number.parseInt(`${gatewayConfig.listen_port}`, 10),
-    healthPath: `${gatewayConfig.health_path || DEFAULT_HEALTH_PATH}`,
-  });
 
   return `Gateway started. PID=${child.pid}. Listen=${getGatewayBaseUrl(gatewayConfig.listen_host, gatewayConfig.listen_port)}`;
 }
 
-export async function installForCurrentProvider({
+async function applyInstallForCurrentProvider({
   codexConfigPath = DEFAULT_CODEX_CONFIG_PATH,
   stateRoot = DEFAULT_STATE_ROOT,
   listenHost = DEFAULT_LISTEN_HOST,
@@ -428,11 +607,22 @@ export async function installForCurrentProvider({
   const providerContext = await getCodexProviderContext(codexConfigPath);
   const localGatewayBaseUrl = getGatewayBaseUrl(listenHost, listenPort);
   const existingState = await readJsonFile(paths.statePath);
+  const existingGatewayConfig = await readJsonFile(paths.configPath);
+  const existingStateMatchesProvider = installStateMatchesProvider(
+    existingState,
+    providerContext.providerName,
+    codexConfigPath,
+  );
 
   let originalBaseUrl = providerContext.currentBaseUrl;
   if (providerContext.currentBaseUrl === localGatewayBaseUrl) {
-    if (!existingState?.original_base_url) {
-      throw new Error("Provider already points to the local gateway, but original_base_url is missing from state.");
+    if (
+      !existingState?.original_base_url ||
+      !existingStateMatchesProvider
+    ) {
+      throw new Error(
+        "Provider already points to the local gateway, but no matching install state can supply original_base_url.",
+      );
     }
     originalBaseUrl = `${existingState.original_base_url}`;
   }
@@ -441,10 +631,16 @@ export async function installForCurrentProvider({
     throw new Error("A real upstream_base_url could not be determined.");
   }
 
-  const backupPath = path.join(paths.backupDir, `config-${new Date().toISOString().replace(/[:.]/g, "").replace("T", "-").slice(0, 15)}.toml`);
-  await copyFile(codexConfigPath, backupPath);
+  const existingBackupPath =
+    existingStateMatchesProvider && existingState?.latest_backup_path
+      ? `${existingState.latest_backup_path}`
+      : "";
+  let backupPath = isFilePath(existingBackupPath) ? existingBackupPath : "";
+  if (!backupPath && providerContext.currentBaseUrl !== localGatewayBaseUrl) {
+    backupPath = createUniqueBackupPath(paths.backupDir);
+    await copyFile(codexConfigPath, backupPath);
+  }
 
-  const existingGatewayConfig = await readJsonFile(paths.configPath);
   const defaultEndpoints = ["/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions"];
   const mergedEndpoints = [];
   for (const endpoint of [
@@ -509,8 +705,10 @@ export async function installForCurrentProvider({
       restartIfRunning: true,
     });
 
+    const installedAt = new Date().toISOString();
     const state = {
-      installed_at: new Date().toISOString(),
+      installed_at: installedAt,
+      last_started_at: installedAt,
       codex_config_path: codexConfigPath,
       provider_name: providerContext.providerName,
       original_base_url: originalBaseUrl,
@@ -537,6 +735,33 @@ export async function installForCurrentProvider({
   }
 }
 
+export async function installForCurrentProvider({
+  codexConfigPath = DEFAULT_CODEX_CONFIG_PATH,
+  stateRoot = DEFAULT_STATE_ROOT,
+  listenHost = DEFAULT_LISTEN_HOST,
+  listenPort = DEFAULT_LISTEN_PORT,
+}) {
+  const launchResult = await launchUi({
+    codexConfigPath,
+    stateRoot,
+    listenHost,
+    listenPort,
+    noOpen: true,
+  });
+  const paths = getGatewayStatePaths(stateRoot);
+  const state = await readJsonFile(paths.statePath);
+  const gatewayConfig = await readJsonFile(paths.configPath);
+  const providerContext = await getCodexProviderContext(codexConfigPath);
+  return {
+    provider: state?.provider_name || providerContext.providerName,
+    upstream: state?.original_base_url || gatewayConfig?.upstream_base_url || "",
+    gateway: getGatewayBaseUrlFromConfig(gatewayConfig) || launchResult.gatewayBaseUrl,
+    configPath: paths.configPath,
+    backupPath: state?.latest_backup_path ? `${state.latest_backup_path}` : "",
+    reused: launchResult.mode === "reuse",
+  };
+}
+
 export async function restoreCodexConfig({
   stateRoot = DEFAULT_STATE_ROOT,
   codexConfigPath = DEFAULT_CODEX_CONFIG_PATH,
@@ -548,7 +773,7 @@ export async function restoreCodexConfig({
   }
 
   const backupPath = `${state.latest_backup_path || ""}`;
-  if (!backupPath || !fs.existsSync(backupPath)) {
+  if (!isFilePath(backupPath)) {
     throw new Error(`A restorable backup file was not found: ${backupPath}`);
   }
 
@@ -583,16 +808,17 @@ export async function launchUi({
   const currentBaseUrl = `${providerContext.currentBaseUrl}`;
   const requestedGatewayBaseUrl = getGatewayBaseUrl(listenHost, listenPort);
   const existingState = await readJsonFile(paths.statePath);
-  const existingGatewayConfig = await readJsonFile(paths.configPath);
-  const stateGatewayBaseUrl = existingState?.gateway_base_url ? `${existingState.gateway_base_url}` : null;
-  const configGatewayBaseUrl = getGatewayBaseUrlFromConfig(existingGatewayConfig);
-  const managedGatewayBaseUrls = [requestedGatewayBaseUrl];
-  for (const candidate of [stateGatewayBaseUrl, configGatewayBaseUrl]) {
-    if (candidate && !managedGatewayBaseUrls.includes(candidate)) {
-      managedGatewayBaseUrls.push(candidate);
-    }
+  let existingGatewayConfig = await readJsonFile(paths.configPath);
+  if (
+    !existingGatewayConfig &&
+    installStateMatchesProvider(existingState, providerContext.providerName, codexConfigPath)
+  ) {
+    const gatewayProcessId = await readLiveGatewayPid(paths.pidPath);
+    existingGatewayConfig = await readGatewayRuntimeConfig(
+      existingState?.gateway_base_url,
+      gatewayProcessId,
+    );
   }
-
   const originalBaseUrl =
     existingState?.original_base_url
       ? `${existingState.original_base_url}`
@@ -603,11 +829,11 @@ export async function launchUi({
   const canReuseExistingInstall =
     existingGatewayConfig &&
     originalBaseUrl &&
-    managedGatewayBaseUrls.includes(currentBaseUrl);
+    installStateMatchesProvider(existingState, providerContext.providerName, codexConfigPath);
 
   let mode = "install";
   if (!canReuseExistingInstall) {
-    await installForCurrentProvider({
+    await applyInstallForCurrentProvider({
       codexConfigPath,
       stateRoot,
       listenHost,
@@ -619,59 +845,106 @@ export async function launchUi({
     const previousGatewayConfigContent = fs.existsSync(paths.configPath)
       ? await readFile(paths.configPath, "utf8")
       : null;
+    const previousGatewayRuntimeConfigContent = `${JSON.stringify(existingGatewayConfig, null, 2)}\n`;
     const previousStateContent = fs.existsSync(paths.statePath)
       ? await readFile(paths.statePath, "utf8")
       : null;
+    let providerConfigWritten = false;
+    let gatewayConfigWritten = false;
+    let stateWritten = false;
+    let gatewayLifecycleAttempted = false;
+    let previousGatewayHealthy = false;
+    let recoveryBackupPath = existingState?.latest_backup_path ? `${existingState.latest_backup_path}` : "";
+    let recoveryBackupCreated = false;
 
     try {
-      existingGatewayConfig.listen_host = listenHost;
-      existingGatewayConfig.listen_port = listenPort;
-      if (!existingGatewayConfig.health_path) {
-        existingGatewayConfig.health_path = DEFAULT_HEALTH_PATH;
+      const reusableGatewayConfig = cloneJsonValue(existingGatewayConfig);
+      reusableGatewayConfig.listen_host = listenHost;
+      reusableGatewayConfig.listen_port = listenPort;
+      if (!reusableGatewayConfig.health_path) {
+        reusableGatewayConfig.health_path = DEFAULT_HEALTH_PATH;
       }
       const legacyContinuationRuleMode = isLegacyContinuationRuleMode(
-        existingGatewayConfig.intercept_rule_mode,
+        reusableGatewayConfig.intercept_rule_mode,
       );
       if (legacyContinuationRuleMode) {
-        existingGatewayConfig.stream_action = CONTINUATION_RECOVERY_STREAM_ACTION;
-      } else if (!existingGatewayConfig.stream_action) {
-        existingGatewayConfig.stream_action = DEFAULT_STREAM_ACTION;
+        reusableGatewayConfig.stream_action = CONTINUATION_RECOVERY_STREAM_ACTION;
+      } else if (!reusableGatewayConfig.stream_action) {
+        reusableGatewayConfig.stream_action = DEFAULT_STREAM_ACTION;
       }
-      existingGatewayConfig.continuation_marker_text = normalizeContinuationMarkerText(
-        existingGatewayConfig.continuation_marker_text,
+      reusableGatewayConfig.continuation_marker_text = normalizeContinuationMarkerText(
+        reusableGatewayConfig.continuation_marker_text,
       );
-      existingGatewayConfig.intercept_rule_mode = normalizeInterceptRuleMode(
-        existingGatewayConfig.intercept_rule_mode,
+      reusableGatewayConfig.intercept_rule_mode = normalizeInterceptRuleMode(
+        reusableGatewayConfig.intercept_rule_mode,
       );
-      existingGatewayConfig.reasoning_match_mode = normalizeReasoningMatchMode(
-        existingGatewayConfig.reasoning_match_mode,
+      reusableGatewayConfig.reasoning_match_mode = normalizeReasoningMatchMode(
+        reusableGatewayConfig.reasoning_match_mode,
       );
-      if (existingGatewayConfig.intercept_streaming === undefined) {
-        existingGatewayConfig.intercept_streaming = true;
+      if (reusableGatewayConfig.intercept_streaming === undefined) {
+        reusableGatewayConfig.intercept_streaming = true;
       }
-      if (existingGatewayConfig.intercept_non_streaming === undefined) {
-        existingGatewayConfig.intercept_non_streaming = true;
+      if (reusableGatewayConfig.intercept_non_streaming === undefined) {
+        reusableGatewayConfig.intercept_non_streaming = true;
       }
-      if (existingGatewayConfig.guard_retry_attempts === undefined || existingGatewayConfig.guard_retry_attempts === null) {
-        existingGatewayConfig.guard_retry_attempts = DEFAULT_GUARD_RETRY_ATTEMPTS;
+      if (reusableGatewayConfig.guard_retry_attempts === undefined || reusableGatewayConfig.guard_retry_attempts === null) {
+        reusableGatewayConfig.guard_retry_attempts = DEFAULT_GUARD_RETRY_ATTEMPTS;
       }
       if (
-        existingGatewayConfig.retry_upstream_capacity_errors === undefined ||
-        existingGatewayConfig.retry_upstream_capacity_errors === null
+        reusableGatewayConfig.retry_upstream_capacity_errors === undefined ||
+        reusableGatewayConfig.retry_upstream_capacity_errors === null
       ) {
-        existingGatewayConfig.retry_upstream_capacity_errors = true;
+        reusableGatewayConfig.retry_upstream_capacity_errors = true;
       } else {
-        existingGatewayConfig.retry_upstream_capacity_errors =
-          existingGatewayConfig.retry_upstream_capacity_errors !== false;
+        reusableGatewayConfig.retry_upstream_capacity_errors =
+          reusableGatewayConfig.retry_upstream_capacity_errors !== false;
       }
-      existingGatewayConfig.request_body_limit_bytes = normalizeRequestBodyLimitBytes(
-        existingGatewayConfig.request_body_limit_bytes,
+      reusableGatewayConfig.request_body_limit_bytes = normalizeRequestBodyLimitBytes(
+        reusableGatewayConfig.request_body_limit_bytes,
       );
-      if (!existingGatewayConfig.intercept_streaming && !existingGatewayConfig.intercept_non_streaming) {
-        existingGatewayConfig.intercept_streaming = true;
-        existingGatewayConfig.intercept_non_streaming = true;
+      if (!reusableGatewayConfig.intercept_streaming && !reusableGatewayConfig.intercept_non_streaming) {
+        reusableGatewayConfig.intercept_streaming = true;
+        reusableGatewayConfig.intercept_non_streaming = true;
       }
-      await writeJsonFile(paths.configPath, existingGatewayConfig);
+      const gatewayConfigChanged = !jsonValuesEqual(existingGatewayConfig, reusableGatewayConfig);
+      const gatewayConfigNeedsWrite =
+        previousGatewayConfigContent === null || gatewayConfigChanged;
+      const gatewayProcessId = await readLiveGatewayPid(paths.pidPath);
+      const gatewayProcessAlive = gatewayProcessId !== null;
+      previousGatewayHealthy =
+        gatewayProcessId !== null &&
+        await isGatewayHealthy(existingGatewayConfig, gatewayProcessId);
+      if (gatewayProcessAlive && !previousGatewayHealthy) {
+        await rm(paths.pidPath, { force: true });
+      }
+
+      const managedGatewayBaseUrls = new Set(
+        [
+          requestedGatewayBaseUrl,
+          existingState?.gateway_base_url ? `${existingState.gateway_base_url}` : null,
+          getGatewayBaseUrlFromConfig(existingGatewayConfig),
+        ].filter(Boolean),
+      );
+      const recoveryBackupUsable = isFilePath(recoveryBackupPath);
+      if (!recoveryBackupUsable && !managedGatewayBaseUrls.has(currentBaseUrl)) {
+        recoveryBackupPath = createUniqueBackupPath(paths.backupDir);
+        await copyFile(codexConfigPath, recoveryBackupPath);
+        recoveryBackupCreated = true;
+      }
+
+      if (gatewayConfigChanged && previousGatewayHealthy) {
+        gatewayLifecycleAttempted = true;
+        await stopGateway({
+          stateRoot,
+          quiet: true,
+          gatewayConfig: existingGatewayConfig,
+        });
+      }
+
+      if (gatewayConfigNeedsWrite) {
+        await writeJsonFile(paths.configPath, reusableGatewayConfig);
+        gatewayConfigWritten = true;
+      }
 
       if (currentBaseUrl !== requestedGatewayBaseUrl) {
         await setCodexProviderBaseUrl({
@@ -679,18 +952,25 @@ export async function launchUi({
           providerName: providerContext.providerName,
           newBaseUrl: requestedGatewayBaseUrl,
         });
+        providerConfigWritten = true;
       }
 
-      await startGateway({
-        stateRoot,
-        configPath: paths.configPath,
-        logPath: paths.logPath,
-        restartIfRunning: true,
-      });
+      const gatewayLifecycleChanged = !previousGatewayHealthy || gatewayConfigChanged;
+      if (gatewayLifecycleChanged) {
+        gatewayLifecycleAttempted = true;
+        await startGateway({
+          stateRoot,
+          configPath: paths.configPath,
+          logPath: paths.logPath,
+          restartIfRunning: false,
+        });
+      }
 
       const statePayload = {
         installed_at: existingState?.installed_at ? `${existingState.installed_at}` : new Date().toISOString(),
-        last_started_at: new Date().toISOString(),
+        last_started_at: gatewayLifecycleChanged
+          ? new Date().toISOString()
+          : existingState?.last_started_at || existingState?.installed_at || new Date().toISOString(),
         codex_config_path: codexConfigPath,
         provider_name: providerContext.providerName,
         original_base_url: originalBaseUrl,
@@ -698,19 +978,96 @@ export async function launchUi({
         gateway_config_path: paths.configPath,
         gateway_log_path: paths.logPath,
         gateway_pid_path: paths.pidPath,
-        latest_backup_path: existingState?.latest_backup_path ? `${existingState.latest_backup_path}` : "",
+        latest_backup_path: recoveryBackupPath,
         state_root: paths.stateRoot,
       };
-      await writeJsonFile(paths.statePath, statePayload);
+      if (!jsonValuesEqual(existingState, statePayload)) {
+        await writeJsonFile(paths.statePath, statePayload);
+        stateWritten = true;
+      }
     } catch (error) {
-      await writeUtf8File(codexConfigPath, previousCodexConfigContent);
-      if (previousGatewayConfigContent !== null) {
-        await writeUtf8File(paths.configPath, previousGatewayConfigContent);
+      const rollbackErrors = [];
+
+      if (gatewayLifecycleAttempted) {
+        try {
+          await stopGateway({ stateRoot, quiet: true });
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
       }
-      if (previousStateContent !== null) {
-        await writeUtf8File(paths.statePath, previousStateContent);
+
+      if (providerConfigWritten) {
+        try {
+          await writeUtf8File(codexConfigPath, previousCodexConfigContent);
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
       }
-      await stopGateway({ stateRoot, quiet: true });
+
+      if (gatewayConfigWritten) {
+        try {
+          if (previousGatewayConfigContent === null) {
+            await rm(paths.configPath, { force: true });
+          } else {
+            await writeUtf8File(paths.configPath, previousGatewayConfigContent);
+          }
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+
+      if (stateWritten) {
+        try {
+          if (previousStateContent === null) {
+            await rm(paths.statePath, { force: true });
+          } else {
+            await writeUtf8File(paths.statePath, previousStateContent);
+          }
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+
+      if (recoveryBackupCreated) {
+        try {
+          await rm(recoveryBackupPath, { force: true });
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+
+      if (gatewayLifecycleAttempted && previousGatewayHealthy) {
+        let temporaryRollbackConfigWritten = false;
+        try {
+          if (!fs.existsSync(paths.configPath)) {
+            await writeUtf8File(paths.configPath, previousGatewayRuntimeConfigContent);
+            temporaryRollbackConfigWritten = true;
+          }
+          await startGateway({
+            stateRoot,
+            configPath: paths.configPath,
+            logPath: paths.logPath,
+            restartIfRunning: true,
+          });
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        } finally {
+          if (temporaryRollbackConfigWritten) {
+            try {
+              await rm(paths.configPath, { force: true });
+            } catch (rollbackError) {
+              rollbackErrors.push(rollbackError);
+            }
+          }
+        }
+      }
+
+      if (rollbackErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...rollbackErrors],
+          "Gateway launch failed and rollback did not complete cleanly.",
+        );
+      }
       throw error;
     }
   }
