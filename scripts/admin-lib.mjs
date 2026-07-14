@@ -15,6 +15,12 @@ export const DEFAULT_REQUEST_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
 export const LEGACY_REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_INTERCEPT_RULE_MODE = "reasoning_tokens";
 export const FINAL_ONLY_HIGH_XHIGH_INTERCEPT_RULE_MODE = "final_answer_only_high_xhigh";
+export const NONE_INTERCEPT_RULE_MODE = "none";
+const INTERCEPT_RULE_MODES = new Set([
+  DEFAULT_INTERCEPT_RULE_MODE,
+  FINAL_ONLY_HIGH_XHIGH_INTERCEPT_RULE_MODE,
+  NONE_INTERCEPT_RULE_MODE,
+]);
 export const MANUAL_REASONING_MATCH_MODE = "manual";
 export const FORMULA_518N_MINUS_2_REASONING_MATCH_MODE = "formula_518n_minus_2";
 export const DEFAULT_REASONING_MATCH_MODE = FORMULA_518N_MINUS_2_REASONING_MATCH_MODE;
@@ -22,6 +28,21 @@ export const DEFAULT_CONTINUATION_MARKER_TEXT = "Continue thinking...";
 export const CONTINUATION_RECOVERY_STREAM_ACTION = "continuation_recovery";
 export const DEFAULT_STREAM_ACTION = CONTINUATION_RECOVERY_STREAM_ACTION;
 export const DEFAULT_GUARD_RETRY_ATTEMPTS = 5;
+const UPSTREAM_ERROR_ACTIONS = new Set([
+  "pass_through",
+  "return_502",
+  "retry_then_pass_through",
+  "retry_then_502",
+]);
+const FIRST_PROGRESS_ACTIONS = new Set(["return_502", "retry_then_502"]);
+const DEFAULT_CAPACITY_ERROR_ACTION = "retry_then_pass_through";
+const DEFAULT_HTTP_429_ACTION = "pass_through";
+const DEFAULT_LATENCY_GUARD = {
+  enabled: false,
+  first_progress_timeout_ms: 0,
+  first_progress_action: "return_502",
+  total_timeout_ms: 0,
+};
 
 function escapeRegExp(value) {
   return `${value}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -29,9 +50,7 @@ function escapeRegExp(value) {
 
 function normalizeInterceptRuleMode(value) {
   const normalized = `${value || ""}`.trim().toLowerCase();
-  return normalized === FINAL_ONLY_HIGH_XHIGH_INTERCEPT_RULE_MODE
-    ? FINAL_ONLY_HIGH_XHIGH_INTERCEPT_RULE_MODE
-    : DEFAULT_INTERCEPT_RULE_MODE;
+  return INTERCEPT_RULE_MODES.has(normalized) ? normalized : DEFAULT_INTERCEPT_RULE_MODE;
 }
 
 function normalizeReasoningMatchMode(value) {
@@ -50,6 +69,49 @@ function normalizeContinuationMarkerText(value) {
 
 function isLegacyContinuationRuleMode(value) {
   return `${value || ""}`.trim().toLowerCase() === CONTINUATION_RECOVERY_STREAM_ACTION;
+}
+
+function normalizeUpstreamErrorAction(value, fallback) {
+  const normalized = `${value ?? ""}`.trim().toLowerCase();
+  return UPSTREAM_ERROR_ACTIONS.has(normalized) ? normalized : fallback;
+}
+
+function normalizeLatencyGuardInteger(value, fallback) {
+  if (value === undefined || value === null || `${value}`.trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function normalizeLatencyGuardConfig(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const normalized = {
+    enabled: typeof source.enabled === "boolean" ? source.enabled : DEFAULT_LATENCY_GUARD.enabled,
+    first_progress_timeout_ms: normalizeLatencyGuardInteger(
+      source.first_progress_timeout_ms,
+      DEFAULT_LATENCY_GUARD.first_progress_timeout_ms,
+    ),
+    first_progress_action: normalizeUpstreamErrorAction(
+      source.first_progress_action,
+      DEFAULT_LATENCY_GUARD.first_progress_action,
+    ),
+    total_timeout_ms: normalizeLatencyGuardInteger(
+      source.total_timeout_ms,
+      DEFAULT_LATENCY_GUARD.total_timeout_ms,
+    ),
+  };
+  if (!FIRST_PROGRESS_ACTIONS.has(normalized.first_progress_action)) {
+    normalized.first_progress_action = DEFAULT_LATENCY_GUARD.first_progress_action;
+  }
+  if (
+    normalized.enabled &&
+    normalized.first_progress_timeout_ms === 0 &&
+    normalized.total_timeout_ms === 0
+  ) {
+    normalized.enabled = false;
+  }
+  return normalized;
 }
 
 export function parseOptions(argv, { booleanFlags = [] } = {}) {
@@ -655,6 +717,10 @@ async function applyInstallForCurrentProvider({
   const legacyContinuationRuleMode = isLegacyContinuationRuleMode(
     existingGatewayConfig?.intercept_rule_mode,
   );
+  const retryUpstreamCapacityErrors = existingGatewayConfig?.retry_upstream_capacity_errors !== false;
+  const legacyCapacityAction = retryUpstreamCapacityErrors
+    ? DEFAULT_CAPACITY_ERROR_ACTION
+    : "pass_through";
   const gatewayConfig = {
     listen_host: listenHost,
     listen_port: listenPort,
@@ -677,7 +743,16 @@ async function applyInstallForCurrentProvider({
         ? 502
         : Number.parseInt(`${existingGatewayConfig.non_stream_status_code}`, 10),
     guard_retry_attempts: normalizeGuardRetryAttempts(existingGatewayConfig?.guard_retry_attempts),
-    retry_upstream_capacity_errors: existingGatewayConfig?.retry_upstream_capacity_errors !== false,
+    retry_upstream_capacity_errors: retryUpstreamCapacityErrors,
+    capacity_error_action: normalizeUpstreamErrorAction(
+      existingGatewayConfig?.capacity_error_action,
+      legacyCapacityAction,
+    ),
+    http_429_action: normalizeUpstreamErrorAction(
+      existingGatewayConfig?.http_429_action,
+      DEFAULT_HTTP_429_ACTION,
+    ),
+    latency_guard: normalizeLatencyGuardConfig(existingGatewayConfig?.latency_guard),
     stream_action: legacyContinuationRuleMode
       ? CONTINUATION_RECOVERY_STREAM_ACTION
       : existingGatewayConfig?.stream_action || DEFAULT_STREAM_ACTION,
@@ -899,6 +974,20 @@ export async function launchUi({
         reusableGatewayConfig.retry_upstream_capacity_errors =
           reusableGatewayConfig.retry_upstream_capacity_errors !== false;
       }
+      const legacyCapacityAction = reusableGatewayConfig.retry_upstream_capacity_errors
+        ? DEFAULT_CAPACITY_ERROR_ACTION
+        : "pass_through";
+      reusableGatewayConfig.capacity_error_action = normalizeUpstreamErrorAction(
+        reusableGatewayConfig.capacity_error_action,
+        legacyCapacityAction,
+      );
+      reusableGatewayConfig.http_429_action = normalizeUpstreamErrorAction(
+        reusableGatewayConfig.http_429_action,
+        DEFAULT_HTTP_429_ACTION,
+      );
+      reusableGatewayConfig.latency_guard = normalizeLatencyGuardConfig(
+        reusableGatewayConfig.latency_guard,
+      );
       reusableGatewayConfig.request_body_limit_bytes = normalizeRequestBodyLimitBytes(
         reusableGatewayConfig.request_body_limit_bytes,
       );

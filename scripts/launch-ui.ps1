@@ -117,6 +117,7 @@ if (-not $canReuseExistingInstall) {
       ""
     }
     $legacyContinuationRuleMode = $existingInterceptRuleMode.Trim().ToLowerInvariant() -eq "continuation_recovery"
+    $normalizedInterceptRuleMode = $existingInterceptRuleMode.Trim().ToLowerInvariant()
     if ($null -eq $reusableGatewayConfig.PSObject.Properties["stream_action"] -or [string]::IsNullOrWhiteSpace([string]$reusableGatewayConfig.stream_action)) {
       if ($null -eq $reusableGatewayConfig.PSObject.Properties["stream_action"]) {
         $reusableGatewayConfig | Add-Member -NotePropertyName "stream_action" -NotePropertyValue "continuation_recovery"
@@ -133,10 +134,17 @@ if (-not $canReuseExistingInstall) {
         $reusableGatewayConfig.continuation_marker_text = "Continue thinking..."
       }
     }
+    $normalizedInterceptRuleMode = if ($legacyContinuationRuleMode) {
+      "reasoning_tokens"
+    } elseif (@("reasoning_tokens", "final_answer_only_high_xhigh", "none") -contains $normalizedInterceptRuleMode) {
+      $normalizedInterceptRuleMode
+    } else {
+      "reasoning_tokens"
+    }
     if ($null -eq $reusableGatewayConfig.PSObject.Properties["intercept_rule_mode"]) {
-      $reusableGatewayConfig | Add-Member -NotePropertyName "intercept_rule_mode" -NotePropertyValue "reasoning_tokens"
-    } elseif ([string]$reusableGatewayConfig.intercept_rule_mode -ne "final_answer_only_high_xhigh") {
-      $reusableGatewayConfig.intercept_rule_mode = "reasoning_tokens"
+      $reusableGatewayConfig | Add-Member -NotePropertyName "intercept_rule_mode" -NotePropertyValue $normalizedInterceptRuleMode
+    } else {
+      $reusableGatewayConfig.intercept_rule_mode = $normalizedInterceptRuleMode
     }
     if ($null -eq $reusableGatewayConfig.PSObject.Properties["reasoning_match_mode"]) {
       $reusableGatewayConfig | Add-Member -NotePropertyName "reasoning_match_mode" -NotePropertyValue "formula_518n_minus_2"
@@ -156,6 +164,29 @@ if (-not $canReuseExistingInstall) {
       $reusableGatewayConfig | Add-Member -NotePropertyName "retry_upstream_capacity_errors" -NotePropertyValue $true
     } else {
       $reusableGatewayConfig.retry_upstream_capacity_errors = [bool]$reusableGatewayConfig.retry_upstream_capacity_errors
+    }
+    $legacyCapacityAction = if ([bool]$reusableGatewayConfig.retry_upstream_capacity_errors) { "retry_then_pass_through" } else { "pass_through" }
+    $capacityErrorAction = Normalize-UpstreamErrorAction `
+      -Value (Get-OptionalPropertyValue -Object $reusableGatewayConfig -Name "capacity_error_action") `
+      -DefaultValue $legacyCapacityAction
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["capacity_error_action"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "capacity_error_action" -NotePropertyValue $capacityErrorAction
+    } else {
+      $reusableGatewayConfig.capacity_error_action = $capacityErrorAction
+    }
+    $http429Action = Normalize-UpstreamErrorAction `
+      -Value (Get-OptionalPropertyValue -Object $reusableGatewayConfig -Name "http_429_action") `
+      -DefaultValue "pass_through"
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["http_429_action"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "http_429_action" -NotePropertyValue $http429Action
+    } else {
+      $reusableGatewayConfig.http_429_action = $http429Action
+    }
+    $latencyGuard = Normalize-LatencyGuard -Value (Get-OptionalPropertyValue -Object $reusableGatewayConfig -Name "latency_guard")
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["latency_guard"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "latency_guard" -NotePropertyValue $latencyGuard
+    } else {
+      $reusableGatewayConfig.latency_guard = $latencyGuard
     }
     if (
       $null -eq $reusableGatewayConfig.PSObject.Properties["request_body_limit_bytes"] -or

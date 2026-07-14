@@ -226,6 +226,24 @@ async function run() {
       "Gateway config default retry_upstream_capacity_errors should be true",
     );
     assert(
+      gatewayConfig.capacity_error_action === "retry_then_pass_through",
+      "Gateway config default capacity_error_action should preserve legacy retry behavior",
+    );
+    assert(
+      gatewayConfig.http_429_action === "pass_through",
+      "Gateway config default http_429_action should pass through",
+    );
+    assert(
+      JSON.stringify(gatewayConfig.latency_guard) ===
+        JSON.stringify({
+          enabled: false,
+          first_progress_timeout_ms: 0,
+          first_progress_action: "return_502",
+          total_timeout_ms: 0,
+        }),
+      "Gateway config default latency_guard should be disabled",
+    );
+    assert(
       exampleGatewayConfig.capacity_error_action === "retry_then_pass_through",
       "Example config default capacity_error_action should preserve legacy retry behavior",
     );
@@ -333,6 +351,96 @@ async function run() {
     );
     await writeFile(gatewayConfigPath, installedGatewayConfigRaw, "utf8");
 
+    const saveReusablePolicyResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          capacity_error_action: "retry_then_502",
+          http_429_action: "retry_then_pass_through",
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 1234,
+            first_progress_action: "retry_then_502",
+            total_timeout_ms: 9876,
+          },
+          retry_upstream_capacity_errors: false,
+        }),
+      },
+    );
+    assert(
+      saveReusablePolicyResponse.status === 200,
+      `Preparing reusable policy config failed: ${saveReusablePolicyResponse.status}`,
+    );
+    const reusablePolicyConfigRaw = await readFile(gatewayConfigPath, "utf8");
+    const reusablePolicyPid = (await readFile(gatewayPidPath, "utf8")).trim();
+    const reusablePolicyMtime = await mtimeNs(gatewayConfigPath);
+    await runPowerShellScript(installScript, [
+      "-CodexConfigPath",
+      codexConfigPath,
+      "-StateRoot",
+      stateRoot,
+      "-ListenPort",
+      String(gatewayPort),
+    ]);
+    const reloadedReusablePolicyConfig = JSON.parse(await readFile(gatewayConfigPath, "utf8"));
+    assert(
+      reloadedReusablePolicyConfig.intercept_rule_mode === "none",
+      "Repeated manual install did not preserve intercept_rule_mode=none",
+    );
+    assert(
+      reloadedReusablePolicyConfig.capacity_error_action === "retry_then_502" &&
+        reloadedReusablePolicyConfig.http_429_action === "retry_then_pass_through",
+      "Repeated manual install did not preserve upstream error actions",
+    );
+    assert(
+      JSON.stringify(reloadedReusablePolicyConfig.latency_guard) ===
+        JSON.stringify({
+          enabled: true,
+          first_progress_timeout_ms: 1234,
+          first_progress_action: "retry_then_502",
+          total_timeout_ms: 9876,
+        }),
+      "Repeated manual install did not preserve nested latency_guard",
+    );
+    assert(
+      (await readFile(gatewayConfigPath, "utf8")) === reusablePolicyConfigRaw,
+      "Repeated manual install rewrote a valid layered policy config",
+    );
+    assert(
+      (await readFile(gatewayPidPath, "utf8")).trim() === reusablePolicyPid,
+      "Repeated manual install restarted a healthy gateway with unchanged layered policies",
+    );
+    assert(
+      (await mtimeNs(gatewayConfigPath)) === reusablePolicyMtime,
+      "Repeated manual install touched layered policy config mtime",
+    );
+    const restoreDefaultPolicyResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          capacity_error_action: "retry_then_pass_through",
+          http_429_action: "pass_through",
+          latency_guard: {
+            enabled: false,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 0,
+          },
+          retry_upstream_capacity_errors: true,
+        }),
+      },
+    );
+    assert(
+      restoreDefaultPolicyResponse.status === 200,
+      `Restoring default policy config failed: ${restoreDefaultPolicyResponse.status}`,
+    );
+
     await mkdir(path.join(legacyStateRoot, "config"), { recursive: true });
     const legacyGatewayConfig = {
       ...gatewayConfig,
@@ -347,6 +455,9 @@ async function run() {
     delete legacyGatewayConfig.stream_action;
     delete legacyGatewayConfig.guard_retry_attempts;
     delete legacyGatewayConfig.retry_upstream_capacity_errors;
+    delete legacyGatewayConfig.capacity_error_action;
+    delete legacyGatewayConfig.http_429_action;
+    delete legacyGatewayConfig.latency_guard;
     await writeFile(
       path.join(legacyStateRoot, "config", "config.json"),
       `${JSON.stringify(legacyGatewayConfig, null, 2)}\n`,
@@ -392,6 +503,24 @@ async function run() {
       "Install script did not migrate missing retry_upstream_capacity_errors",
     );
     assert(
+      reinstalledGatewayConfig.capacity_error_action === "retry_then_pass_through",
+      "Install script did not migrate missing Capacity action to legacy retry behavior",
+    );
+    assert(
+      reinstalledGatewayConfig.http_429_action === "pass_through",
+      "Install script did not default missing HTTP 429 action to pass through",
+    );
+    assert(
+      JSON.stringify(reinstalledGatewayConfig.latency_guard) ===
+        JSON.stringify({
+          enabled: false,
+          first_progress_timeout_ms: 0,
+          first_progress_action: "return_502",
+          total_timeout_ms: 0,
+        }),
+      "Install script did not add disabled latency_guard defaults",
+    );
+    assert(
       reinstalledGatewayConfig.request_body_limit_bytes === 100 * 1024 * 1024,
       "Install script did not migrate legacy 10MB request_body_limit_bytes",
     );
@@ -412,7 +541,10 @@ async function run() {
     gatewayConfig.continuation_marker_text = "  Launch reuse marker  ";
     delete gatewayConfig.stream_action;
     delete gatewayConfig.guard_retry_attempts;
-    delete gatewayConfig.retry_upstream_capacity_errors;
+    gatewayConfig.retry_upstream_capacity_errors = false;
+    delete gatewayConfig.capacity_error_action;
+    delete gatewayConfig.http_429_action;
+    delete gatewayConfig.latency_guard;
     gatewayConfig.request_body_limit_bytes = 10 * 1024 * 1024;
     await writeFile(
       gatewayConfigPath,
@@ -460,12 +592,45 @@ async function run() {
       "Launch UI reuse did not migrate missing guard_retry_attempts",
     );
     assert(
-      migratedGatewayConfig.retry_upstream_capacity_errors === true,
-      "Launch UI reuse did not migrate missing retry_upstream_capacity_errors",
+      migratedGatewayConfig.retry_upstream_capacity_errors === false,
+      "Launch UI reuse did not preserve legacy retry_upstream_capacity_errors=false",
+    );
+    assert(
+      migratedGatewayConfig.capacity_error_action === "pass_through",
+      "Launch UI reuse did not map legacy Capacity false to pass_through",
+    );
+    assert(
+      migratedGatewayConfig.http_429_action === "pass_through",
+      "Launch UI reuse did not default missing HTTP 429 action to pass through",
+    );
+    assert(
+      JSON.stringify(migratedGatewayConfig.latency_guard) ===
+        JSON.stringify({
+          enabled: false,
+          first_progress_timeout_ms: 0,
+          first_progress_action: "return_502",
+          total_timeout_ms: 0,
+        }),
+      "Launch UI reuse did not add disabled latency_guard defaults",
     );
     assert(
       migratedGatewayConfig.request_body_limit_bytes === 100 * 1024 * 1024,
       "Launch UI reuse did not migrate legacy 10MB request_body_limit_bytes",
+    );
+    const restoreMigratedCapacityResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          retry_upstream_capacity_errors: true,
+          capacity_error_action: "retry_then_pass_through",
+        }),
+      },
+    );
+    assert(
+      restoreMigratedCapacityResponse.status === 200,
+      `Restoring migrated Capacity defaults failed: ${restoreMigratedCapacityResponse.status}`,
     );
     assert(Array.isArray(gatewayConfig.endpoints), "Gateway config endpoints must be an array");
     assert(
