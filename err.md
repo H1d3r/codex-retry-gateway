@@ -1436,6 +1436,39 @@
      - deadline 用例要求 HTTP 502、`upstream_total_timeout`、只发一次上游请求且只落一个 `total_timeout_returned_502` sample。
      - 缓冲用例要求大于 `1MiB` 的无 progress 元数据仍返回 200，并记录 `timeout_response_control_lost=true` 与 `response_forwarding_started=true`。
 
+40. 分层策略的 attempt 统计、流解析和配置幂等必须覆盖断连与非标准响应
+   - 现象：
+     - 客户端在上传请求体时断连会被误记成 `request_rejected + 413`，看起来像请求体超限。
+     - SSE 长时间没有事件分隔符时，未完成事件字符串可持续增长；慢速 `text/plain` 等非 SSE 流也不会结束首 progress 计时。
+     - timeout、Retry-After 等待中断连和 observe-only 命中后断连会出现 inspected/failed 重复、timeout 不进 inspected 分母或 `matched_current_rule` 丢失。
+     - `latency_guard` 等对象仅调整成员顺序时，安装/启动脚本仍会写盘，并可能重启已经健康的 gateway。
+   - 根因：
+     - 请求体读取异常统一走 413 分支，没有区分 `ECONNRESET` / request abort，也没有保留实际已读字节。
+     - SSE parser 只等待分隔符后再切块，非 SSE chunk 又没有作为有效输出信号。
+     - inspected 计数散落在多个 timeout、策略等待和 stream catch 分支，没有 attempt 级幂等；断连收口使用了默认 `matched=false`。
+     - 配置比较直接比较序列化文本，错误地把对象键顺序当成配置语义；数组顺序则必须继续保留。
+   - 处理：
+     - 请求体读取错误携带 `requestBodyBytesRead`；只有真实超过上限才记录 `413 request_rejected`，客户端断连记录 `client_disconnected` 和实际读取字节。
+     - SSE 未完成事件超过 `1MiB` 后进入 bounded discard 状态，只保留识别后续边界所需的尾部；非 SSE 的首个非空 chunk 直接标记 first content/progress。
+     - 使用 attempt sample 级 `recordInspectedResponseForSample()` 去重；取得上游响应后的 timeout 计入 inspected，Retry-After 断连不再同时增加 failed，observe-only 断连复用已经观察到的规则命中事实。
+     - Node 与 PowerShell 配置比较都递归排序对象键，但保持数组原顺序，合法配置仅成员换序时不写盘、不改 mtime、不重启 PID。
+   - 防回归：
+     - `test-gateway-e2e.mjs` 覆盖上传断连、慢速非 SSE、超大无分隔 SSE、Retry-After 断连、timeout 计数恒等式和 observe-only 命中后断连。
+     - `test-install-restore.mjs`、`test-launch-ui.mjs`、`test-launch-ui-unix.mjs` 都覆盖嵌套配置成员换序后的字节、mtime 与 PID 幂等。
+
+41. Windows 已退出进程对象仍可能存在，不能只凭 Get-Process 判断存活
+   - 现象：
+     - `test-launch-ui.mjs` 稳定失败于 `PowerShell failed-start cleanup left its child PID file behind`。
+     - PowerShell cleanup helper 已返回，子进程也确实停止，但 PID 文件没有删除。
+   - 根因：
+     - Windows 上已终止进程在父进程仍持有句柄时，`Get-Process -Id` 短时间仍能返回对象，此时对象的 `HasExited=true`。
+     - `Test-ProcessAlive` 旧实现只要 `Get-Process` 成功就返回 true，导致 `Stop-FailedGatewayStart` 跳过 PID 文件清理。
+   - 处理：
+     - `Test-ProcessAlive` 改为返回 `-not $process.HasExited`；找不到进程时仍返回 false。
+   - 防回归：
+     - RED：`node .\scripts\test-launch-ui.mjs` 稳定失败于失败启动 PID 文件残留。
+     - GREEN：同一命令通过 `PASS launch-ui flow`；随后四套 E2E 串行 fresh 通过。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

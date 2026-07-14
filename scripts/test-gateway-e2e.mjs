@@ -53,6 +53,52 @@ async function getFreePort() {
   return port;
 }
 
+async function abortRequestDuringUpload(port, testKey) {
+  await new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (error = null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    socket.once("error", (error) => {
+      if (error?.code === "ECONNRESET") {
+        finish();
+        return;
+      }
+      finish(error);
+    });
+    socket.once("close", () => finish());
+    socket.once("connect", () => {
+      const partialBody = JSON.stringify({
+        model: "gpt-5.5",
+        test_sequence_key: testKey,
+        partial: "upload-will-disconnect",
+      });
+      socket.write(
+        [
+          "POST /responses HTTP/1.1",
+          `Host: 127.0.0.1:${port}`,
+          "Content-Type: application/json",
+          "Content-Length: 65536",
+          `X-Test-Key: ${testKey}`,
+          "Connection: close",
+          "",
+          partialBody,
+        ].join("\r\n"),
+      );
+      setTimeout(() => socket.destroy(), 30);
+    });
+  });
+}
+
 function execFileText(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     execFile(command, args, options, (error, stdout, stderr) => {
@@ -3476,6 +3522,18 @@ function startFakeUpstream(port) {
             );
             return;
           }
+          if (parsed.test_force_slow_text_for_stream) {
+            res.writeHead(200, {
+              "content-type": "text/plain; charset=utf-8",
+              "x-upstream-test": "responses-slow-text-fallback",
+            });
+            res.write(parsed.test_slow_text_first_chunk ?? "plain-first-chunk");
+            setTimeout(
+              () => res.end(parsed.test_slow_text_final_chunk ?? "plain-final-chunk"),
+              parsed.test_slow_text_pause_ms ?? 200,
+            );
+            return;
+          }
           if (parsed.test_force_json_for_stream) {
             finishJsonResponse();
             return;
@@ -4538,6 +4596,44 @@ async function run() {
     assert(
       !brokenBypassLogText.includes("[error] TypeError: fetch failed"),
       "上游 fetch failed 不应记录为 gateway 内部 error 堆栈",
+    );
+    const uploadDisconnectMetricsBefore = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    const uploadDisconnectKey = "client-disconnect-during-request-upload";
+    await abortRequestDuringUpload(gatewayPort, uploadDisconnectKey);
+    let uploadDisconnectSample = null;
+    const uploadDisconnectDeadline = Date.now() + 3000;
+    while (!uploadDisconnectSample && Date.now() < uploadDisconnectDeadline) {
+      const payload = await fetch(
+        `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      uploadDisconnectSample = (payload.recent_samples || []).find(
+        (sample) =>
+          sample.request_summary?.sanitized_headers?.["x-test-key"] === uploadDisconnectKey,
+      );
+      if (!uploadDisconnectSample) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    const uploadDisconnectMetricsAfter = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    assert(
+      uploadDisconnectSample?.final_action === "client_disconnected" &&
+        uploadDisconnectSample?.client_http_status === null &&
+        Number(uploadDisconnectSample?.request_summary?.body_bytes) > 0 &&
+        Number(uploadDisconnectSample?.request_summary?.body_bytes) < 65536,
+      `上传阶段断连不得伪装成 413 request_rejected: ${JSON.stringify(uploadDisconnectSample)}`,
+    );
+    assert(
+      uploadDisconnectMetricsAfter.metrics.total_proxy_request_count ===
+        uploadDisconnectMetricsBefore.metrics.total_proxy_request_count + 1 &&
+        uploadDisconnectMetricsAfter.metrics.failed_proxy_request_count ===
+          uploadDisconnectMetricsBefore.metrics.failed_proxy_request_count + 1 &&
+        uploadDisconnectMetricsAfter.metrics.inspected_response_count ===
+          uploadDisconnectMetricsBefore.metrics.inspected_response_count,
+      `上传阶段断连必须作为一个失败代理请求且不能计为 inspected: before=${JSON.stringify(uploadDisconnectMetricsBefore.metrics)} after=${JSON.stringify(uploadDisconnectMetricsAfter.metrics)}`,
     );
     const oversizedPayloadResponse = await fetch(
       `http://127.0.0.1:${limitGatewayPort}/responses`,
@@ -6742,6 +6838,26 @@ async function run() {
       "空 commentary 结构事件不应结束首 progress 计时",
     );
 
+    await configureLatencyGuard({ firstProgressTimeoutMs: 60 });
+    const slowTextStreamKey = "latency-slow-non-sse-stream-progress";
+    const slowTextStreamResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: slowTextStreamKey,
+        test_force_slow_text_for_stream: true,
+        test_slow_text_first_chunk: "plain-visible-progress",
+        test_slow_text_final_chunk: "plain-stream-complete",
+        test_slow_text_pause_ms: 200,
+      },
+    );
+    assert(
+      slowTextStreamResponse.status === 200 &&
+        slowTextStreamResponse.text.includes("plain-visible-progress") &&
+        slowTextStreamResponse.text.includes("plain-stream-complete"),
+      `非 SSE 的非空流式 chunk 应结束首 progress 计时: status=${slowTextStreamResponse.status} body=${slowTextStreamResponse.text}`,
+    );
+
     const toolProgressKey = "latency-tool-call-is-progress";
     const toolProgressResponse = await readSseUntilClose(
       `http://127.0.0.1:${gatewayPort}/responses`,
@@ -6830,6 +6946,90 @@ async function run() {
           (entry) => entry.body?.test_sequence_key === rateLimitWithFirstProgressGuardKey,
         ).length === 2,
       "已完整收到 429 后，首 progress timer 不应中断 Retry-After 等待",
+    );
+
+    const retryWaitDisconnectConfig = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          guard_retry_attempts: 1,
+          http_429_action: "retry_then_502",
+          latency_guard: {
+            enabled: false,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 0,
+          },
+        }),
+      },
+    );
+    assert(retryWaitDisconnectConfig.status === 200, "Retry-After 断连场景配置失败");
+    const retryWaitDisconnectMetricsBefore = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    const retryWaitDisconnectKey = "http-429-retry-wait-client-disconnect";
+    const retryWaitDisconnectController = new AbortController();
+    const retryWaitDisconnectPromise = fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: retryWaitDisconnectKey,
+          test_http_429_attempts: 10,
+          test_retry_after: "0.5",
+        }),
+        signal: retryWaitDisconnectController.signal,
+      },
+    );
+    const retryWaitUpstreamDeadline = Date.now() + 2000;
+    while (
+      upstream.responseRequests.filter(
+        (entry) => entry.body?.test_sequence_key === retryWaitDisconnectKey,
+      ).length === 0 &&
+      Date.now() < retryWaitUpstreamDeadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    retryWaitDisconnectController.abort();
+    try {
+      await retryWaitDisconnectPromise;
+    } catch {
+      // 客户端主动取消仍未收到响应的请求属于预期。
+    }
+    let retryWaitDisconnectSample = null;
+    const retryWaitSampleDeadline = Date.now() + 3000;
+    while (!retryWaitDisconnectSample && Date.now() < retryWaitSampleDeadline) {
+      const payload = await fetch(
+        `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      retryWaitDisconnectSample = (payload.recent_samples || []).find((sample) =>
+        `${sample.request_payload_excerpt || ""}`.includes(retryWaitDisconnectKey),
+      );
+      if (!retryWaitDisconnectSample) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    const retryWaitDisconnectMetricsAfter = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    assert(
+      retryWaitDisconnectSample?.final_action === "client_disconnected" &&
+        retryWaitDisconnectSample?.policy_trigger === "http_429",
+      `Retry-After 等待中断连样本收口错误: ${JSON.stringify(retryWaitDisconnectSample)}`,
+    );
+    assert(
+      retryWaitDisconnectMetricsAfter.metrics.total_proxy_request_count ===
+        retryWaitDisconnectMetricsBefore.metrics.total_proxy_request_count + 1 &&
+        retryWaitDisconnectMetricsAfter.metrics.inspected_response_count ===
+          retryWaitDisconnectMetricsBefore.metrics.inspected_response_count + 1 &&
+        retryWaitDisconnectMetricsAfter.metrics.failed_proxy_request_count ===
+          retryWaitDisconnectMetricsBefore.metrics.failed_proxy_request_count,
+      `Retry-After 等待中断连不得同时计入 inspected 与 failed: before=${JSON.stringify(retryWaitDisconnectMetricsBefore.metrics)} after=${JSON.stringify(retryWaitDisconnectMetricsAfter.metrics)}`,
     );
 
     const policyDeadlineGatewayPort = await getFreePort();
@@ -6951,6 +7151,14 @@ async function run() {
         "    }",
         "  }",
         "  return Reflect.apply(originalPush, this, items);",
+        "};",
+        "const originalSplit = String.prototype.split;",
+        "String.prototype.split = function guardedSplit(separator, ...args) {",
+        "  const value = String(this);",
+        "  if (separator instanceof RegExp && Buffer.byteLength(value, 'utf8') > 1024 * 1024) {",
+        "    throw new Error('SSE parser buffer exceeded hard limit before framing');",
+        "  }",
+        "  return Reflect.apply(originalSplit, value, [separator, ...args]);",
         "};",
         "",
       ].join("\n"),
@@ -7168,6 +7376,91 @@ async function run() {
         ).length === 1,
       `客户端主动断连未被独立收口: ${JSON.stringify(clientDisconnectSample)}`,
     );
+
+    const observedDisconnectConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          reasoning_match_mode: "formula_518n_minus_2",
+          intercept_streaming: false,
+          stream_action: "disconnect",
+          latency_guard: {
+            enabled: false,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 0,
+          },
+        }),
+      },
+    );
+    assert(observedDisconnectConfigResponse.status === 200, "observe-only 断连场景配置失败");
+    const observedDisconnectKey = "observed-rule-match-client-disconnect";
+    const observedDisconnectController = new AbortController();
+    const observedDisconnectResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          stream: true,
+          test_sequence_key: observedDisconnectKey,
+          test_reasoning_tokens: 516,
+          test_stream_reasoning_in_output_chunk: true,
+          test_stream_text: "observed-match-before-disconnect",
+          test_stream_pause_after_output_ms: 350,
+        }),
+        signal: observedDisconnectController.signal,
+      },
+    );
+    const observedDisconnectReader = observedDisconnectResponse.body.getReader();
+    const observedDisconnectFirstRead = await observedDisconnectReader.read();
+    assert(
+      !observedDisconnectFirstRead.done && observedDisconnectFirstRead.value?.length > 0,
+      "observe-only 断连测试未先收到规则命中 chunk",
+    );
+    observedDisconnectController.abort();
+    try {
+      await observedDisconnectReader.read();
+    } catch {
+      // 主动取消后 reader 抛错属于预期。
+    }
+    let observedDisconnectSample = null;
+    const observedDisconnectDeadline = Date.now() + 3000;
+    while (!observedDisconnectSample && Date.now() < observedDisconnectDeadline) {
+      const payload = await fetch(
+        `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      observedDisconnectSample = (payload.recent_samples || []).find((sample) =>
+        `${sample.request_payload_excerpt || ""}`.includes(observedDisconnectKey),
+      );
+      if (!observedDisconnectSample) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    assert(
+      observedDisconnectSample?.final_action === "client_disconnected" &&
+        observedDisconnectSample?.matched_current_rule === true &&
+        observedDisconnectSample?.blocked_by_gateway === false,
+      `observe-only 命中后断连样本必须保留命中事实: ${JSON.stringify(observedDisconnectSample)}`,
+    );
+    const restoreInterceptAfterObservedDisconnectResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_streaming: true,
+          stream_action: "strict_502",
+        }),
+      },
+    );
+    assert(
+      restoreInterceptAfterObservedDisconnectResponse.status === 200,
+      "observe-only 断连用例后恢复流式拦截配置失败",
+    );
     const layeredPolicyMetrics = await fetch(
       `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
     ).then((response) => response.json());
@@ -7192,6 +7485,16 @@ async function run() {
         layeredPolicyMetrics.metrics.timeout_return_502_count >= 4 &&
         layeredPolicyMetrics.metrics.timeout_disconnect_after_forward_count >= 1,
       `timeout 分项计数不完整: ${JSON.stringify(layeredPolicyMetrics.metrics)}`,
+    );
+    assert(
+      layeredPolicyMetrics.metrics.total_proxy_request_count ===
+        layeredPolicyMetrics.metrics.inspected_response_count +
+          layeredPolicyMetrics.metrics.bypassed_proxy_request_count +
+          layeredPolicyMetrics.metrics.failed_proxy_request_count +
+          layeredPolicyMetrics.metrics.active_proxy_request_count &&
+        layeredPolicyMetrics.metrics.blocked_response_count <=
+          layeredPolicyMetrics.metrics.inspected_response_count,
+      `分层策略执行后代理计数恒等式失效: ${JSON.stringify(layeredPolicyMetrics.metrics)}`,
     );
 
     const layeredPolicyJsonExport = await fetch(

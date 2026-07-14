@@ -203,6 +203,43 @@ function Normalize-LatencyGuard {
   }
 }
 
+function ConvertTo-CanonicalJsonNode {
+  param($Value)
+
+  if ($null -eq $Value) {
+    return $null
+  }
+  if ($Value -is [System.Collections.IDictionary]) {
+    $ordered = [ordered]@{}
+    foreach ($key in @($Value.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive)) {
+      $ordered[$key] = ConvertTo-CanonicalJsonNode -Value $Value[$key]
+    }
+    return [pscustomobject]$ordered
+  }
+  if ($Value -is [pscustomobject]) {
+    $ordered = [ordered]@{}
+    foreach ($property in @($Value.PSObject.Properties | Sort-Object -Property Name -CaseSensitive)) {
+      $ordered[$property.Name] = ConvertTo-CanonicalJsonNode -Value $property.Value
+    }
+    return [pscustomobject]$ordered
+  }
+  if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+    $items = @($Value | ForEach-Object { ConvertTo-CanonicalJsonNode -Value $_ })
+    return ,$items
+  }
+  return $Value
+}
+
+function ConvertTo-CanonicalJson {
+  param(
+    [Parameter(Mandatory = $true)]
+    $Value
+  )
+
+  $canonical = ConvertTo-CanonicalJsonNode -Value $Value
+  return ($canonical | ConvertTo-Json -Depth 20 -Compress)
+}
+
 function Write-JsonFile {
   param(
     [Parameter(Mandatory = $true)]
@@ -291,8 +328,8 @@ function Test-ProcessAlive {
   )
 
   try {
-    $null = Get-Process -Id $ProcessId -ErrorAction Stop
-    return $true
+    $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    return -not $process.HasExited
   } catch {
     return $false
   }

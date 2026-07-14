@@ -214,8 +214,23 @@ function cloneJsonValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function canonicalizeJsonValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => canonicalizeJsonValue(item));
+  }
+  if (value && typeof value === "object") {
+    const normalized = {};
+    for (const key of Object.keys(value).sort()) {
+      normalized[key] = canonicalizeJsonValue(value[key]);
+    }
+    return normalized;
+  }
+  return value;
+}
+
 function jsonValuesEqual(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return JSON.stringify(canonicalizeJsonValue(left)) ===
+    JSON.stringify(canonicalizeJsonValue(right));
 }
 
 function isFilePath(filePath) {

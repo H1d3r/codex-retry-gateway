@@ -243,6 +243,14 @@ Issue #11 收口说明：
 - 通用 HTTP 429 不受旧 Capacity 布尔控制，改由独立的 `http_429_action` 管理；默认仍为 `pass_through`。普通非 Capacity 5xx 不会被泛化重试。
 - PR 合并后可关闭 GitHub Issue #11：`https://github.com/nonononull/codex-retry-gateway/issues/11`。
 
+Issue #26 收口说明：
+
+- `intercept_rule_mode=none` 只关闭 reasoning 规则，Capacity、HTTP 429、响应超时与全量采集仍可独立叠加；未启用首 progress 控制时，流式响应边读边透传。
+- Capacity、HTTP 429、reasoning、Responses 续写恢复和首 progress 超时共用 `guard_retry_attempts`，同一次上游响应只由优先级最高的策略接管一次。
+- 每次上游 attempt 都落独立样本；上传阶段客户端断连、Retry-After 等待中断连、总超时、已透传后断连和 observe-only 命中会按最终事实收口，不伪装成 413、重复失败或丢失规则命中事实。
+- 合法配置比较忽略对象成员顺序但保留数组顺序，Windows/Unix 复用启动不会因 `latency_guard` 等对象仅换序而重写配置或重启健康 gateway。
+- 本次可叠加策略由 GitHub Issue #26 跟踪：`https://github.com/nonononull/codex-retry-gateway/issues/26`。
+
 说明：
 
 - 页面保存配置后会立即热生效，不需要重启 gateway
@@ -259,8 +267,10 @@ Issue #11 收口说明：
 - Capacity 只精确匹配 `Selected model is at capacity. Please try a different model.`；其余 HTTP 429 才进入通用 429 策略，普通非 Capacity 5xx 继续原样透传
 - HTTP 429 重试会遵守秒数或 HTTP-date 格式的 `Retry-After`，单次等待最多 60 秒；无合法 header 时使用 full-jitter，等待超过总 deadline 时直接执行当前动作的耗尽分支
 - 已进入 Retry-After 等待后如果总 deadline 到期，timeout 优先并用当前 attempt 返回 `upstream-total-timeout` 502，不会重复落样本或创建新 attempt；客户端在等待中断开时只记录 `client_disconnected`
+- `inspected_response_count` 按已取得上游响应的 attempt 计数；等待重试时客户端断连不会再同时增加 `failed_proxy_request_count`，总 timeout 也会进入 inspected 分母，使 `total = inspected + bypassed + failed + active` 保持可核对
 - `endpoints` 是 reasoning、Capacity、HTTP 429 和 latency guard 的共同管理边界；未列入的路径完全旁路这些策略，不会出现只启用超时但不处理 Capacity/429 的半旁路
 - `latency_guard.first_progress_timeout_ms` 与 `latency_guard.total_timeout_ms` 只接受 `0..2_147_483_647` 的整数；`0` 表示单独关闭该阈值，避免超过 Node 定时器上限后被缩短成近似立即超时
+- 流式 `text/plain` 或其它非 SSE 响应的首个非空 chunk 也算首 progress；SSE 未完成事件的解析缓存固定受 `1MiB` 上限约束，超大事件进入丢弃状态，不会通过无分隔文本无限增长
 - 一旦响应头或不可撤回内容已经写给客户端，gateway 就不能把状态改成 502，也不能重新派发并拼接第二轮输出；后续总超时只能取消上游并断开连接，样本记录 `timeout_disconnected_after_forward`
 - 网关内部重试的每次上游尝试都会计入代理请求总数；每次拿到并检查的响应都会计入被检查响应总数；命中当前拦截规则会计入当前规则命中总数，被吞掉重试或最终拦截会计入实际拦截总数
 - 命中日志里的 `action=internal_retry remaining=N` 表示本次命中只在网关内部吞掉并继续重试，没有把失败状态返回给 Codex；`action=return_status_502` 才表示已经达到重试上限或配置为 `0`，本次会对 Codex 返回拦截状态

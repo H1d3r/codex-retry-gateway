@@ -208,8 +208,8 @@ if (-not $canReuseExistingInstall) {
       $reusableGatewayConfig.intercept_non_streaming = $true
     }
 
-    $existingGatewayConfigJson = $existingGatewayConfig | ConvertTo-Json -Depth 20 -Compress
-    $reusableGatewayConfigJson = $reusableGatewayConfig | ConvertTo-Json -Depth 20 -Compress
+    $existingGatewayConfigJson = ConvertTo-CanonicalJson -Value $existingGatewayConfig
+    $reusableGatewayConfigJson = ConvertTo-CanonicalJson -Value $reusableGatewayConfig
     $gatewayConfigChanged = $existingGatewayConfigJson -cne $reusableGatewayConfigJson
     $gatewayConfigNeedsWrite = $null -eq $previousGatewayConfigContent -or $gatewayConfigChanged
 

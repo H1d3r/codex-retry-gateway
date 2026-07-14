@@ -168,12 +168,34 @@ reasoning 统计落盘说明：
 
 ```powershell
 node .\scripts\test-gateway-e2e.mjs
+node .\scripts\test-install-restore.mjs
 node .\scripts\test-launch-ui.mjs
 node .\scripts\test-launch-ui-unix.mjs
-node .\scripts\test-install-restore.mjs
 node --check .\gateway.mjs
 node --check .\scripts\admin-lib.mjs
+node --check .\scripts\test-gateway-e2e.mjs
+node --check .\scripts\test-install-restore.mjs
+node --check .\scripts\test-launch-ui.mjs
+node --check .\scripts\test-launch-ui-unix.mjs
 git diff --check
+```
+
+四套 E2E 会创建和清理临时 gateway、PID 文件与健康端口，必须按上面顺序串行执行，不要并行运行 `test-launch-ui.mjs` 与其它进程生命周期测试。Codex Desktop 默认 Node 出现后台子进程不退出时，可显式使用：
+
+```powershell
+& 'C:\Users\dashuai\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe' .\scripts\test-gateway-e2e.mjs
+```
+
+涉及 PowerShell 变更时继续执行 AST 解析：
+
+```powershell
+$files = @('.\scripts\common.ps1', '.\scripts\install-for-current-provider.ps1', '.\scripts\launch-ui.ps1')
+foreach ($file in $files) {
+  $tokens = $null
+  $errors = $null
+  [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $file), [ref]$tokens, [ref]$errors)
+  if ($errors.Count -gt 0) { throw "$file PowerShell AST 解析失败: $($errors[0].Message)" }
+}
 ```
 
 PowerShell 包装入口：

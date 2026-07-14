@@ -119,10 +119,17 @@ post_implementation_review:
   reviewer_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => REQUEST_CHANGES
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => REQUEST_CHANGES
-  parent_review_status: fixes-implemented-awaiting-rereview
+  parent_review_status: fixes-verified-awaiting-rereview
   review_fix_evidence:
     - Retry-After deadline and 1MiB hard-limit RED reproduced
-    - bundled Node gateway E2E PASS after latest source mutation
+    - upload disconnect no longer becomes request_rejected 413
+    - unfinished SSE framing and pre-progress buffering are bounded at 1MiB
+    - non-SSE chunks mark first progress
+    - timeout, Retry-After disconnect and observe-only match accounting preserve final facts
+    - reordered object keys do not rewrite config or restart a healthy gateway
+    - exited Windows process objects use HasExited before PID cleanup
+    - 2026-07-15 four sequential bundled-Node E2E suites PASS after latest source mutation
+    - 2026-07-15 JS syntax, PowerShell AST, git diff check and temporary-process audit PASS
 git_progress_checkpoints:
   - startup-baseline
   - after-config-ui-batch

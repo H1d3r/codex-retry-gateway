@@ -377,8 +377,7 @@ async function run() {
     const backupDir = path.join(stateRoot, "backups");
     const firstStateRaw = await readFile(statePath, "utf8");
     const firstCodexConfigRaw = await readFile(codexConfigPath, "utf8");
-    const firstGatewayConfigRaw = await readFile(gatewayConfigPath, "utf8");
-    const firstGatewayConfig = JSON.parse(firstGatewayConfigRaw);
+    const firstGatewayConfig = JSON.parse(await readFile(gatewayConfigPath, "utf8"));
     assert(firstGatewayConfig.intercept_rule_mode === "none", "Unix policy setup did not persist none mode");
     assert(
       firstGatewayConfig.intercept_streaming === false &&
@@ -397,6 +396,14 @@ async function run() {
         firstGatewayConfig.latency_guard?.total_timeout_ms === 9876,
       "Unix policy setup did not persist latency_guard",
     );
+    firstGatewayConfig.latency_guard = {
+      total_timeout_ms: 9876,
+      first_progress_action: "retry_then_502",
+      first_progress_timeout_ms: 1234,
+      enabled: true,
+    };
+    const firstGatewayConfigRaw = `${JSON.stringify(firstGatewayConfig, null, 2)}\n`;
+    await writeFile(gatewayConfigPath, firstGatewayConfigRaw, "utf8");
     const firstGatewayPid = (await readFile(gatewayPidPath, "utf8")).trim();
     const firstBackups = (await readdir(backupDir)).sort();
     const firstMtimes = {

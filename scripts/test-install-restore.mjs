@@ -376,7 +376,15 @@ async function run() {
       saveReusablePolicyResponse.status === 200,
       `Preparing reusable policy config failed: ${saveReusablePolicyResponse.status}`,
     );
-    const reusablePolicyConfigRaw = await readFile(gatewayConfigPath, "utf8");
+    const reusablePolicyConfig = JSON.parse(await readFile(gatewayConfigPath, "utf8"));
+    reusablePolicyConfig.latency_guard = {
+      total_timeout_ms: 9876,
+      first_progress_action: "retry_then_502",
+      first_progress_timeout_ms: 1234,
+      enabled: true,
+    };
+    const reusablePolicyConfigRaw = `${JSON.stringify(reusablePolicyConfig, null, 2)}\n`;
+    await writeFile(gatewayConfigPath, reusablePolicyConfigRaw, "utf8");
     const reusablePolicyPid = (await readFile(gatewayPidPath, "utf8")).trim();
     const reusablePolicyMtime = await mtimeNs(gatewayConfigPath);
     await runPowerShellScript(installScript, [
@@ -403,13 +411,10 @@ async function run() {
       "Repeated manual install did not preserve upstream error actions",
     );
     assert(
-      JSON.stringify(reloadedReusablePolicyConfig.latency_guard) ===
-        JSON.stringify({
-          enabled: true,
-          first_progress_timeout_ms: 1234,
-          first_progress_action: "retry_then_502",
-          total_timeout_ms: 9876,
-        }),
+      reloadedReusablePolicyConfig.latency_guard?.enabled === true &&
+        reloadedReusablePolicyConfig.latency_guard?.first_progress_timeout_ms === 1234 &&
+        reloadedReusablePolicyConfig.latency_guard?.first_progress_action === "retry_then_502" &&
+        reloadedReusablePolicyConfig.latency_guard?.total_timeout_ms === 9876,
       "Repeated manual install did not preserve nested latency_guard",
     );
     assert(
