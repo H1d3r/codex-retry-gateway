@@ -238,6 +238,8 @@ agent_lifecycle:
       - 019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
       - 019f622a-eb8e-7012-a0d8-363d91794436 => round-6 REQUEST_CHANGES, Critical=0, Important=1, Minor=2
       - 019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
+      - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=1
+      - 019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=2, Minor=2
     idle: []
     timeout: []
     failed: []
@@ -246,6 +248,8 @@ agent_lifecycle:
     - 019f6040-69fe-72b0-89c9-d24b9e12b6bc
     - 019f622a-eb8e-7012-a0d8-363d91794436
     - 019f622a-ffce-7980-92b3-ef6b51ca9b73
+    - 019f6266-a7c6-7571-8982-73d9a90d2393
+    - 019f6266-bbcd-7870-9e23-2838fd017498
   review_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏既有高风险行为？
   closeout_rule: 两名 reviewer 正常返回最终 verdict，Critical/Important 清零并完成复审。
 ```
@@ -361,9 +365,10 @@ post_implementation_review:
   changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..f789066c685e565fe57cc4292ce346f2d898f9a4
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
-  returned_agent_count: 0
+  returned_agent_count: 2
   reviewer_output_refs:
-    - none
+    - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=1
+    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=2, Minor=2
   historical_reviewer_output_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
@@ -401,7 +406,12 @@ post_implementation_review:
     - incomplete-attempt-telemetry
     - protected-feature-regression
   reject_if_hits:
-    - pending-final-review
+    - retry-dispatch-final-deadline-gap
+    - synchronous-processing-crosses-deadline-before-client-write
+    - non-stream-observe-only-sample-recorded-before-forwarding
+    - interrupted-policy-wait-misses-trigger-counter
+    - PowerShell-canonical-scalar-array-corruption
+    - lifecycle-wall-clock-regression-crosses-before-first-chunk
   resolved_findings_pending_rereview:
     - upload disconnect is client_disconnected with actual bytes, not request_rejected 413
     - unfinished SSE event and pre-progress buffers are bounded at 1MiB
@@ -434,19 +444,18 @@ post_implementation_review:
     - every stream chunk rechecks the first-progress wall clock before progress classification
     - UTF-8 BOM coverage splits the three encoded bytes across network chunks
     - pending policy evidence ends before the request's internal-retry completion log; cross-process wall-clock comparison alone has a bounded 50ms tolerance
-  completion_status: review-fix-batch-6-full-local-verification-passed-awaiting-final-rereview
+  completion_status: reviewer-round-7-changes-requested-remediation-approved
   parent_resolution:
     status: blocked
-    reason: awaiting-two-same-question-reviewers
-  implementation_freeze_status: active
+    reason: verified-review-findings-awaiting-red-green-remediation
+  implementation_freeze_status: released-for-bounded-remediation
   allowed_ops:
-    - local-review
-    - evidence-reconciliation
+    - write-test
+    - source-edit
+    - test
     - project-doc-write
     - commit
   forbidden_ops:
-    - source-edit
-    - current-gate-execute
     - pr
     - merge
     - claim-done
