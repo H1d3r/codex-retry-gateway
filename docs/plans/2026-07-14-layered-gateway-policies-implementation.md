@@ -359,6 +359,8 @@ README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retr
 
 第三轮 reviewer 的 4 个 Important 已继续按 RED/GREEN 修复：同步 retry 样本收口不得把下一 attempt 的真实派发拖过总 deadline；误标 SSE 的 `data:` 字段名与 JSON 跨 chunk 时不能误算普通文本 progress；EOF 纯 CR 终态事件必须参与 usage/结构/reasoning 判定；`stream_action=disconnect` 已写响应后遇到受保护超大 SSE 必须取消上游、断开下游并记录专用 final action。2026-07-15 使用 Codex bundled Node 串行运行四套 E2E、六个 JS syntax、三份 PowerShell AST、`git diff --check` 和临时进程审计均通过，等待最终双 reviewer 复审。
 
+第四轮双 reviewer 合并出的 6 个独立 Important 已继续 RED/GREEN：四种共享 retry 统一使用最终 deadline 派发闸门；旧 retry sample 不等待下一响应头并按捕获时间及时落盘；误标 SSE 使用字段内部跨 chunk 的有界待判/普通文本回退；支持流首 UTF-8 BOM；EOF 才确认的 reasoning/final-only disconnect 实际断连；policy retry 后 fetch failure 仍单独计入 failed 并保持 attempt 恒等式。对应 gateway E2E 已通过，等待完整验证与原 reviewer 最终复审。
+
 - [x] **Step 2：执行完整本地验证**
 
 ```powershell

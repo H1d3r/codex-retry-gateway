@@ -347,11 +347,18 @@ post_implementation_review:
   reviewer_output_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
+    - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-4 REQUEST_CHANGES, Critical=0, Important=4
+    - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-4 REQUEST_CHANGES, Critical=0, Important=4
   latest_rereview_findings:
     - policy retry sample closeout can delay the next real upstream dispatch beyond total deadline
     - mislabeled SSE data prefix split across chunks can be misclassified as plain-text progress
     - terminal CR-only SSE event at EOF is not flushed into rule inspection
     - disconnect mode can pass through an oversized protected SSE event after headers are sent
+    - continuation, reasoning guard and first-progress retries lack the final total-deadline dispatch gate
+    - pending policy samples wait for the next response headers and pollute attempt timing
+    - SSE field names split inside the token and a leading UTF-8 BOM remain unhandled
+    - EOF-only disconnect matches are downgraded to observe-only
+    - a fetch failure after an inspected retry attempt breaks the attempt-count identity
   reject_if_hits:
     - retry-or-502-after-downstream-forwarding
     - total-deadline-reset-across-attempts
@@ -379,7 +386,12 @@ post_implementation_review:
     - mislabeled SSE switches to framing on field prefixes before JSON arrives
     - EOF flushes complete CR-only terminal events into usage/structure/reasoning inspection
     - protected inspection overflow disconnects after forwarding with a dedicated final action
-  completion_status: review-fix-batch-3-verified-awaiting-final-rereview
+    - all four retry types share pending dispatch, final deadline gating and bounded dispatch yielding
+    - pending samples capture their own finish time and do not wait for the next response headers
+    - mislabeled SSE uses bounded candidate/confirmed/plain fallback and ignores a leading UTF-8 BOM
+    - EOF-only reasoning and final-only matches disconnect instead of becoming observe-only
+    - fetch failures are classified per attempt even when an earlier attempt was inspected
+  completion_status: review-fix-batch-4-verified-awaiting-final-rereview
 post_implementation_review_policy:
   review_phase: post-implementation
   freshness_rule: review-after-last-mutation
@@ -405,6 +417,7 @@ implementation_commit_refs:
   - git:4480e21
   - git:da20dee
   - git:2f63d97
+  - git:6a42655
 ```
 
 ## Stop Gates
@@ -437,6 +450,16 @@ review_fix_batch_3_green_evidence:
   - next dispatch occurs before synchronous old-attempt closeout and the same deterministic deadline injection passes
   - field-prefix SSE sniffing, EOF CR flush and disconnect inspection overflow E2E all pass
   - four sequential bundled-Node E2E suites, six JS syntax checks, three PowerShell AST checks, diff check and temporary-process audit pass
+review_fix_batch_4_red_evidence:
+  - split data field token was misclassified as plain-text progress
+  - reasoning guard synchronous sample closeout prevented the second dispatch before the 220ms deadline
+  - pending policy sample was absent while the next fetch delayed response headers
+  - EOF-only disconnect match completed normally instead of closing the connection
+review_fix_batch_4_green_evidence:
+  - data/event/id/retry inner-token splits and reserved-prefix plain-text fallback pass
+  - policy/reasoning/continuation/first-progress retries all reach upstream before the shared deadline
+  - old retry sample appears with its own duration while the next fetch is still pending
+  - BOM, EOF reasoning/final-only disconnect and post-policy fetch-failure count identity pass
 full_verification_status: passed-awaiting-final-rereview
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99

@@ -1501,7 +1501,7 @@
      - chunk 解析必须把末尾 CR 保留到下一块判断 CRLF，但 EOF 分支没有允许尾随 CR 的 final flush。
      - 检查上限只受 `strict502Mode` 控制，没有覆盖 reasoning 规则启用但响应已不可改写的 disconnect 模式。
    - 处理：
-     - policy retry 等待完成后先保留旧 attempt 上下文；下一轮在派发前做最终墙钟检查。过期时用旧 sample 返回总 timeout；未过期时先等待下一 fetch 成功取得响应头或结束，再同步完成旧 retry 日志、计数和样本，确保收口不阻塞真实派发。
+     - policy retry 等待完成后先保留旧 attempt 上下文；下一轮在派发前做最终墙钟检查。过期时用旧 sample 返回总 timeout；未过期时启动下一 fetch 并让出两个有界事件循环轮次，再按预先捕获的旧 attempt 结束时间同步完成日志、计数和样本，不等待下一响应头。
      - `total_proxy_request_count` 与 active 计数移动到实际 fetch attempt，未派发的 deadline 分支不计数，也不记录新 attempt。
      - 误标 SSE 从行首 `data:` / `event:` / `id:` / `retry:` / comment 前缀开始识别；EOF 使用只在终止阶段允许尾随 CR 的 `flushSsePayloads()`，完整事件继续进入模型、usage、结构与 reasoning 累积。
      - reasoning 流式保护启用且检查超限时统一 fail-closed：未写响应返回专用 502；已写响应取消 reader/upstream、销毁下游并记录 `response_inspection_limit_disconnected_after_forward`。
@@ -1509,6 +1509,30 @@
      - deadline 故障注入让旧 `http_429_internal_retry` 样本同步入库跨过总 deadline，并断言第二次上游实际接收时间仍早于 deadline；第一版仅提前创建 fetch Promise 仍以 239 ms 对 220 ms 失败，最终后移同步收口后转绿。
      - E2E 覆盖 `data:` 与 JSON 跨 chunk并暂停、纯 CR completed 后立即 EOF、disconnect 已写响应后的受保护超大事件断连和专用样本。
      - 2026-07-15 Codex bundled Node 四套 E2E 串行 PASS，六个 JS syntax、三份 PowerShell AST、`git diff --check` 与仓库临时 Node 进程 0 残留。
+
+44. 所有共享 retry、误标 SSE 和 attempt 计数必须使用统一状态机口径
+   - 现象：
+     - 第三批最终 deadline 闸门只覆盖 Capacity/429；reasoning guard、续写和首 progress timeout 的同步折叠、日志或样本收口仍可跨过 deadline 后继续派发。
+     - 旧 policy sample 等到下一 fetch 返回响应头才落盘；下一 fetch 挂起时旧样本长期不可见，duration/TPS 还包含下一 attempt 的等待。
+     - 误标 SSE 只识别完整字段前缀，首 chunk 为 `d` / `eve` / `i` / `ret` 会被误算普通文本 progress；反向把完整 `id:` / `retry:` / comment 普通文本永久当 SSE。
+     - 流首 UTF-8 BOM 会让首行变成 `\uFEFFdata:`，唯一 completed 事件中的 516 被漏掉。
+     - EOF flush 才确认命中时，disconnect 模式因不能返回 502 而被降成 observe-only；final-answer-only 同样受影响。
+     - 前一 attempt 已记 inspected 后，下一 fetch failure 只记录样本却不增加 failed，破坏 `total = inspected + bypassed + failed + active`。
+   - 根因：
+     - retry 的预算递增、样本完成和继续循环分散在四个分支，没有统一的“未派发 pending -> deadline gate -> 已派发”状态。
+     - 用 fetch Promise resolve 当作派发确认会把旧 attempt 生命周期绑定到下一响应头；只创建 Promise 或只让出一次 `setImmediate` 又不足以让 Node/Undici 在确定性故障注入下写出请求。
+     - Content-Type 误标本身存在协议歧义，需要待判态，而不是遇到完整保留字段就永久切换布尔值。
+     - request-level outcome 不能替代 attempt-level inspected/failed 分类。
+   - 处理：
+     - 四种 retry 都生成 `pendingRetryDispatch`，不提前扣预算或完成 sample；下一轮可覆盖首 progress timeout 地复核总 deadline。允许派发时先启动 fetch 并连续让出两个 check/poll 轮次，再完成旧 sample；过期时仍用旧 sample 返回总 timeout。
+     - pending 对象捕获 `requestFinishedAtMs` 与 `latestLogSeq`；旧样本不等待下一响应头，挂起 fetch 下仍及时可见，duration/TPS 不跨 attempt。续写次数与 timeout retry 次数也只在进入派发轮次后增加。
+     - parser 使用有界 tri-state：字段名部分前缀保持待判，JSON data 确认为 SSE，完整不可识别事件回退普通文本；parser 副本忽略可跨 chunk 的流首 UTF-8 BOM，原始下游字节不改。
+     - EOF 最终命中且 `stream_action=disconnect` 时统一记录实际 blocked/matched，取消上游并 `res.destroy()`；reasoning 与 final-only 共用该分支。
+     - 当前 attempt 尚未 inspected 而失败时在内层 catch 单独增加 failed 并写 request outcome，外层兜底不再因前序 inspected 状态漏计或重复计数。
+   - 防回归：
+     - 同一计时故障模块分别让 `http_429_internal_retry`、`internal_retry`、`continuation_recovery`、`first_progress_timeout_internal_retry` 的同步入库跨过 220 ms deadline，四类第二次上游请求都必须在 deadline 前实际收到。
+     - 第二 fetch 延迟 800 ms 且 latency guard 关闭时，旧 429 sample 必须在 250 ms 观测窗口内出现，且自身 duration 小于 500 ms。
+     - E2E 覆盖 `d/eve/i/ret` 字段内部拆分、`id:`/comment 普通文本回退、BOM completed 516、纯 CR EOF reasoning/final-only disconnect，以及 429 后连续 fetch failure 的全局计数恒等式。
 
 ### 2026-06-26 实测证据
 
