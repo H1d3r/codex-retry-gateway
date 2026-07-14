@@ -1552,6 +1552,27 @@
      - 独立 fault gateway 把 45 ms first-progress 与 70 ms total timer 回调延迟到 200 ms；上游分别在 80/100 ms 产生 progress/body，仍必须按墙钟返回对应 502。
      - pending sample 额外断言唯一性、`request_finished_at_ms` 早于第二次上游接收、duration 与 evidence 上界存在；未派发 Retry-After timeout 断言 retry 字段为空。
 
+46. 检查上限必须先于 progress/timeout，测试证据不能依赖预热事件或跨进程毫秒墙钟
+   - 现象：
+     - “误标首个超大候选”用例默认先生成普通输出，parser 已进入 confirmed SSE，无法证明首个事件超过 `1MiB` 时仍会 fail-closed。
+     - 超大候选在同一 chunk 完成边界后可能先被当成普通文本 progress；first-progress 已过期时又可能先走 timeout，绕过专用检查失败收口。
+     - timer 回调延迟时，连续 lifecycle/metadata chunk 不会主动复核 first-progress 墙钟，要等有效输出、EOF 或迟到 timer 才超时。
+     - JavaScript 字符切分只能覆盖完整 BOM 独立成块，不能覆盖 `EF BB BF` 三个 UTF-8 字节跨网络 chunk。
+     - pending sample 测试严格比较 gateway 与假上游两个进程的 `Date.now()`；Windows 实测出现 4ms 回拨，导致因果顺序正确但断言偶发失败。
+   - 根因：
+     - 测试 fixture 没有关闭默认输出事件；生产分支又把检查上限放在 progress 与 timeout 处理之后。
+     - first-progress 的绝对截止时间只在有效 progress/EOF 路径复核，没有覆盖每个已到达的流式 chunk。
+     - 字符切分与网络字节切分不是同一层语义；跨进程墙钟也不是单调因果时钟。
+   - 处理：
+     - 超大候选用例设置 `test_stream_only_completed_event=true`，保证首个且唯一事件就是带 516 的超大 completed。
+     - 抽出统一检查上限收口函数，并在 progress/first-progress timeout 之前执行；随后每个 chunk 在 progress 分类前调用 first-progress 墙钟复核。
+     - fake upstream 增加 Buffer 字节切分，直接覆盖 BOM 三字节跨 chunk。
+     - pending sample 断言增加日志游标，要求 `evidence_log_seq_range.to` 早于本次 `internal_retry` 完成日志；跨进程时间比较只保留 50ms 时钟容差，不放宽样本唯一性、duration 或 evidence 顺序。
+   - 防回归：
+     - fault gateway 将 200ms first-progress timer 延迟到 500ms，并在超大候选累积到 `1MiB` 时阻塞 230ms，断言检查上限仍先返回 `response-inspection-limit-exceeded`。
+     - 47ms first-progress timer 被延迟时，上游 80ms 后连续发送 lifecycle，首个过期 chunk 必须立即返回 502。
+     - 修正后 `test-gateway-e2e.mjs` 单轮 GREEN，并连续 3 轮稳定性复跑全部 GREEN；此前五轮稳定性基线也全部 GREEN。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

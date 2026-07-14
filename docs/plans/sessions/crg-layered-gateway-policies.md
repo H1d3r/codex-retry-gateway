@@ -236,12 +236,16 @@ agent_lifecycle:
     completed:
       - 019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
       - 019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
+      - 019f622a-eb8e-7012-a0d8-363d91794436 => round-6 REQUEST_CHANGES, Critical=0, Important=1, Minor=2
+      - 019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
     idle: []
     timeout: []
     failed: []
   closed_agent_refs:
     - 019f6040-55cb-7dc0-a70d-d8a5c7a03d99
     - 019f6040-69fe-72b0-89c9-d24b9e12b6bc
+    - 019f622a-eb8e-7012-a0d8-363d91794436
+    - 019f622a-ffce-7980-92b3-ef6b51ca9b73
   review_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏既有高风险行为？
   closeout_rule: 两名 reviewer 正常返回最终 verdict，Critical/Important 清零并完成复审。
 ```
@@ -280,7 +284,7 @@ source_edit_admission: approved-by-owner-with-project-native-plan
 ```yaml
 protected_feature_replay:
   required: true
-  status: passed-after-review-fixes
+  status: passed
   completion_status: passed
   baseline_ref: git:b4cac27
   known_good_features:
@@ -289,6 +293,7 @@ protected_feature_replay:
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
       post_change_replay_ref: 2026-07-15 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: 518*n-2、manual values 与拦截次数保持通过
+      actual_result: 518*n-2、manual values 与拦截次数保持通过
       owner_visible_status: passed
       regression_status: passed
     - feature: final-answer-only-high-xhigh-and-zero-exclusion
@@ -296,6 +301,7 @@ protected_feature_replay:
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
       post_change_replay_ref: 2026-07-15 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: high/xhigh、普通 0 放行与 null/非 0 语义保持通过
+      actual_result: high/xhigh、普通 0 放行与 null/非 0 语义保持通过
       owner_visible_status: passed
       regression_status: passed
     - feature: context-compaction-zero-exemption
@@ -303,6 +309,7 @@ protected_feature_replay:
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
       post_change_replay_ref: 2026-07-15 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: 只有 context_compaction reasoning_tokens=0 豁免
+      actual_result: 只有 context_compaction reasoning_tokens=0 豁免
       owner_visible_status: passed
       regression_status: passed
     - feature: continuation-recovery-folding-and-exhaustion
@@ -310,6 +317,7 @@ protected_feature_replay:
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
       post_change_replay_ref: 2026-07-15 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: 命中轮丢弃、最终轮折叠、共享次数与耗尽 502 保持通过
+      actual_result: 命中轮丢弃、最终轮折叠、共享次数与耗尽 502 保持通过
       owner_visible_status: passed
       regression_status: passed
     - feature: capacity-legacy-retry-then-pass-through
@@ -317,6 +325,7 @@ protected_feature_replay:
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
       post_change_replay_ref: 2026-07-15 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: 旧 true 配置重试耗尽后仍透传原始 Capacity 响应
+      actual_result: 旧 true 配置重试耗尽后仍透传原始 Capacity 响应
       owner_visible_status: passed
       regression_status: passed
     - feature: windows-and-unix-idempotent-config-recovery
@@ -324,6 +333,7 @@ protected_feature_replay:
       post_change_replay_plan_ref: node .\scripts\test-install-restore.mjs; node .\scripts\test-launch-ui.mjs; node .\scripts\test-launch-ui-unix.mjs
       post_change_replay_ref: 2026-07-15 Codex bundled Node install-restore、Windows launch、Unix launch 三组 E2E 全部 PASS
       expected_result: 合法配置复用零误写、PID 身份和恢复闭环保持通过
+      actual_result: 合法配置复用零误写、PID 身份和恢复闭环保持通过
       owner_visible_status: passed
       regression_status: passed
   forbidden_ops_until_replay:
@@ -351,6 +361,8 @@ post_implementation_review:
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-4 REQUEST_CHANGES, Critical=0, Important=4
     - agent:019f620a-6d9c-7e12-97da-7d7a905684e1 => round-5 PASS, Critical=0, Important=0, Minor=2
     - agent:019f620a-81e7-7783-a8c2-1a002493178d => round-5 REQUEST_CHANGES, Critical=0, Important=4, Minor=1
+    - agent:019f622a-eb8e-7012-a0d8-363d91794436 => round-6 REQUEST_CHANGES, Critical=0, Important=1, Minor=2
+    - agent:019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
   latest_rereview_findings:
     - policy retry sample closeout can delay the next real upstream dispatch beyond total deadline
     - mislabeled SSE data prefix split across chunks can be misclassified as plain-text progress
@@ -364,6 +376,11 @@ post_implementation_review:
     - mislabeled oversized first SSE event is discarded before candidate confirmation
     - standalone BOM and fallback-plus-trailing-candidate corrupt first-progress classification
     - delayed timer callbacks can lose first-progress and total hard deadlines on completion paths
+    - oversized-candidate regression used an earlier default output event and could pass without exercising the candidate state
+    - inspection-limit handling ran after progress/first-progress timeout classification
+    - lifecycle-only chunks did not independently recheck the first-progress wall clock
+    - JavaScript character splitting did not cover UTF-8 BOM bytes split across chunks
+    - pending policy evidence assertion did not prove the captured range excluded retry-completion logs
   reject_if_hits:
     - retry-or-502-after-downstream-forwarding
     - total-deadline-reset-across-attempts
@@ -400,7 +417,12 @@ post_implementation_review:
     - BOM-only chunks and unrecognized fallback facts survive remaining-buffer changes
     - body/chunk/EOF completion paths enforce first-progress and total deadlines by wall clock
     - undispatched retry fields and old-attempt evidence ranges remain attempt-local
-  completion_status: review-fix-batch-5-e2e-passed-awaiting-final-verification-and-rereview
+    - oversized candidate tests start with the only completed event and no pre-confirming output
+    - inspection-limit fail-closed runs before progress and first-progress timeout handling
+    - every stream chunk rechecks the first-progress wall clock before progress classification
+    - UTF-8 BOM coverage splits the three encoded bytes across network chunks
+    - pending policy evidence ends before the request's internal-retry completion log; cross-process wall-clock comparison alone has a bounded 50ms tolerance
+  completion_status: review-fix-batch-6-full-local-verification-passed-awaiting-final-rereview
 post_implementation_review_policy:
   review_phase: post-implementation
   freshness_rule: review-after-last-mutation
@@ -428,6 +450,7 @@ implementation_commit_refs:
   - git:2f63d97
   - git:6a42655
   - git:92c189d
+  - git:248d001
 ```
 
 ## Stop Gates
@@ -452,6 +475,9 @@ verification_results:
   - 2026-07-15 common/install/launch PowerShell AST => PASS
   - 2026-07-15 temporary gateway process audit => 0 leftovers
   - 2026-07-15 git diff --check => PASS with line-ending warnings only
+  - 2026-07-15 latest gateway E2E after round-6 fixes => PASS codex-retry-gateway e2e
+  - 2026-07-15 gateway E2E stability replay before evidence tightening => 5/5 PASS
+  - 2026-07-15 gateway E2E stability replay after evidence tightening and 50ms cross-process clock tolerance => 3/3 PASS
 review_fix_batch_3_red_evidence:
   - next attempt reached upstream at 239ms with a 220ms total deadline when synchronous retry sample closeout ran before real dispatch
   - terminal CR-only completed SSE returned 200 instead of intercepting reasoning_tokens=516
@@ -479,10 +505,23 @@ review_fix_batch_5_green_evidence:
   - standalone BOM, fallback-plus-tail and mislabeled oversized candidate E2E pass
   - delayed first-progress and total timer callbacks still return wall-clock 502
   - undispatched retry fields, pending sample uniqueness/finish time and evidence bounds are asserted
-full_verification_status: review-fix-batch-5-e2e-passed-awaiting-final-verification-and-rereview
+review_fix_batch_6_red_evidence:
+  - first oversized-candidate regression still had an earlier default output event and did not exercise candidate fail-closed
+  - delayed first-progress timer plus lifecycle-only chunks exposed missing per-chunk wall-clock checks
+  - inspection-limit and delayed first-progress in the same chunk required an explicit priority assertion
+  - strict cross-process timestamp ordering reproduced a 4ms Windows wall-clock rollback
+review_fix_batch_6_green_evidence:
+  - only-completed oversized candidate returns response-inspection-limit-exceeded before timeout
+  - each lifecycle chunk rechecks first-progress wall clock and the first expired chunk returns 502
+  - UTF-8 BOM bytes split across chunks do not count as progress
+  - pending sample evidence upper bound is lower than the current internal-retry completion log sequence
+  - gateway E2E passed once and then passed three consecutive stability replays after the final test correction
+full_verification_status: review-fix-batch-6-full-local-verification-passed-awaiting-final-rereview
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
+  - agent:019f622a-eb8e-7012-a0d8-363d91794436
+  - agent:019f622a-ffce-7980-92b3-ef6b51ca9b73
 pr_ref: pending
 merge_ref: pending
 rollout_ref: pending

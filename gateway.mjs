@@ -11497,6 +11497,55 @@ async function handleStreaming({
     });
   };
 
+  const handleInspectionLimitExceeded = (inspectionLimitError) => {
+    if (!inspectedRecorded) {
+      recordInspectedResponseForSample(
+        monitor,
+        reasoningSample,
+        observedReasoning,
+        false,
+        "stream",
+      );
+      inspectedRecorded = true;
+    }
+    setRequestTrackingOutcome(requestTracking, "inspected");
+    recordBlockedResponse(monitor, "stream");
+    abortController.abort();
+    reader.cancel().catch(() => {});
+    finalizeModelInsights(monitor, pathname, modelContext);
+    if (!res.headersSent && !wroteAnyChunk) {
+      res.writeHead(502, {
+        "content-type": "application/json; charset=utf-8",
+        "x-codex-retry-gateway-reason": "response-inspection-limit-exceeded",
+      });
+      markReasoningSampleClientHeadersSent(reasoningSample);
+      markReasoningSampleClientWrite(reasoningSample);
+      res.end(
+        buildResponseInspectionLimitBody(
+          pathname,
+          PRE_PROGRESS_BUFFER_LIMIT_BYTES,
+        ),
+      );
+      finishReasoningSample({
+        finalAction: "response_inspection_limit_exceeded",
+        clientHttpStatus: 502,
+        matchedCurrentRule: false,
+        blockedByGateway: true,
+        failureSummary: buildFailureSummary(inspectionLimitError),
+      });
+    } else {
+      res.destroy();
+      finishReasoningSample({
+        finalAction: "response_inspection_limit_disconnected_after_forward",
+        clientHttpStatus: null,
+        matchedCurrentRule: false,
+        blockedByGateway: true,
+        failureSummary: buildFailureSummary(inspectionLimitError),
+      });
+    }
+    return { handled: true };
+  };
+
   const ensureClientHeaders = () => {
     if (res.headersSent) {
       return;
@@ -11801,6 +11850,12 @@ async function handleStreaming({
     if (inspectionLimitError) {
       reasoningSample.failure_summary = buildFailureSummary(inspectionLimitError);
     }
+    if (inspectionLimitError && inspectionProtectionEnabled) {
+      return handleInspectionLimitExceeded(inspectionLimitError);
+    }
+    if (latencyGuard?.expireFirstProgressDeadlineIfNeeded()) {
+      throw new Error("upstream first progress deadline expired before stream chunk processing");
+    }
     const sseDetectionPending =
       !sseState.sse_like &&
       sseState.sse_candidate;
@@ -11942,58 +11997,6 @@ async function handleStreaming({
           clientHttpStatus: null,
           matchedCurrentRule: true,
           blockedByGateway: true,
-        });
-      }
-      return { handled: true };
-    }
-
-    if (
-      inspectionLimitError &&
-      inspectionProtectionEnabled
-    ) {
-      if (!inspectedRecorded) {
-        recordInspectedResponseForSample(
-          monitor,
-          reasoningSample,
-          observedReasoning,
-          false,
-          "stream",
-        );
-        inspectedRecorded = true;
-      }
-      setRequestTrackingOutcome(requestTracking, "inspected");
-      recordBlockedResponse(monitor, "stream");
-      abortController.abort();
-      reader.cancel().catch(() => {});
-      finalizeModelInsights(monitor, pathname, modelContext);
-      if (!res.headersSent && !wroteAnyChunk) {
-        res.writeHead(502, {
-          "content-type": "application/json; charset=utf-8",
-          "x-codex-retry-gateway-reason": "response-inspection-limit-exceeded",
-        });
-        markReasoningSampleClientHeadersSent(reasoningSample);
-        markReasoningSampleClientWrite(reasoningSample);
-        res.end(
-          buildResponseInspectionLimitBody(
-            pathname,
-            PRE_PROGRESS_BUFFER_LIMIT_BYTES,
-          ),
-        );
-        finishReasoningSample({
-          finalAction: "response_inspection_limit_exceeded",
-          clientHttpStatus: 502,
-          matchedCurrentRule: false,
-          blockedByGateway: true,
-          failureSummary: buildFailureSummary(inspectionLimitError),
-        });
-      } else {
-        res.destroy();
-        finishReasoningSample({
-          finalAction: "response_inspection_limit_disconnected_after_forward",
-          clientHttpStatus: null,
-          matchedCurrentRule: false,
-          blockedByGateway: true,
-          failureSummary: buildFailureSummary(inspectionLimitError),
         });
       }
       return { handled: true };

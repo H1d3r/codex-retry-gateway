@@ -363,6 +363,8 @@ README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retr
 
 第五轮 reviewer 的 4 个 Important 已继续 RED/GREEN：误标首个超大 SSE 候选无法绕过检查上限；独立 BOM chunk 不算 progress；普通文本 fallback 后的尾随候选不覆盖本 chunk progress；首 progress/total 完成路径按墙钟复核，不依赖延迟 timer 回调顺序。两个采集 Minor 同步收紧：未派发 timeout 明确保持 retry 字段为空，旧 policy sample 的 evidence 上界不跨入下一 attempt。对应 gateway E2E 与三套生命周期 E2E 已通过，等待最终完整验证与复审。
 
+第六轮 reviewer 合并出的 3 个独立 Important 已继续关闭：超大候选测试改为首个且唯一事件就是 `response.completed`；检查上限在 progress/first-progress timeout 之前 fail-closed；每个流式 chunk 在 progress 分类前无条件复核 first-progress 墙钟。BOM 测试改为按 UTF-8 字节跨 chunk，旧 policy sample 进一步断言 evidence 上界早于当前请求的内部重试完成日志。Windows 跨进程 `Date.now()` 曾出现 4ms 回拨，测试只对该跨进程比较保留 50ms 容差，样本唯一性、800ms 挂起期间及时可见、duration 上界和日志 evidence 顺序仍为硬断言。修正后 gateway E2E 单轮通过并连续 3 轮稳定性复跑通过。
+
 - [x] **Step 2：执行完整本地验证**
 
 ```powershell
