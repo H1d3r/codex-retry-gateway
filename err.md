@@ -1595,6 +1595,31 @@
      - observe-only 断言客户端首写字段；Retry-After 断连断言 trigger+1/retry 不变；Windows launch 断言标量数组 canonical JSON。
      - gateway E2E 连续 3 轮 GREEN，三套生命周期 E2E 全部 GREEN，临时 gateway 进程残留为 0。
 
+48. 未派发 current attempt 不能抢走 pending 终态，首 progress 和最终写入必须绑定真实边界
+   - 现象：
+     - pending 旧 guard 首次 total 检查尚未过期、current guard 紧接着过期时，旧 sample 丢失，落盘的是 `upstream_fetch_started_at_ms=null` 的伪 attempt 2，inspected 还重复增加。
+     - current 首 progress timer 在 header clone 前启动；同步准备跨过首 progress 但未跨 total 时，第二次上游仍被派发并错误返回 first-progress 502。
+     - 非流式 Capacity/429 502、策略透传和 reasoning block 在最后一次 total 检查后仍会执行 logger、模型归档、错误体构造或 header copy；同步工作跨线后仍写原策略响应。
+     - fetch 被 first-progress abort 后，rejection 直到 total deadline 之后才恢复时，旧代码仍按 first-progress 收口。
+     - 续写安全模式的 Capacity/429 pass-through 直接发送原始 `bodyBuffer`，可泄露 `encrypted_content`。
+   - 根因：
+     - pending 与 current 各自做 deadline 检查，但第二个闸门的 timeout 分支固定绑定 current 局部 sample；current guard 又早于真实 fetch 创建。
+     - 非流式多个早退分支没有统一的“同步准备完成 -> 最终墙钟复核 -> 首次 writeHead”不可撤回边界。
+     - fetch outcome 先抛 rejection、后检查 total，且策略透传绕过普通非流式脱敏出口。
+   - 处理：
+     - 第二个 total gate 过期且存在 pending 时，强制用 pending 的 guard、sample、模型和结构收口；current attempt 只有真实 fetch 后才记预算、代理总数和 active。
+     - current latency guard 在 header/request 准备完成后创建，首 progress 从真实派发邻近位置开始；请求级 total deadline 仍跨 attempt 不重置。
+     - 非流式所有未写终态先完成模型归档、错误体或 header 准备，再紧邻 `writeHead` 复核 total；timeout 写入前清理尚未发送的上游 header，策略 outcome/blocked 只在闸门通过后计数。
+     - fetch resolve/reject 以及 catch 都先以 `overrideExisting=true` 复核 total，再复核 first-progress；总 deadline 已过时覆盖较早 phase。
+     - Capacity/429 pass-through 在续写安全模式下复用 `stripEncryptedContentFromBodyBuffer()`；none 模式不启用该标志。
+   - 防回归：
+     - 故障注入让 pending 检查看到 deadline 前 1ms、current 检查看到已过期，断言只落 attempt 1、只发一次上游、预算仍为 0 且 attempt 恒等式成立。
+     - 第二次 header clone 阻塞 80ms，first-progress=40ms、total=220ms；正常第二次上游必须返回 200，证明本地准备不消耗首 progress 窗口。
+     - Capacity 502、HTTP 429 pass-through 与 reasoning block 分别在最终同步准备中阻塞 100ms，延迟 timer 回调后仍统一返回 total-timeout 502。
+     - first-progress=40ms、total=60ms 的 fetch rejection 被阻塞到 80ms，最终只能增加 total timeout；续写 Capacity pass/retry-exhaust 两条路径都不得出现 key 或 secret。
+     - lifecycle 反例记录上游 chunk 实际发送时间，硬证明既有 deadline 前 chunk，也有首次跨线的后续 chunk。
+     - 2026-07-15 gateway E2E 首轮 GREEN 并连续 3/3 稳定复跑；install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留全部 PASS。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

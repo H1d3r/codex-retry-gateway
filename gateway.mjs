@@ -2151,6 +2151,9 @@ function handleAttemptLatencyTimeout({
     : "upstream-total-timeout";
   const body = buildLatencyTimeoutErrorBody(phase, limitMs, requestTracking);
   recordTimeoutOutcome(monitor, phase, "return_502");
+  for (const headerName of res.getHeaderNames()) {
+    res.removeHeader(headerName);
+  }
   res.writeHead(502, {
     "content-type": "application/json; charset=utf-8",
     "x-codex-retry-gateway-reason": reasonHeader,
@@ -11306,15 +11309,16 @@ async function handleNonStreaming({
       };
     }
     if (actionExhaustsTo502(upstreamPolicy.action)) {
+      finalizeModelInsights(monitor, pathname, modelContext, parsed);
+      const policyErrorBody = buildUpstreamPolicyErrorBody(upstreamPolicy, requestTracking);
+      throwIfTotalDeadlineExpired("upstream total deadline expired before policy 502 forwarding");
       recordUpstreamPolicyOutcome(monitor, upstreamPolicy.trigger, "return_502");
       recordBlockedResponse(monitor, "non-stream");
-      finalizeModelInsights(monitor, pathname, modelContext, parsed);
       res.writeHead(502, {
         "content-type": "application/json; charset=utf-8",
         "x-codex-retry-gateway-reason": upstreamPolicy.reasonHeader,
       });
       markReasoningSampleClientHeadersSent(reasoningSample);
-      const policyErrorBody = buildUpstreamPolicyErrorBody(upstreamPolicy, requestTracking);
       markReasoningSampleClientWrite(reasoningSample);
       res.end(policyErrorBody);
       completeReasoningBehaviorSample({
@@ -11330,15 +11334,19 @@ async function handleNonStreaming({
       });
       return { handled: true };
     }
-    recordUpstreamPolicyOutcome(monitor, upstreamPolicy.trigger, "pass_through");
+    const policyPassThroughBody = requestTracking?.strip_encrypted_reasoning_response
+      ? stripEncryptedContentFromBodyBuffer(bodyBuffer)
+      : bodyBuffer;
     finalizeModelInsights(monitor, pathname, modelContext, parsed);
     copyHeadersToClient(upstreamResponse.headers, res);
+    throwIfTotalDeadlineExpired("upstream total deadline expired before policy pass-through forwarding");
+    recordUpstreamPolicyOutcome(monitor, upstreamPolicy.trigger, "pass_through");
     res.writeHead(upstreamResponse.status);
     markReasoningSampleClientHeadersSent(reasoningSample);
-    if (bodyBuffer.length > 0) {
+    if (policyPassThroughBody.length > 0) {
       markReasoningSampleClientWrite(reasoningSample);
     }
-    res.end(bodyBuffer);
+    res.end(policyPassThroughBody);
     completeReasoningBehaviorSample({
       runtime,
       sample: reasoningSample,
@@ -11365,7 +11373,6 @@ async function handleNonStreaming({
       logger(`[match] non-stream path=${pathname} ${ruleMatch.reasonForLog} action=${action} mode=${ruleMatch.mode}`);
     }
     if (shouldIntercept) {
-      recordBlockedResponse(monitor, "non-stream");
       finalizeModelInsights(
         monitor,
         pathname,
@@ -11373,9 +11380,13 @@ async function handleNonStreaming({
         upstreamResponse.status >= 400 ? parsed : null,
       );
       if (canGuardRetry) {
+        throwIfTotalDeadlineExpired("upstream total deadline expired before reasoning retry");
+        recordBlockedResponse(monitor, "non-stream");
         return { guardRetry: true };
       }
       const blockedBody = buildBlockedBody(pathname, ruleMatch.blockedReasoning, config.non_stream_status_code);
+      throwIfTotalDeadlineExpired("upstream total deadline expired before reasoning block forwarding");
+      recordBlockedResponse(monitor, "non-stream");
       res.writeHead(config.non_stream_status_code, {
         "content-type": "application/json; charset=utf-8",
         "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
@@ -11400,7 +11411,6 @@ async function handleNonStreaming({
   const finalBody = requestTracking?.strip_encrypted_reasoning_response
     ? stripEncryptedContentFromBodyBuffer(bodyBuffer)
     : bodyBuffer;
-  throwIfTotalDeadlineExpired("upstream total deadline expired before non-stream forwarding");
   finalizeModelInsights(
     monitor,
     pathname,
@@ -11408,6 +11418,7 @@ async function handleNonStreaming({
     upstreamResponse.status >= 400 ? parsed : null,
   );
   copyHeadersToClient(upstreamResponse.headers, res);
+  throwIfTotalDeadlineExpired("upstream total deadline expired before non-stream forwarding");
   res.writeHead(upstreamResponse.status);
   markReasoningSampleClientHeadersSent(reasoningSample);
   if (finalBody.length > 0) {
@@ -12230,6 +12241,25 @@ async function proxyRequest(runtime, req, res) {
     });
   };
 
+  const handlePendingRetryTotalTimeout = (pendingRetry) => {
+    handleAttemptLatencyTimeout({
+      runtime,
+      config,
+      monitor: runtime.monitor,
+      pathname,
+      requestTracking,
+      modelContext: pendingRetry.modelContext,
+      reasoningSample: pendingRetry.reasoningSample,
+      structureAccumulator: pendingRetry.structureAccumulator,
+      res,
+      latencyGuard: pendingRetry.latencyGuard,
+      upstreamStatus: pendingRetry.reasoningSample.upstream_http_status,
+      errorPayload: pendingRetry.errorPayload,
+      blockedResponseAlreadyRecorded: pendingRetry.blockedResponseAlreadyRecorded,
+      modelInsightsAlreadyFinalized: pendingRetry.modelInsightsAlreadyFinalized,
+    });
+  };
+
   while (true) {
     const attemptIndex = guardRetryAttemptsUsed + (pendingRetryDispatch ? 1 : 0);
     let activeProxyRequestStarted = false;
@@ -12251,11 +12281,7 @@ async function proxyRequest(runtime, req, res) {
       requestIsStream,
     );
     const structureAccumulator = createStructureAccumulator();
-    const latencyGuard = createAttemptLatencyGuard(
-      shouldInspect ? config : { latency_guard: DEFAULT_CONFIG.latency_guard },
-      requestTracking,
-      abortController,
-    );
+    let latencyGuard = null;
 
     try {
       const upstreamHeaders = cloneHeadersForUpstream(req.headers);
@@ -12266,25 +12292,24 @@ async function proxyRequest(runtime, req, res) {
       ) {
         const timedOutRetry = pendingRetryDispatch;
         pendingRetryDispatch = null;
-        handleAttemptLatencyTimeout({
-          runtime,
-          config,
-          monitor: runtime.monitor,
-          pathname,
-          requestTracking,
-          modelContext: timedOutRetry.modelContext,
-          reasoningSample: timedOutRetry.reasoningSample,
-          structureAccumulator: timedOutRetry.structureAccumulator,
-          res,
-          latencyGuard: timedOutRetry.latencyGuard,
-          upstreamStatus: timedOutRetry.reasoningSample.upstream_http_status,
-          errorPayload: timedOutRetry.errorPayload,
-          blockedResponseAlreadyRecorded: timedOutRetry.blockedResponseAlreadyRecorded,
-          modelInsightsAlreadyFinalized: timedOutRetry.modelInsightsAlreadyFinalized,
-        });
+        handlePendingRetryTotalTimeout(timedOutRetry);
         return;
       }
+      latencyGuard = createAttemptLatencyGuard(
+        shouldInspect ? config : { latency_guard: DEFAULT_CONFIG.latency_guard },
+        requestTracking,
+        abortController,
+      );
       if (latencyGuard.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
+        if (pendingRetryDispatch) {
+          pendingRetryDispatch.latencyGuard.expireTotalDeadlineIfNeeded({
+            overrideExisting: true,
+          });
+          const timedOutRetry = pendingRetryDispatch;
+          pendingRetryDispatch = null;
+          handlePendingRetryTotalTimeout(timedOutRetry);
+          return;
+        }
         throw new Error("upstream total deadline expired before fetch dispatch");
       }
 
@@ -12325,11 +12350,13 @@ async function proxyRequest(runtime, req, res) {
         completePendingRetryDispatch(completedRetry);
       }
       const upstreamResponseOutcome = await upstreamResponseOutcomePromise;
+      latencyGuard.expireTotalDeadlineIfNeeded({ overrideExisting: true });
+      latencyGuard.expireFirstProgressDeadlineIfNeeded();
+      if (latencyGuard.timeoutPhase) {
+        throw upstreamResponseOutcome.error || new Error("upstream latency deadline expired after fetch");
+      }
       if (upstreamResponseOutcome.error) {
         throw upstreamResponseOutcome.error;
-      }
-      if (latencyGuard.expireTotalDeadlineIfNeeded()) {
-        throw new Error("upstream total deadline expired after retry dispatch");
       }
       const upstreamResponse = upstreamResponseOutcome.response;
       reasoningSample.upstream_headers_at_ms = upstreamResponseOutcome.headersAtMs;
@@ -12566,7 +12593,9 @@ async function proxyRequest(runtime, req, res) {
         recordReasoningBehaviorSample(runtime, reasoningSample);
         return;
       }
-      if (latencyGuard.timeoutPhase) {
+      latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true });
+      latencyGuard?.expireFirstProgressDeadlineIfNeeded();
+      if (latencyGuard?.timeoutPhase) {
         const timeoutResult = handleAttemptLatencyTimeout({
           runtime,
           config,
@@ -12625,7 +12654,7 @@ async function proxyRequest(runtime, req, res) {
       recordReasoningBehaviorSample(runtime, reasoningSample);
       throw error;
     } finally {
-      latencyGuard.clear();
+      latencyGuard?.clear();
       requestTracking.client_disconnect_signal?.removeEventListener(
         "abort",
         abortAttemptForClientDisconnect,

@@ -238,8 +238,8 @@ agent_lifecycle:
       - 019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
       - 019f622a-eb8e-7012-a0d8-363d91794436 => round-6 REQUEST_CHANGES, Critical=0, Important=1, Minor=2
       - 019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
-      - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=1
-      - 019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=2, Minor=2
+      - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=0
+      - 019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=2
     idle: []
     timeout: []
     failed: []
@@ -359,10 +359,10 @@ post_implementation_review:
   review_scope: whole-source
   owner_requested_scope: all-source
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
-  implementation_snapshot_ref: git:c1cb042be9ba7938bef9b7983f71b0e5108eadcb
-  last_mutation_ref: git:c1cb042be9ba7938bef9b7983f71b0e5108eadcb
-  review_after_last_mutation: true
-  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..c1cb042be9ba7938bef9b7983f71b0e5108eadcb
+  implementation_snapshot_ref: pending-round-8-source-snapshot
+  last_mutation_ref: working-tree:round-8-review-remediation
+  review_after_last_mutation: false
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..working-tree
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
   returned_agent_count: 0
@@ -377,26 +377,16 @@ post_implementation_review:
     - agent:019f620a-81e7-7783-a8c2-1a002493178d => round-5 REQUEST_CHANGES, Critical=0, Important=4, Minor=1
     - agent:019f622a-eb8e-7012-a0d8-363d91794436 => round-6 REQUEST_CHANGES, Critical=0, Important=1, Minor=2
     - agent:019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
-    - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=1
-    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=2, Minor=2
+    - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=0
+    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=2
   latest_rereview_findings:
-    - policy retry sample closeout can delay the next real upstream dispatch beyond total deadline
-    - mislabeled SSE data prefix split across chunks can be misclassified as plain-text progress
-    - terminal CR-only SSE event at EOF is not flushed into rule inspection
-    - disconnect mode can pass through an oversized protected SSE event after headers are sent
-    - continuation, reasoning guard and first-progress retries lack the final total-deadline dispatch gate
-    - pending policy samples wait for the next response headers and pollute attempt timing
-    - SSE field names split inside the token and a leading UTF-8 BOM remain unhandled
-    - EOF-only disconnect matches are downgraded to observe-only
-    - a fetch failure after an inspected retry attempt breaks the attempt-count identity
-    - mislabeled oversized first SSE event is discarded before candidate confirmation
-    - standalone BOM and fallback-plus-trailing-candidate corrupt first-progress classification
-    - delayed timer callbacks can lose first-progress and total hard deadlines on completion paths
-    - oversized-candidate regression used an earlier default output event and could pass without exercising the candidate state
-    - inspection-limit handling ran after progress/first-progress timeout classification
-    - lifecycle-only chunks did not independently recheck the first-progress wall clock
-    - JavaScript character splitting did not cover UTF-8 BOM bytes split across chunks
-    - pending policy evidence assertion did not prove the captured range excluded retry-completion logs
+    - a pending old attempt can be lost when its first deadline gate passes but the current guard expires before dispatch
+    - non-stream Capacity/429 pass-through, policy 502 and reasoning-block exits lack a final total-deadline gate immediately before writeHead
+    - fetch rejection and post-fetch wall-clock checks do not override an already-selected first-progress timeout with an expired total deadline
+    - continuation-safe Capacity/429 pass-through can forward the original body with encrypted_content instead of the redacted payload
+    - header cloning can cross first-progress deadline without crossing total deadline and still dispatch an upstream attempt
+    - lifecycle timing evidence infers prior chunk timing from total duration instead of recording upstream send timestamps
+    - the full frozen diff contains three trailing-whitespace violations
   reject_if_patterns:
     - retry-or-502-after-downstream-forwarding
     - total-deadline-reset-across-attempts
@@ -446,10 +436,17 @@ post_implementation_review:
     - upstream policy trigger and final outcome counters are independent
     - PowerShell canonical JSON preserves scalar array values and order
     - lifecycle regression crosses the deadline on a later metadata chunk, not the first chunk
-  completion_status: review-fix-batch-7-full-local-verification-passed-awaiting-original-reviewer-rereview
+    - pending/current split-gate expiry reuses the inspected pending sample and does not create a synthetic attempt
+    - current first-progress timing starts after local header preparation and adjacent to real fetch dispatch
+    - all non-stream terminal writes recheck total deadline after final synchronous preparation
+    - fetch resolve/reject and catch let expired total deadline override first-progress phase
+    - continuation-safe Capacity/429 pass-through strips encrypted_content on pass and retry exhaustion
+    - lifecycle regression records actual upstream chunk send timestamps on both sides of the deadline
+    - full baseline diff has no trailing-whitespace violations
+  completion_status: review-fix-batch-8-full-local-verification-passed-awaiting-source-snapshot
   parent_resolution:
     status: blocked
-    reason: round-7-fixes-verified-awaiting-stable-snapshot-and-original-reviewer-rereview
+    reason: round-8-fixes-verified-awaiting-stable-source-snapshot-and-original-reviewer-rereview
   implementation_freeze_status: active
   allowed_ops:
     - local-review
@@ -521,6 +518,11 @@ verification_results:
   - 2026-07-15 final implementation snapshot f789066 four sequential bundled-Node E2E suites => PASS
   - 2026-07-15 round-7 gateway E2E stability replay => 3/3 PASS
   - 2026-07-15 round-7 install-restore, Windows launch and Unix launch E2E => PASS
+  - 2026-07-15 round-8 gateway E2E initial GREEN and stability replay => 3/3 PASS
+  - 2026-07-15 round-8 install-restore, Windows launch and Unix launch E2E => PASS
+  - 2026-07-15 round-8 six JS syntax and three PowerShell AST checks => PASS
+  - 2026-07-15 round-8 full baseline diff check => PASS
+  - 2026-07-15 round-8 temporary gateway process audit => 0 leftovers
 review_fix_batch_3_red_evidence:
   - next attempt reached upstream at 239ms with a 220ms total deadline when synchronous retry sample closeout ran before real dispatch
   - terminal CR-only completed SSE returned 200 instead of intercepting reasoning_tokens=516
@@ -573,7 +575,21 @@ review_fix_batch_7_green_evidence:
   - synchronous non-stream/stream parse and late reader termination return total-timeout 502
   - scalar arrays preserve values/order and object-key-only reordering remains idempotent
   - gateway E2E stability replay 3/3 PASS and three lifecycle E2E suites PASS
-full_verification_status: review-fix-batch-7-full-local-verification-passed-awaiting-original-reviewer-rereview
+review_fix_batch_8_red_evidence:
+  - split total gates persisted an undispatched attempt 2 and incremented inspected twice instead of closing pending attempt 1
+  - an 80ms second header clone consumed a 40ms first-progress window and returned first-progress 502 after real dispatch
+  - Capacity policy 502 was written after synchronous body construction crossed total deadline
+  - delayed fetch rejection preserved first-progress even though total deadline had also expired
+  - continuation-safe Capacity pass-through exposed encrypted_content and its secret
+review_fix_batch_8_green_evidence:
+  - split-gate timeout closes the inspected attempt 1 with one upstream request and no consumed retry budget
+  - current first-progress guard begins after header preparation and the immediate second upstream response returns 200
+  - Capacity 502, HTTP 429 pass-through and reasoning block all return total-timeout after final synchronous stalls
+  - fetch rejection records only total timeout after the total wall clock expires
+  - Capacity pass-through and retry-exhaustion bodies are redacted in continuation safety mode
+  - lifecycle evidence contains actual upstream chunk send times before and after the first-progress deadline
+  - gateway E2E stability replay 3/3, three lifecycle E2E suites, syntax, AST, diff and process audit all pass
+full_verification_status: review-fix-batch-8-full-local-verification-passed-awaiting-source-snapshot
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc

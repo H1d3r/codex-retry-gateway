@@ -107,7 +107,7 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - `final_answer_only_high_xhigh` 是实验收窄规则，仅在 `reasoning.effort=high/xhigh` 下拦截 `final answer only + commentary not observed + no tool call + no reasoning item`，且 `reasoning_tokens=null/缺失` 或非 0 的响应结构；普通 `reasoning_tokens=0` 只观察落盘，不触发该实验规则。它可能漏掉仍影响正确性的 516 样本，不建议替代默认 516/1034/1552 主拦截。
 - `none` 不使用 reasoning 规则，直接透传正常流式响应并继续全量采集；Capacity、HTTP 429 与响应超时仍可独立叠加。
 - 三个规则模式三选一；`intercept_streaming` / `intercept_non_streaming` 只控制命中当前 reasoning 规则后是否真正拦截。
-- `stream_action=continuation_recovery` 是流式命中动作，不是拦截规则；仅在 `reasoning_tokens` 主规则命中时，对 `/responses` 与 `/v1/responses` 的流式响应尝试内部续写。`final_answer_only_high_xhigh` 实验规则不触发安全续写，只共用 `guard_retry_attempts` 做普通内部重试/最终拦截。续写请求会删除 `previous_response_id`，只显式 replay 原始 input 并追加 `phase=commentary` 标记，默认不自动请求 `reasoning.encrypted_content`，续写 replay 会过滤原始 input 中的 reasoning item / `encrypted_content`，安全模式下即使原请求显式 include 且本轮未命中，也会在下游响应和本地请求摘要中剥离 `encrypted_content`，也不 replay 命中轮 encrypted reasoning item，不限定特定 token 公式。
+- `stream_action=continuation_recovery` 是流式命中动作，不是拦截规则；仅在 `reasoning_tokens` 主规则命中时，对 `/responses` 与 `/v1/responses` 的流式响应尝试内部续写。`final_answer_only_high_xhigh` 实验规则不触发安全续写，只共用 `guard_retry_attempts` 做普通内部重试/最终拦截。续写请求会删除 `previous_response_id`，只显式 replay 原始 input 并追加 `phase=commentary` 标记，默认不自动请求 `reasoning.encrypted_content`，续写 replay 会过滤原始 input 中的 reasoning item / `encrypted_content`，安全模式下即使原请求显式 include 且本轮未命中，也会在所有下游响应体和本地请求摘要中剥离 `encrypted_content`，包括 Capacity/429 透传错误体；也不 replay 命中轮 encrypted reasoning item，不限定特定 token 公式。
 - `guard_retry_attempts` 默认 `5`，是单个客户端请求共享的内部追加尝试预算；reasoning 普通重试、Responses 续写恢复、Capacity、HTTP 429 与首 progress 超时重试都共用这里。
 - `stream_action=continuation_recovery` 复用 `guard_retry_attempts` 控制最大安全续写次数；安全续写后的后续轮如果再次命中，会继续安全续写，耗尽后仍命中才返回拦截状态；各命中轮 lifecycle / reasoning item / tentative final answer / message / tool call / convenience `output_text` 不透给客户端，最终下游 SSE 以干净完成轮的 lifecycle 为准。
 - `remote_compaction_v2` 只是 beta feature 标记，不单独识别为压缩请求；只有显式 `context_compaction` 且 `reasoning_tokens=0` 的响应会豁免，`516/1034/1552` 等命中值仍按当前规则处理并受 `guard_retry_attempts` 控制。
@@ -116,7 +116,7 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - `endpoints` 同时限定 reasoning、Capacity、HTTP 429 与 latency guard；列表外路径必须全部旁路这些策略。
 - 两个 latency 阈值只接受 `0..2_147_483_647` 的整数；Retry-After 等待中命中总 deadline 必须复用当前 attempt 返回 timeout 502，不能静默结束或重复落盘。
 - timer 回调不是 deadline 的唯一真源；非流式 JSON/脱敏、流式 SSE/结构解析、每个 chunk、EOF、reader 异常、retry 派发与客户端写入前都必须按绝对时间复核。流式 chunk 必须先收口检查上限，再按 total、first-progress 顺序复核；测试要让前几个 lifecycle 在 deadline 前到达、后续 lifecycle 首次跨线，不能只测首 chunk 已过期。
-- Capacity/429、reasoning、续写和首 progress retry 共用统一 pending 派发闸门；header/request 等同步准备必须在最终 deadline 复核之前完成，真实 fetch 启动后才增加共享预算、代理总数和 active。旧 attempt 的结束时间/日志范围在 retry 决策时捕获，下一 fetch 启动并让出两个有界事件循环轮次后立即落盘，不得等待下一响应头。过期分支不得保留新 attempt 样本。
+- Capacity/429、reasoning、续写和首 progress retry 共用统一 pending 派发闸门；header/request 等同步准备必须在最终 deadline 复核和 current 首 progress 计时之前完成，真实 fetch 启动后才增加共享预算、代理总数和 active。旧 attempt 的结束时间/日志范围在 retry 决策时捕获，下一 fetch 启动并让出两个有界事件循环轮次后立即落盘，不得等待下一响应头。过期分支不得保留新 attempt 样本。
 - Capacity/429 的 trigger 在分类时计数，retry/pass-through/502 在动作确定时分别计数；Retry-After 等待被客户端断连或 total deadline 中断时，trigger 仍必须保留且 retry 不得增加。
 - Windows canonical 配置比较必须保留字符串、数字、布尔数组的值和顺序，同时只忽略对象键顺序。
 - SSE framing 必须覆盖字段名与 JSON 跨 chunk、fallback 后尾随候选、独立/同块/UTF-8 字节级跨 chunk 的 BOM、首个事件即超大的误标候选、LF/CR/CRLF 混合空行和 EOF 纯 CR 终态；检查上限优先于同一 chunk 中迟到的 first-progress timeout；reasoning 保护下的超大事件在未写响应时返回专用 502，在已写响应时 fail-closed 断连；EOF 才命中的 disconnect 规则也必须实际断连。

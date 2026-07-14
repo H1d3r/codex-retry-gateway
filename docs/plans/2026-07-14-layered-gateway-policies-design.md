@@ -164,7 +164,7 @@ retry_then_502
 
 1. 建立本次 attempt 样本和 AbortController。
 2. 从第一次上游派发开始建立客户端请求总 deadline；内部重试不得重置总 deadline。
-3. 每次 attempt 单独建立首个有效输出 deadline。
+3. 本地 header/request 准备完成后、紧邻真实 fetch 时，才为 current attempt 单独建立首个有效输出 deadline；尚未派发的本地准备耗时不计入上游首 progress。
 4. deadline 真源是绝对墙钟，计时器只负责唤醒；非流式 body、每个流式 chunk、EOF 和 retry 派发在完成或透传前都复核，事件循环阻塞导致回调延迟时仍标记明确 timeout phase 并中止当前 attempt。
 5. 收到完整错误响应后，先判断精确 Capacity，再判断剩余通用 429。
 6. 正常响应继续进入既有 reasoning 规则判断。
@@ -189,12 +189,15 @@ timeout > capacity > generic HTTP 429 > reasoning rule > pass through
 7. 已开始等待后若总 deadline 先到，timeout 优先；当前 attempt 直接返回 `upstream-total-timeout` 502，不先记录为策略重试，也不重复创建样本。等待 timer 恢复后必须按当前墙钟再次检查 deadline，不能只依赖 timer 回调顺序。
 8. 等待中客户端断开时，当前 attempt 记录 `client_disconnected`，不得继续重试或伪造客户端状态。
 9. Capacity/429、reasoning guard、续写和首 progress retry 都必须进入统一 pending 状态，并在下一 attempt 真正派发前做墙钟 deadline 闸门。允许派发时先启动 fetch、让出两个有界事件循环轮次，再按 retry 决策时捕获的旧 attempt 结束时间和日志序号同步收口；不得等待下一响应头。闸门过期时继续用旧 attempt 返回总 timeout，不增加请求/active 计数、预算或新 attempt 样本。
+10. pending 旧 attempt 的闸门首次通过、current 闸门随后过期时，仍必须由 pending 旧 attempt 收口；不得落一个 `upstream_fetch_started_at_ms=null` 的伪 current sample。
 
 ## 8. 流式响应约束
 
 ### 8.1 Reasoning 规则开启
 
 保留现有严格缓冲与续写行为：在决定 reasoning 命中前不向客户端发送不可撤回内容。因此 Capacity、429、超时和 reasoning 命中在返回头前均可安全重试或转换为 502。
+
+续写安全模式的 `encrypted_content` 脱敏覆盖所有客户端响应体，包括 Capacity/429 的 pass-through 与 retry 耗尽后 pass-through；`intercept_rule_mode=none` 仍保留原始透传语义。
 
 ### 8.2 不使用规则
 

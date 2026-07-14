@@ -226,7 +226,13 @@ function createSseResponseWithPauseAfterFirstChunk(
   });
 }
 
-function createSseResponseWithInitialDelay(res, chunks, initialDelayMs, intervalMs = 20) {
+function createSseResponseWithInitialDelay(
+  res,
+  chunks,
+  initialDelayMs,
+  intervalMs = 20,
+  onChunkSent = null,
+) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache",
@@ -241,6 +247,7 @@ function createSseResponseWithInitialDelay(res, chunks, initialDelayMs, interval
       return;
     }
     res.write(chunks[index]);
+    onChunkSent?.(Date.now(), index);
     index += 1;
     timer = setTimeout(writeNext, intervalMs);
   };
@@ -3668,11 +3675,18 @@ function startFakeUpstream(port) {
                 : {},
             );
           } else if (initialDelayMs !== undefined) {
+            const streamChunkSentAtMs = [];
+            if (parsed.test_record_stream_chunk_sent_at_ms) {
+              requestSnapshot.stream_chunk_sent_at_ms = streamChunkSentAtMs;
+            }
             createSseResponseWithInitialDelay(
               res,
               streamChunks,
               initialDelayMs,
               parsed.test_stream_chunk_delay_ms ?? 20,
+              parsed.test_record_stream_chunk_sent_at_ms
+                ? (sentAtMs) => streamChunkSentAtMs.push(sentAtMs)
+                : null,
             );
           } else if (parsed.test_stream_pause_before_output_ms) {
             createSseResponseWithPauseBeforeOutput(
@@ -7350,12 +7364,32 @@ async function run() {
         "const originalSetTimeout = global.setTimeout;",
         "const originalUnshift = Array.prototype.unshift;",
         "const originalObjectEntries = Object.entries;",
+        "const originalDateNow = Date.now;",
         "let acceleratedTotalDeadline = false;",
         "let stalledRetryDelay = false;",
         "let dispatchWindowDeadlineAt = 0;",
         "let stalledDispatchWindowRetry = false;",
         "const stalledRetrySampleActions = new Set();",
         "let finalDispatchHeaderCloneCount = 0;",
+        "let splitTotalGateHeaderCloneCount = 0;",
+        "let splitTotalGateActive = false;",
+        "let splitTotalGateNowCallCount = 0;",
+        "let firstProgressHeaderCloneCount = 0;",
+        "Date.now = function patchedDateNow() {",
+        "  if (splitTotalGateActive && new Error().stack.includes('expireTotalDeadlineIfNeeded')) {",
+        "    splitTotalGateNowCallCount += 1;",
+        "    if (splitTotalGateNowCallCount === 1) {",
+        "      return 0;",
+        "    }",
+        "    if (splitTotalGateNowCallCount <= 3) {",
+        "      if (splitTotalGateNowCallCount === 3) {",
+        "        splitTotalGateActive = false;",
+        "      }",
+        "      return Number.MAX_SAFE_INTEGER;",
+        "    }",
+        "  }",
+        "  return originalDateNow();",
+        "};",
         "global.setTimeout = function patchedSetTimeout(callback, delay, ...args) {",
         "  const numericDelay = Number(delay);",
         "  if (!acceleratedTotalDeadline && numericDelay >= 600 && numericDelay <= 731) {",
@@ -7400,6 +7434,20 @@ async function run() {
         "      const releaseAt = dispatchWindowDeadlineAt + 20;",
         "      while (Date.now() < releaseAt) {}",
         "      dispatchWindowDeadlineAt = 0;",
+        "    }",
+        "  }",
+        "  if (value && value['x-test-split-total-gate'] === '1' && new Error().stack.includes('cloneHeadersForUpstream')) {",
+        "    splitTotalGateHeaderCloneCount += 1;",
+        "    if (splitTotalGateHeaderCloneCount === 2) {",
+        "      splitTotalGateActive = true;",
+        "      splitTotalGateNowCallCount = 0;",
+        "    }",
+        "  }",
+        "  if (value && value['x-test-first-progress-header-stall'] === '1' && new Error().stack.includes('cloneHeadersForUpstream')) {",
+        "    firstProgressHeaderCloneCount += 1;",
+        "    if (firstProgressHeaderCloneCount === 2) {",
+        "      const releaseAt = originalDateNow() + 80;",
+        "      while (originalDateNow() < releaseAt) {}",
         "    }",
         "  }",
         "  return Reflect.apply(originalObjectEntries, Object, [value]);",
@@ -7737,6 +7785,126 @@ async function run() {
         `最终 deadline 跨过后不得增加预算、attempt 或真实上游请求: body=${JSON.stringify(finalDispatchGapBody)} requests=${JSON.stringify(finalDispatchGapRequests)} before=${JSON.stringify(finalDispatchGapMetricsBefore.metrics)} after=${JSON.stringify(finalDispatchGapMetricsAfter.metrics)}`,
       );
 
+      const splitTotalGateConfigResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 1,
+            http_429_action: "retry_then_502",
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 0,
+              first_progress_action: "return_502",
+              total_timeout_ms: 220,
+            },
+          }),
+        },
+      );
+      assert(splitTotalGateConfigResponse.status === 200, "pending/current 双闸门归属配置失败");
+      const splitTotalGateMetricsBefore = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/status`,
+      ).then((response) => response.json());
+      const splitTotalGateKey = "latency-pending-owner-between-total-gates";
+      const splitTotalGateResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/responses`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-split-total-gate": "1",
+          },
+          body: JSON.stringify({
+            test_sequence_key: splitTotalGateKey,
+            test_http_429_attempts: 1,
+            test_retry_after: "0",
+          }),
+          signal: AbortSignal.timeout(1500),
+        },
+      );
+      const splitTotalGateBody = await splitTotalGateResponse.json();
+      const splitTotalGateAnalytics = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      const splitTotalGateSamples = (splitTotalGateAnalytics.recent_samples || []).filter(
+        (sample) => `${sample.request_payload_excerpt || ""}`.includes(splitTotalGateKey),
+      );
+      const splitTotalGateRequests = upstream.responseRequests.filter(
+        (entry) => entry.body?.test_sequence_key === splitTotalGateKey,
+      );
+      const splitTotalGateMetricsAfter = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/status`,
+      ).then((response) => response.json());
+      assert(
+        splitTotalGateResponse.status === 502 &&
+          splitTotalGateBody?.error?.code === "upstream_total_timeout" &&
+          splitTotalGateRequests.length === 1 &&
+          splitTotalGateSamples.length === 1 &&
+          splitTotalGateSamples[0]?.attempt_id?.endsWith(":attempt:1") &&
+          splitTotalGateSamples[0]?.retry_budget_used === 0 &&
+          Number.isFinite(splitTotalGateSamples[0]?.upstream_fetch_started_at_ms) &&
+          splitTotalGateMetricsAfter.metrics.total_proxy_request_count ===
+            splitTotalGateMetricsBefore.metrics.total_proxy_request_count + 1 &&
+          splitTotalGateMetricsAfter.metrics.inspected_response_count ===
+            splitTotalGateMetricsBefore.metrics.inspected_response_count + 1,
+        `两个 total gate 之间过期时必须由已检查的 pending attempt 收口: ${JSON.stringify({
+          body: splitTotalGateBody,
+          samples: splitTotalGateSamples,
+          requests: splitTotalGateRequests,
+          before: splitTotalGateMetricsBefore.metrics,
+          after: splitTotalGateMetricsAfter.metrics,
+        })}`,
+      );
+
+      const firstProgressHeaderStallConfigResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 1,
+            http_429_action: "retry_then_502",
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 40,
+              first_progress_action: "return_502",
+              total_timeout_ms: 220,
+            },
+          }),
+        },
+      );
+      assert(firstProgressHeaderStallConfigResponse.status === 200, "首 progress 派发起点配置失败");
+      const firstProgressHeaderStallKey = "latency-first-progress-starts-at-dispatch";
+      const firstProgressHeaderStallResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/responses`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-first-progress-header-stall": "1",
+          },
+          body: JSON.stringify({
+            test_sequence_key: firstProgressHeaderStallKey,
+            test_http_429_attempts: 1,
+            test_retry_after: "0",
+          }),
+          signal: AbortSignal.timeout(1500),
+        },
+      );
+      const firstProgressHeaderStallBody = await firstProgressHeaderStallResponse.json();
+      const firstProgressHeaderStallRequests = upstream.responseRequests.filter(
+        (entry) => entry.body?.test_sequence_key === firstProgressHeaderStallKey,
+      );
+      assert(
+        firstProgressHeaderStallResponse.status === 200 &&
+          firstProgressHeaderStallBody?.usage?.output_tokens_details?.reasoning_tokens === 128 &&
+          firstProgressHeaderStallRequests.length === 2,
+        `请求准备耗时不得消耗尚未派发 attempt 的首 progress 窗口: status=${firstProgressHeaderStallResponse.status} body=${JSON.stringify(firstProgressHeaderStallBody)} requests=${JSON.stringify(firstProgressHeaderStallRequests)}`,
+      );
+
       const pendingSampleConfigResponse = await fetch(
         `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
         {
@@ -7879,19 +8047,56 @@ async function run() {
       [
         "const originalSetTimeout = global.setTimeout;",
         "const originalJsonParse = JSON.parse;",
+        "const originalJsonStringify = JSON.stringify;",
+        "const originalHeadersEntries = Headers.prototype.entries;",
         "const delayedFirstProgressTimers = new Set();",
         "let delayedTotalTimerCount = 0;",
+        "let delayedFetchRejectionFirstProgress = false;",
+        "let stalledCapacityTerminalBody = false;",
+        "let stalledReasoningTerminalBody = false;",
+        "let stalledRateLimitHeaderCopy = false;",
         "global.setTimeout = function patchedSetTimeout(callback, delay, ...args) {",
         "  const numericDelay = Number(delay);",
+        "  if (numericDelay === 40 && !delayedFetchRejectionFirstProgress) {",
+        "    delayedFetchRejectionFirstProgress = true;",
+        "    return originalSetTimeout(() => {",
+        "      callback(...args);",
+        "      const releaseAt = Date.now() + 40;",
+        "      while (Date.now() < releaseAt) {}",
+        "    }, delay);",
+        "  }",
         "  if ([45, 47, 200].includes(numericDelay) && !delayedFirstProgressTimers.has(numericDelay)) {",
         "    delayedFirstProgressTimers.add(numericDelay);",
         "    return originalSetTimeout(callback, numericDelay === 200 ? 500 : 200, ...args);",
         "  }",
-        "  if (delayedTotalTimerCount < 4 && numericDelay >= 60 && numericDelay <= 70) {",
+        "  if (delayedTotalTimerCount < 8 && numericDelay >= 60 && numericDelay <= 70) {",
         "    delayedTotalTimerCount += 1;",
         "    return originalSetTimeout(callback, 200, ...args);",
         "  }",
         "  return originalSetTimeout(callback, delay, ...args);",
+        "};",
+        "JSON.stringify = function patchedJsonStringify(value, ...args) {",
+        "  const result = Reflect.apply(originalJsonStringify, JSON, [value, ...args]);",
+        "  const code = value?.error?.code;",
+        "  if (!stalledCapacityTerminalBody && code === 'upstream_capacity_policy_triggered') {",
+        "    stalledCapacityTerminalBody = true;",
+        "    const releaseAt = Date.now() + 100;",
+        "    while (Date.now() < releaseAt) {}",
+        "  }",
+        "  if (!stalledReasoningTerminalBody && code === 'reasoning_guard_triggered') {",
+        "    stalledReasoningTerminalBody = true;",
+        "    const releaseAt = Date.now() + 100;",
+        "    while (Date.now() < releaseAt) {}",
+        "  }",
+        "  return result;",
+        "};",
+        "Headers.prototype.entries = function patchedHeadersEntries() {",
+        "  if (!stalledRateLimitHeaderCopy && this.get('x-upstream-test') === 'responses-http-429' && new Error().stack.includes('copyHeadersToClient')) {",
+        "    stalledRateLimitHeaderCopy = true;",
+        "    const releaseAt = Date.now() + 100;",
+        "    while (Date.now() < releaseAt) {}",
+        "  }",
+        "  return Reflect.apply(originalHeadersEntries, this, []);",
         "};",
         "let stalledNonStreamDeadlineParse = false;",
         "let stalledStreamDeadlineParse = false;",
@@ -7957,6 +8162,144 @@ async function run() {
         `http://127.0.0.1:${completionDeadlineGatewayPort}${config.health_path}`,
         { gateway: completionDeadlineGateway, logPath: completionDeadlineLogPath },
       );
+
+      const terminalDeadlineConfigResponse = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "reasoning_tokens",
+            reasoning_match_mode: "formula_518n_minus_2",
+            reasoning_equals: [516],
+            stream_action: "strict_502",
+            intercept_streaming: true,
+            intercept_non_streaming: true,
+            guard_retry_attempts: 0,
+            capacity_error_action: "return_502",
+            http_429_action: "pass_through",
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 0,
+              first_progress_action: "return_502",
+              total_timeout_ms: 70,
+            },
+          }),
+        },
+      );
+      assert(terminalDeadlineConfigResponse.status === 200, "非流式终态 deadline 配置失败");
+
+      const assertTerminalDeadlineWins = async ({ key, requestBody }) => {
+        const response = await fetch(
+          `http://127.0.0.1:${completionDeadlineGatewayPort}/responses`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ test_sequence_key: key, ...requestBody }),
+          },
+        );
+        const body = await response.json();
+        assert(
+          response.status === 502 &&
+            response.headers.get("x-codex-retry-gateway-reason") ===
+              "upstream-total-timeout" &&
+            body?.error?.code === "upstream_total_timeout",
+          `${key} 在首次 writeHead 前跨过 total deadline 时必须由 timeout 收口: status=${response.status} body=${JSON.stringify(body)}`,
+        );
+      };
+
+      await assertTerminalDeadlineWins({
+        key: "total-deadline-before-capacity-policy-502-write",
+        requestBody: {
+          test_capacity_error_attempts: 1,
+          test_retry_after: "0",
+        },
+      });
+      await assertTerminalDeadlineWins({
+        key: "total-deadline-before-http-429-pass-through-write",
+        requestBody: {
+          test_http_429_attempts: 1,
+          test_retry_after: "0",
+        },
+      });
+      await assertTerminalDeadlineWins({
+        key: "total-deadline-before-reasoning-block-write",
+        requestBody: {
+          test_reasoning_tokens: 516,
+        },
+      });
+
+      const fetchRejectionDeadlineConfigResponse = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 0,
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 40,
+              first_progress_action: "return_502",
+              total_timeout_ms: 60,
+            },
+          }),
+        },
+      );
+      assert(fetchRejectionDeadlineConfigResponse.status === 200, "fetch rejection deadline 优先级配置失败");
+      const fetchRejectionMetricsBefore = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/status`,
+      ).then((response) => response.json());
+      const fetchRejectionDeadlineResponse = await readSseUntilClose(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/responses`,
+        {
+          stream: true,
+          test_sequence_key: "total-deadline-overrides-first-progress-fetch-rejection",
+          test_stream_initial_delay_ms: 200,
+          test_stream_chunk_delay_ms: 10,
+        },
+      );
+      const fetchRejectionDeadlineBody = JSON.parse(fetchRejectionDeadlineResponse.text);
+      const fetchRejectionMetricsAfter = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/status`,
+      ).then((response) => response.json());
+      assert(
+        fetchRejectionDeadlineResponse.status === 502 &&
+          fetchRejectionDeadlineResponse.headers.get("x-codex-retry-gateway-reason") ===
+            "upstream-total-timeout" &&
+          fetchRejectionDeadlineBody?.error?.code === "upstream_total_timeout" &&
+          fetchRejectionMetricsAfter.metrics.total_timeout_count ===
+            fetchRejectionMetricsBefore.metrics.total_timeout_count + 1 &&
+          fetchRejectionMetricsAfter.metrics.first_progress_timeout_count ===
+            fetchRejectionMetricsBefore.metrics.first_progress_timeout_count &&
+          fetchRejectionMetricsAfter.metrics.failed_proxy_request_count ===
+            fetchRejectionMetricsBefore.metrics.failed_proxy_request_count,
+        `fetch rejection 收口时已过 total deadline，必须覆盖较早的 first-progress phase: ${JSON.stringify({
+          response: fetchRejectionDeadlineResponse,
+          body: fetchRejectionDeadlineBody,
+          before: fetchRejectionMetricsBefore.metrics,
+          after: fetchRejectionMetricsAfter.metrics,
+        })}`,
+      );
+
+      const restoreFirstProgressCompletionConfigResponse = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 0,
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 45,
+              first_progress_action: "return_502",
+              total_timeout_ms: 0,
+            },
+          }),
+        },
+      );
+      assert(restoreFirstProgressCompletionConfigResponse.status === 200, "恢复首 progress 完成路径配置失败");
       const delayedFirstProgressResponse = await readSseUntilClose(
         `http://127.0.0.1:${completionDeadlineGatewayPort}/responses`,
         {
@@ -8001,14 +8344,32 @@ async function run() {
           test_stream_lifecycle_repeat_count: 12,
           test_stream_initial_delay_ms: 0,
           test_stream_chunk_delay_ms: 10,
+          test_record_stream_chunk_sent_at_ms: true,
         },
       );
       const delayedMetadataElapsedMs = Date.now() - delayedMetadataStartedAt;
+      const delayedMetadataUpstreamRequest = upstream.responseRequests.find(
+        (entry) => entry.body?.test_sequence_key === "delayed-first-progress-metadata-wall-clock",
+      );
+      const delayedMetadataChunkTimes =
+        delayedMetadataUpstreamRequest?.stream_chunk_sent_at_ms || [];
       assert(
         delayedMetadataResponse.status === 502 &&
           delayedMetadataElapsedMs >= 47 &&
-          delayedMetadataElapsedMs < 120,
-        `前序 lifecycle 在 deadline 前、首个过期 lifecycle chunk 应立即按墙钟超时: status=${delayedMetadataResponse.status} elapsed=${delayedMetadataElapsedMs}`,
+          delayedMetadataElapsedMs < 120 &&
+          delayedMetadataChunkTimes.length >= 2 &&
+          delayedMetadataChunkTimes.some(
+            (sentAtMs) => sentAtMs - delayedMetadataUpstreamRequest.received_at_ms < 47,
+          ) &&
+          delayedMetadataChunkTimes.some(
+            (sentAtMs) => sentAtMs - delayedMetadataUpstreamRequest.received_at_ms >= 47,
+          ),
+        `前序 lifecycle 必须实际在 deadline 前发送，后续 chunk 首次跨线并立即超时: ${JSON.stringify({
+          status: delayedMetadataResponse.status,
+          elapsed_ms: delayedMetadataElapsedMs,
+          upstream_received_at_ms: delayedMetadataUpstreamRequest?.received_at_ms ?? null,
+          stream_chunk_sent_at_ms: delayedMetadataChunkTimes,
+        })}`,
       );
 
       const synchronousDeadlineConfigResponse = await fetch(
@@ -9343,6 +9704,110 @@ async function run() {
     assert(
       continuationRestoreConfigResponse.status === 200,
       `恢复续写恢复端点配置失败: ${continuationRestoreConfigResponse.status}`,
+    );
+
+    const continuationCapacitySecret = "continuation-capacity-encrypted-secret";
+    const continuationCapacityPassConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          reasoning_equals: [516, 1034, 18],
+          stream_action: "continuation_recovery",
+          intercept_streaming: true,
+          intercept_non_streaming: false,
+          endpoints: ["/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions"],
+          guard_retry_attempts: 1,
+          capacity_error_action: "pass_through",
+        }),
+      },
+    );
+    assert(continuationCapacityPassConfigResponse.status === 200, "续写 Capacity 透传脱敏配置失败");
+    const continuationCapacityPassKey = "continuation-capacity-pass-through-redaction";
+    const continuationCapacityPassResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          stream: true,
+          input: "续写安全模式错误策略透传不应泄露 encrypted reasoning",
+          test_sequence_key: continuationCapacityPassKey,
+          test_capacity_error_attempts: 1,
+          test_capacity_error_payload: {
+            error: {
+              type: "rate_limit_error",
+              code: "model_at_capacity",
+              message: "Selected model is at capacity. Please try a different model.",
+              encrypted_content: continuationCapacitySecret,
+            },
+          },
+        }),
+      },
+    );
+    const continuationCapacityPassText = await continuationCapacityPassResponse.text();
+    assert(
+      continuationCapacityPassResponse.status === 429 &&
+        !continuationCapacityPassText.includes("encrypted_content") &&
+        !continuationCapacityPassText.includes(continuationCapacitySecret),
+      `续写安全模式 Capacity pass-through 不得透出 encrypted_content: ${continuationCapacityPassText}`,
+    );
+
+    const continuationCapacityRetryConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          reasoning_equals: [516, 1034, 18],
+          stream_action: "continuation_recovery",
+          intercept_streaming: true,
+          intercept_non_streaming: false,
+          endpoints: ["/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions"],
+          guard_retry_attempts: 1,
+          capacity_error_action: "retry_then_pass_through",
+        }),
+      },
+    );
+    assert(continuationCapacityRetryConfigResponse.status === 200, "续写 Capacity 重试耗尽脱敏配置失败");
+    const continuationCapacityRetrySecret = "continuation-capacity-retry-encrypted-secret";
+    const continuationCapacityRetryKey = "continuation-capacity-retry-exhausted-redaction";
+    const continuationCapacityRetryResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          stream: true,
+          input: "续写安全模式策略重试耗尽仍不应泄露 encrypted reasoning",
+          test_sequence_key: continuationCapacityRetryKey,
+          test_capacity_error_attempts: 10,
+          test_retry_after: "0",
+          test_capacity_error_payload: {
+            error: {
+              type: "rate_limit_error",
+              code: "model_at_capacity",
+              message: "Selected model is at capacity. Please try a different model.",
+              encrypted_content: continuationCapacityRetrySecret,
+            },
+          },
+        }),
+      },
+    );
+    const continuationCapacityRetryText = await continuationCapacityRetryResponse.text();
+    assert(
+      continuationCapacityRetryResponse.status === 429 &&
+        !continuationCapacityRetryText.includes("encrypted_content") &&
+        !continuationCapacityRetryText.includes(continuationCapacityRetrySecret) &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === continuationCapacityRetryKey,
+        ).length === 2,
+      `续写安全模式 retry_then_pass_through 耗尽不得透出 encrypted_content: ${continuationCapacityRetryText}`,
     );
 
     const continuationCompactionKey = "continuation-context-compaction-no-include";

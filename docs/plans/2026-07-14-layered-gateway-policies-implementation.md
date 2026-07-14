@@ -367,6 +367,8 @@ README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retr
 
 第七轮双 reviewer 合并出的 3 个独立 Important 和 3 个独立 Minor 已核实并按 RED/GREEN 关闭：所有 request/header 同步准备移到 retry 最终 deadline 闸门前，fetch 启动后才记预算、total/active；非流式 JSON/脱敏、流式 SSE/结构、EOF、reader 异常和客户端写入前补绝对墙钟复核；非流式 observe-only 在实际透传后再冻结样本；Capacity/429 trigger 与最终 outcome 分开计数；PowerShell canonical JSON 先保留标量再递归对象；lifecycle 反例改为前序 chunk 在 deadline 前、后续 chunk 首次跨线。RED 分别复现 200 误透传、第二次 fetch 在 deadline 后仍派发、采集字段空值、trigger 漏计和标量数组对象化；GREEN 后 gateway E2E 连续 3 轮通过，安装恢复、Windows launch、Unix launch 三套 E2E 全部通过。
 
+第八轮原 reviewer 复审提出的 6 个行为/证据边界已继续按 RED/GREEN 关闭：pending 首次 total gate 通过但 current gate 随后过期时改由旧 attempt 收口；current 首 progress guard 移到 header/request 准备完成后、紧邻 fetch 创建；Capacity/429 502、策略透传、reasoning block 与普通透传在最终同步准备后紧邻 `writeHead` 复核 total；fetch resolve/reject 与 catch 统一让 total 覆盖较早 first-progress phase；续写安全模式的 Capacity/429 pass-through 复用 `encrypted_content` 脱敏；lifecycle 反例记录上游每个 chunk 实际发送时间。完整范围尾随空白同时清零。修正后 gateway E2E 首轮通过并连续 3 轮稳定复跑通过，三套生命周期 E2E、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程审计全部通过，等待原两位 reviewer 对新快照复审。
+
 - [x] **Step 2：执行完整本地验证**
 
 ```powershell
