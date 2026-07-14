@@ -119,7 +119,7 @@ post_implementation_review:
   reviewer_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
-  parent_review_status: round-2-fixes-verified-awaiting-rereview
+  parent_review_status: review-fix-batch-3-verified-awaiting-final-rereview
   review_fix_evidence:
     - Retry-After deadline and 1MiB hard-limit RED reproduced
     - upload disconnect no longer becomes request_rejected 413
@@ -133,6 +133,10 @@ post_implementation_review:
     - byte-bounded SSE framing supports mixed LF/CR/CRLF and mislabeled JSON SSE
     - oversized protected SSE returns response_inspection_limit_exceeded instead of bypassing rules
     - observe-only timeout preserves matched_current_rule
+    - next policy attempt is deadline-gated before dispatch and old retry sample closeout runs only after the next fetch ends
+    - mislabeled SSE field prefixes remain framed when JSON arrives in a later chunk
+    - EOF flushes complete CR-only terminal SSE events
+    - protected inspection overflow disconnects after forwarding with response_inspection_limit_disconnected_after_forward
     - 2026-07-15 four sequential bundled-Node E2E suites PASS after latest source mutation
     - 2026-07-15 JS syntax, PowerShell AST, git diff check and temporary-process audit PASS
 git_progress_checkpoints:
@@ -141,6 +145,7 @@ git_progress_checkpoints:
   - after-proxy-policy-batch
   - after-migration-batch
   - pre-verification
+  - review-fix-batch-3
   - pre-pr
 rollout_draft:
   source_task: crg-layered-gateway-policies

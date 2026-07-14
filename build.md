@@ -115,6 +115,8 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - `latency_guard` 默认关闭；首个有效输出超时可直接 502 或按共享预算重试后 502，总 deadline 跨 attempt 不重置。已经透传后不能改写 502，只能断连并落盘。
 - `endpoints` 同时限定 reasoning、Capacity、HTTP 429 与 latency guard；列表外路径必须全部旁路这些策略。
 - 两个 latency 阈值只接受 `0..2_147_483_647` 的整数；Retry-After 等待中命中总 deadline 必须复用当前 attempt 返回 timeout 502，不能静默结束或重复落盘。
+- policy retry 等待完成后，下一 attempt 在派发前必须做最后一次墙钟 deadline 检查；旧 attempt 的同步日志和 analytics 入库不得先于下一 fetch 结束，否则会阻塞实际派发。过期分支不得增加代理请求总数、active 计数或保留新 attempt 样本。
+- SSE framing 必须覆盖字段前缀与 JSON 跨 chunk、LF/CR/CRLF 混合空行和 EOF 纯 CR 终态；reasoning 保护下的超大事件在未写响应时返回专用 502，在已写响应时必须 fail-closed 断连并落专用 final action。
 - none + latency guard 的首 progress 前导缓冲是严格 `1MiB` 硬上限；越界 chunk 不能先进入缓冲数组。
 - `retry_upstream_capacity_errors` 只用于旧配置迁移；新动作字段是最终真源。
 

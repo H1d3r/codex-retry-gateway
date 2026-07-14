@@ -266,12 +266,12 @@ Issue #26 收口说明：
 - 续写恢复命中后，命中轮会计入实际拦截；网关丢弃中间命中轮 lifecycle、reasoning item、tentative final answer、message、tool call、`response.completed` 与 `[DONE]`，最终只保留干净完成轮自带的 `response.created` / `response.in_progress` / `response.completed` / `[DONE]`；后续轮再次命中会继续安全续写，直到 `guard_retry_attempts` 耗尽；只有最终成功透传给客户端时，才计入续写成功，耗尽后仍命中则返回 `502`
 - Capacity 只精确匹配 `Selected model is at capacity. Please try a different model.`；其余 HTTP 429 才进入通用 429 策略，普通非 Capacity 5xx 继续原样透传
 - HTTP 429 重试会遵守秒数或 HTTP-date 格式的 `Retry-After`，包括被精确 Capacity 特征优先分类的 HTTP 429；单次等待最多 60 秒，无合法 header 时使用 full-jitter，等待超过总 deadline 时直接执行当前动作的耗尽分支
-- 已进入 Retry-After 等待后如果总 deadline 到期，timeout 优先并用当前 attempt 返回 `upstream-total-timeout` 502，不会重复落样本或创建新 attempt；等待 timer 恢复后还会按当前墙钟复核 deadline，防止事件循环延迟后误派发；客户端在等待中断开时只记录 `client_disconnected`
+- 已进入 Retry-After 等待后如果总 deadline 到期，timeout 优先并用当前 attempt 返回 `upstream-total-timeout` 502，不会重复落样本或创建新 attempt；等待 timer 恢复后和下一 attempt 真正派发前都会按当前墙钟复核 deadline；旧 retry 样本的同步日志/落盘会延后到下一次 fetch 已结束，不能阻塞网络派发并把请求拖过 deadline；客户端在等待中断开时只记录 `client_disconnected`
 - `inspected_response_count` 按已取得上游响应的 attempt 计数；等待重试时客户端断连不会再同时增加 `failed_proxy_request_count`，总 timeout 也会进入 inspected 分母，使 `total = inspected + bypassed + failed + active` 保持可核对
 - `endpoints` 是 reasoning、Capacity、HTTP 429 和 latency guard 的共同管理边界；未列入的路径完全旁路这些策略，不会出现只启用超时但不处理 Capacity/429 的半旁路
 - `latency_guard.first_progress_timeout_ms` 与 `latency_guard.total_timeout_ms` 只接受 `0..2_147_483_647` 的整数；`0` 表示单独关闭该阈值，避免超过 Node 定时器上限后被缩短成近似立即超时
-- 流式 `text/plain` 或其它非 SSE 响应的首个非空 chunk 也算首 progress；同时会对误标 Content-Type 的 JSON SSE 做有界内容识别，SSE 空行支持 LF、CR 和 CRLF 混合组合
-- SSE 事件解析状态固定受 `1MiB` 字节硬上限约束；`none` 或 observe-only 场景继续原样透传并在样本中记录检查失败，严格 reasoning 流式保护无法检查超大 SSE 事件时返回 `502 response_inspection_limit_exceeded`，不会静默绕过 516/续写规则
+- 流式 `text/plain` 或其它非 SSE 响应的首个非空 chunk 也算首 progress；同时会从行首 `data:` / `event:` / `id:` / `retry:` / comment 前缀开始有界识别误标 Content-Type 的 SSE，即使字段名与 JSON 跨 chunk 也不会误算普通文本 progress；SSE 空行支持 LF、CR、CRLF 及混合组合，EOF 会 flush 以纯 CR 结束的完整终态事件
+- SSE 事件解析状态固定受 `1MiB` 字节硬上限约束；`none` 或 observe-only 场景继续原样透传并在样本中记录检查失败；reasoning 流式保护无法检查超大 SSE 事件时，尚未写响应则返回 `502 response_inspection_limit_exceeded`，已写响应则取消上游、断开下游并记录 `response_inspection_limit_disconnected_after_forward`，不会静默绕过 516/续写规则
 - 一旦响应头或不可撤回内容已经写给客户端，gateway 就不能把状态改成 502，也不能重新派发并拼接第二轮输出；后续总超时只能取消上游并断开连接，样本记录 `timeout_disconnected_after_forward`
 - 网关内部重试的每次上游尝试都会计入代理请求总数；每次拿到并检查的响应都会计入被检查响应总数；命中当前拦截规则会计入当前规则命中总数，被吞掉重试或最终拦截会计入实际拦截总数
 - 命中日志里的 `action=internal_retry remaining=N` 表示本次命中只在网关内部吞掉并继续重试，没有把失败状态返回给 Codex；`action=return_status_502` 才表示已经达到重试上限或配置为 `0`，本次会对 Codex 返回拦截状态

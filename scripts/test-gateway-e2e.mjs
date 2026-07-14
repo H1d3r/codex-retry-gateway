@@ -193,6 +193,39 @@ function createSseResponseWithPauseAfterOutput(
   });
 }
 
+function createSseResponseWithPauseAfterFirstChunk(
+  res,
+  chunks,
+  pauseMs,
+  intervalMs = 20,
+  extraHeaders = {},
+) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+    "x-upstream-test": "sse-paused-after-first-chunk",
+    ...extraHeaders,
+  });
+  let index = 0;
+  let timer = null;
+  const writeNext = () => {
+    if (index >= chunks.length) {
+      res.end();
+      return;
+    }
+    res.write(chunks[index]);
+    index += 1;
+    timer = setTimeout(writeNext, index === 1 ? pauseMs : intervalMs);
+  };
+  timer = setTimeout(writeNext, intervalMs);
+  res.on("close", () => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
+}
+
 function createSseResponseWithInitialDelay(res, chunks, initialDelayMs, intervalMs = 20) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -731,8 +764,14 @@ function buildResponsesStreamChunks(parsed, reasoning, sequenceCount = 0) {
   if (Number.isInteger(parsed.test_stream_completed_padding_bytes)) {
     completedPayload.response.test_padding = "x".repeat(parsed.test_stream_completed_padding_bytes);
   }
-  chunks.push(`data: ${JSON.stringify(completedPayload)}\n\n`);
-  chunks.push("data: [DONE]\n\n");
+  const completedChunk = `data: ${JSON.stringify(completedPayload)}\n\n`;
+  if (parsed.test_stream_only_completed_event) {
+    return [completedChunk];
+  }
+  chunks.push(completedChunk);
+  if (!parsed.test_stream_omit_done) {
+    chunks.push("data: [DONE]\n\n");
+  }
   return chunks;
 }
 
@@ -3100,6 +3139,7 @@ function startFakeUpstream(port) {
         const serializedInput = JSON.stringify(parsed.input || "");
         const requestSnapshot = {
           path: req.url,
+          received_at_ms: Date.now(),
           headers: {
             authorization,
             userAgent: req.headers["user-agent"] || null,
@@ -3554,12 +3594,29 @@ function startFakeUpstream(port) {
               chunk.replaceAll("\n\n", parsed.test_stream_event_separator),
             );
           }
+          if (Number.isInteger(parsed.test_stream_split_first_chunk_at)) {
+            const firstChunk = streamChunks.shift() ?? "";
+            streamChunks.unshift(
+              firstChunk.slice(0, parsed.test_stream_split_first_chunk_at),
+              firstChunk.slice(parsed.test_stream_split_first_chunk_at),
+            );
+          }
           const initialDelayMs = selectStreamSequenceValue(
             parsed,
             "test_stream_initial_delay_ms_sequence",
             sequenceCount,
           ) ?? parsed.test_stream_initial_delay_ms;
-          if (initialDelayMs !== undefined) {
+          if (parsed.test_stream_pause_after_first_chunk_ms) {
+            createSseResponseWithPauseAfterFirstChunk(
+              res,
+              streamChunks,
+              parsed.test_stream_pause_after_first_chunk_ms,
+              parsed.test_stream_chunk_delay_ms ?? 20,
+              parsed.test_stream_response_content_type
+                ? { "content-type": parsed.test_stream_response_content_type }
+                : {},
+            );
+          } else if (initialDelayMs !== undefined) {
             createSseResponseWithInitialDelay(
               res,
               streamChunks,
@@ -6871,7 +6928,8 @@ async function run() {
         test_sequence_key: mislabeledLifecycleTimeoutKey,
         test_reasoning_tokens: 128,
         test_include_stream_lifecycle: true,
-        test_stream_pause_before_output_ms: 200,
+        test_stream_split_first_chunk_at: 5,
+        test_stream_pause_after_first_chunk_ms: 100,
         test_stream_chunk_delay_ms: 10,
         test_stream_response_content_type: "text/plain; charset=utf-8",
       },
@@ -7116,8 +7174,12 @@ async function run() {
       policyDeadlineTimerFaultPath,
       [
         "const originalSetTimeout = global.setTimeout;",
+        "const originalUnshift = Array.prototype.unshift;",
         "let acceleratedTotalDeadline = false;",
         "let stalledRetryDelay = false;",
+        "let dispatchWindowDeadlineAt = 0;",
+        "let stalledDispatchWindowRetry = false;",
+        "let stalledInternalRetrySample = false;",
         "global.setTimeout = function patchedSetTimeout(callback, delay, ...args) {",
         "  const numericDelay = Number(delay);",
         "  if (!acceleratedTotalDeadline && numericDelay >= 600 && numericDelay <= 731) {",
@@ -7132,7 +7194,26 @@ async function run() {
         "      callback(...args);",
         "    }, delay);",
         "  }",
+        "  if (!dispatchWindowDeadlineAt && numericDelay >= 180 && numericDelay <= 220) {",
+        "    dispatchWindowDeadlineAt = Date.now() + numericDelay;",
+        "  }",
+        "  if (!stalledDispatchWindowRetry && dispatchWindowDeadlineAt && numericDelay === 60) {",
+        "    stalledDispatchWindowRetry = true;",
+        "    return originalSetTimeout(() => {",
+        "      const resumeAt = dispatchWindowDeadlineAt - 20;",
+        "      while (Date.now() < resumeAt) {}",
+        "      callback(...args);",
+        "    }, delay);",
+        "  }",
         "  return originalSetTimeout(callback, delay, ...args);",
+        "};",
+        "Array.prototype.unshift = function patchedUnshift(...items) {",
+        "  if (!stalledInternalRetrySample && dispatchWindowDeadlineAt && items.some((item) => item?.final_action === 'http_429_internal_retry')) {",
+        "    stalledInternalRetrySample = true;",
+        "    const releaseAt = dispatchWindowDeadlineAt + 20;",
+        "    while (Date.now() < releaseAt) {}",
+        "  }",
+        "  return Reflect.apply(originalUnshift, this, items);",
         "};",
         "",
       ].join("\n"),
@@ -7259,6 +7340,53 @@ async function run() {
             (entry) => entry.body?.test_sequence_key === lateTimerDeadlineKey,
           ).length === 1,
         "Retry-After timer 恢复时总 deadline 已过期，不得派发新 attempt",
+      );
+
+      const dispatchWindowConfigResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 1,
+            http_429_action: "retry_then_502",
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 0,
+              first_progress_action: "return_502",
+              total_timeout_ms: 220,
+            },
+          }),
+        },
+      );
+      assert(dispatchWindowConfigResponse.status === 200, "下一 attempt 最终 deadline 闸门配置失败");
+      const dispatchWindowKey = "latency-final-gate-before-next-dispatch";
+      try {
+        const dispatchWindowResponse = await fetch(
+          `http://127.0.0.1:${policyDeadlineGatewayPort}/responses`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              test_sequence_key: dispatchWindowKey,
+              test_http_429_attempts: 1,
+              test_retry_after: "0.06",
+            }),
+            signal: AbortSignal.timeout(1500),
+          },
+        );
+        await dispatchWindowResponse.arrayBuffer();
+      } catch {
+        // 总 deadline 可以在第二次请求已按时派发后取消其响应读取。
+      }
+      const dispatchWindowRequests = upstream.responseRequests.filter(
+        (entry) => entry.body?.test_sequence_key === dispatchWindowKey,
+      );
+      assert(
+        dispatchWindowRequests.length === 2 &&
+          dispatchWindowRequests[1].received_at_ms - dispatchWindowRequests[0].received_at_ms < 220,
+        `下一 attempt 必须在总 deadline 前真正派发: ${JSON.stringify(dispatchWindowRequests)}`,
       );
     } finally {
       await stopGateway(policyDeadlineGateway);
@@ -7659,6 +7787,22 @@ async function run() {
       `混合换行 SSE 边界不得绕过 516: status=${mixedNewlineSseResponse.status}`,
     );
 
+    const terminalCrSseKey = "terminal-cr-sse-reasoning-516";
+    const terminalCrSseResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: terminalCrSseKey,
+        test_reasoning_tokens: 516,
+        test_stream_only_completed_event: true,
+        test_stream_event_separator: "\r\r",
+      },
+    );
+    assert(
+      terminalCrSseResponse.status === 502,
+      `纯 CR 终态 SSE 在 EOF 时不得绕过 516: status=${terminalCrSseResponse.status}`,
+    );
+
     const oversizedProtectedSseKey = "oversized-protected-sse-event";
     const oversizedProtectedSseResponse = await readSseUntilClose(
       `http://127.0.0.1:${gatewayPort}/responses`,
@@ -7692,6 +7836,52 @@ async function run() {
       oversizedProtectedSample?.final_action === "response_inspection_limit_exceeded" &&
         oversizedProtectedSample?.blocked_by_gateway === true,
       `超大 SSE 检查失败必须详细落盘: ${JSON.stringify(oversizedProtectedSample)}`,
+    );
+
+    const disconnectInspectionConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...strictParserConfig,
+          stream_action: "disconnect",
+        }),
+      },
+    );
+    assert(disconnectInspectionConfigResponse.status === 200, "disconnect 超大事件配置失败");
+    const disconnectInspectionKey = "disconnect-oversized-protected-sse-event";
+    const disconnectInspectionResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: disconnectInspectionKey,
+        test_reasoning_tokens: 516,
+        test_stream_completed_padding_bytes: 1024 * 1024 + 64 * 1024,
+      },
+    );
+    assert(
+      disconnectInspectionResponse.status === 200 && disconnectInspectionResponse.closedByError,
+      "disconnect 模式已写响应后遇到 protected 超大 SSE 必须 fail-closed 断连",
+    );
+    let disconnectInspectionSample = null;
+    const disconnectInspectionSampleDeadline = Date.now() + 3000;
+    while (!disconnectInspectionSample && Date.now() < disconnectInspectionSampleDeadline) {
+      const payload = await fetch(
+        `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      disconnectInspectionSample = (payload.recent_samples || []).find((sample) =>
+        `${sample.request_payload_excerpt || ""}`.includes(disconnectInspectionKey),
+      );
+      if (!disconnectInspectionSample) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    assert(
+      disconnectInspectionSample?.final_action ===
+          "response_inspection_limit_disconnected_after_forward" &&
+        disconnectInspectionSample?.blocked_by_gateway === true,
+      `disconnect 超大事件断连必须详细落盘: ${JSON.stringify(disconnectInspectionSample)}`,
     );
 
     const observedTimeoutConfigResponse = await fetch(

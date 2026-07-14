@@ -1489,6 +1489,27 @@
      - `test-gateway-e2e.mjs` 新增 Capacity 正值等待、late timer deadline、混合换行、误标 Content-Type、超大 protected completed、parser 硬上限故障注入和 observe-only timeout 七组反例。
      - 2026-07-15 Codex bundled Node 四套 E2E 串行 PASS，六个 JS syntax、PowerShell AST、`git diff --check` 与临时进程审计 PASS。
 
+43. 策略重试的同步收口、SSE EOF 和 disconnect 检查失败必须按不可撤回边界处理
+   - 现象：
+     - Retry-After timer 恢复时虽然 deadline 尚余约 20 ms，但旧 retry attempt 的同步 analytics 入库可以阻塞事件循环；第二次上游请求最终在总 deadline 之后才真正到达。
+     - 误标 `text/plain` 的 SSE 首 chunk 只有 `data:`、JSON 位于下一 chunk 时，会被当成普通文本 progress。
+     - 唯一 `response.completed` 事件用 `\r\r` 结束后立即 EOF 时，最后一个 CR 一直被保留等待潜在 LF，516 可绕过最终规则判断。
+     - `stream_action=disconnect` 已发送 200 响应头后遇到超过 1 MiB 的受保护事件，旧超限分支因不是 strict-502 模式而继续透传。
+   - 根因：
+     - “调用 `fetch()` 返回 Promise”不等于请求已经离开 Node/Undici 事件循环；在其后立即同步收口仍可能挡住真实网络派发。
+     - 误标 SSE 嗅探只接受 `data: {` 或 `data: [DONE]`，没有在字段前缀阶段切换到 SSE framing。
+     - chunk 解析必须把末尾 CR 保留到下一块判断 CRLF，但 EOF 分支没有允许尾随 CR 的 final flush。
+     - 检查上限只受 `strict502Mode` 控制，没有覆盖 reasoning 规则启用但响应已不可改写的 disconnect 模式。
+   - 处理：
+     - policy retry 等待完成后先保留旧 attempt 上下文；下一轮在派发前做最终墙钟检查。过期时用旧 sample 返回总 timeout；未过期时先等待下一 fetch 成功取得响应头或结束，再同步完成旧 retry 日志、计数和样本，确保收口不阻塞真实派发。
+     - `total_proxy_request_count` 与 active 计数移动到实际 fetch attempt，未派发的 deadline 分支不计数，也不记录新 attempt。
+     - 误标 SSE 从行首 `data:` / `event:` / `id:` / `retry:` / comment 前缀开始识别；EOF 使用只在终止阶段允许尾随 CR 的 `flushSsePayloads()`，完整事件继续进入模型、usage、结构与 reasoning 累积。
+     - reasoning 流式保护启用且检查超限时统一 fail-closed：未写响应返回专用 502；已写响应取消 reader/upstream、销毁下游并记录 `response_inspection_limit_disconnected_after_forward`。
+   - 防回归：
+     - deadline 故障注入让旧 `http_429_internal_retry` 样本同步入库跨过总 deadline，并断言第二次上游实际接收时间仍早于 deadline；第一版仅提前创建 fetch Promise 仍以 239 ms 对 220 ms 失败，最终后移同步收口后转绿。
+     - E2E 覆盖 `data:` 与 JSON 跨 chunk并暂停、纯 CR completed 后立即 EOF、disconnect 已写响应后的受保护超大事件断连和专用样本。
+     - 2026-07-15 Codex bundled Node 四套 E2E 串行 PASS，六个 JS syntax、三份 PowerShell AST、`git diff --check` 与仓库临时 Node 进程 0 残留。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

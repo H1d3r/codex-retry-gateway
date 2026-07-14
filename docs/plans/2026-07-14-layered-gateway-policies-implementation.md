@@ -357,6 +357,8 @@ README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retr
 
 第二轮 reviewer 的 7 个 Important 也已逐项 RED/GREEN：Capacity 429 遵守正值 Retry-After、等待 timer 恢复后墙钟复核总 deadline、SSE LF/CR/CRLF 混合边界、observe-only timeout 保留命中事实、误标 Content-Type 的 JSON SSE 有界识别、parser 状态拼接前执行 1 MiB 硬限制、严格保护下超大事件返回专用 `response_inspection_limit_exceeded` 502。当前状态为“修复已 fresh 验证、待原 reviewer 再复审”。
 
+第三轮 reviewer 的 4 个 Important 已继续按 RED/GREEN 修复：同步 retry 样本收口不得把下一 attempt 的真实派发拖过总 deadline；误标 SSE 的 `data:` 字段名与 JSON 跨 chunk 时不能误算普通文本 progress；EOF 纯 CR 终态事件必须参与 usage/结构/reasoning 判定；`stream_action=disconnect` 已写响应后遇到受保护超大 SSE 必须取消上游、断开下游并记录专用 final action。2026-07-15 使用 Codex bundled Node 串行运行四套 E2E、六个 JS syntax、三份 PowerShell AST、`git diff --check` 和临时进程审计均通过，等待最终双 reviewer 复审。
+
 - [x] **Step 2：执行完整本地验证**
 
 ```powershell

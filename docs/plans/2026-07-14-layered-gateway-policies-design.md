@@ -188,6 +188,7 @@ timeout > capacity > generic HTTP 429 > reasoning rule > pass through
 6. 所有等待必须可被客户端断开、总超时或 gateway 关闭中止。
 7. 已开始等待后若总 deadline 先到，timeout 优先；当前 attempt 直接返回 `upstream-total-timeout` 502，不先记录为策略重试，也不重复创建样本。等待 timer 恢复后必须按当前墙钟再次检查 deadline，不能只依赖 timer 回调顺序。
 8. 等待中客户端断开时，当前 attempt 记录 `client_disconnected`，不得继续重试或伪造客户端状态。
+9. 下一 attempt 真正派发前必须再做一次墙钟 deadline 闸门；旧 retry attempt 的日志、计数和 analytics 同步收口只能在下一次 fetch 已结束后执行，不能让收口阻塞实际网络派发。闸门过期时继续用旧 attempt 返回总 timeout，不增加请求/active 计数，也不保留新 attempt 样本。
 
 ## 8. 流式响应约束
 
@@ -222,10 +223,11 @@ timeout > capacity > generic HTTP 429 > reasoning rule > pass through
 ### 8.5 SSE framing 与检查上限
 
 - SSE 空行边界按 LF、CR、CRLF 及其合法混合组合解析，不能只识别 `\n\n` 与 `\r\n\r\n`。
-- `stream:true` 的非 JSON 响应即使 Content-Type 缺失或误标，也对 `data: {json}` 做有界 SSE 内容识别；真正的普通文本首个非空 chunk 仍按首 progress 处理。
+- `stream:true` 的非 JSON 响应即使 Content-Type 缺失或误标，也从行首 `data:`、`event:`、`id:`、`retry:` 或 comment 字段前缀开始做有界 SSE 内容识别；字段名和 JSON 可以跨 chunk，真正的普通文本首个非空 chunk 仍按首 progress 处理。
+- EOF 必须 flush 已由完整空行终止的剩余事件，包括最后一个换行符为 CR 的 `\r\r`、`\n\r` 与 `\r\n\r` 组合；没有完整事件边界的残片不得强行解析。
 - 单个 SSE 事件的 parser 状态使用 1 MiB 字节硬上限，拼接前检查剩余预算；超限后的 discard 状态只保留识别下一个事件边界所需的最多 3 字节尾部。
 - `intercept_rule_mode=none` 或 `intercept_streaming=false` 时，超大事件不改变既有透传/observe-only 语义，但样本必须记录检查失败。
-- reasoning 流式严格保护开启且尚未向客户端写回时，无法完整检查的超大 SSE 事件必须返回专用 502，不能按未命中静默透传。
+- reasoning 流式保护开启时，无法完整检查的超大 SSE 事件不能按未命中静默透传：尚未写响应时返回专用 502；响应头或内容已写出时取消上游并断开下游，样本记录 `response_inspection_limit_disconnected_after_forward`。
 
 ## 9. 502 契约
 

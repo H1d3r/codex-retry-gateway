@@ -347,6 +347,11 @@ post_implementation_review:
   reviewer_output_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
+  latest_rereview_findings:
+    - policy retry sample closeout can delay the next real upstream dispatch beyond total deadline
+    - mislabeled SSE data prefix split across chunks can be misclassified as plain-text progress
+    - terminal CR-only SSE event at EOF is not flushed into rule inspection
+    - disconnect mode can pass through an oversized protected SSE event after headers are sent
   reject_if_hits:
     - retry-or-502-after-downstream-forwarding
     - total-deadline-reset-across-attempts
@@ -370,7 +375,11 @@ post_implementation_review:
     - mislabeled JSON SSE remains inspectable without breaking plain-text progress
     - oversized protected SSE returns response_inspection_limit_exceeded instead of bypassing rules
     - observe-only timeout preserves matched_current_rule
-  completion_status: round-2-fixes-verified-awaiting-rereview
+    - next policy attempt has a final wall-clock gate and old retry sample closeout cannot block dispatch
+    - mislabeled SSE switches to framing on field prefixes before JSON arrives
+    - EOF flushes complete CR-only terminal events into usage/structure/reasoning inspection
+    - protected inspection overflow disconnects after forwarding with a dedicated final action
+  completion_status: review-fix-batch-3-verified-awaiting-final-rereview
 post_implementation_review_policy:
   review_phase: post-implementation
   freshness_rule: review-after-last-mutation
@@ -394,6 +403,8 @@ implementation_commit_refs:
   - git:2644884
   - git:150241b
   - git:4480e21
+  - git:da20dee
+  - git:2f63d97
 ```
 
 ## Stop Gates
@@ -418,7 +429,15 @@ verification_results:
   - 2026-07-15 common/install/launch PowerShell AST => PASS
   - 2026-07-15 temporary gateway process audit => 0 leftovers
   - 2026-07-15 git diff --check => PASS with line-ending warnings only
-full_verification_status: passed-awaiting-rereview
+review_fix_batch_3_red_evidence:
+  - next attempt reached upstream at 239ms with a 220ms total deadline when synchronous retry sample closeout ran before real dispatch
+  - terminal CR-only completed SSE returned 200 instead of intercepting reasoning_tokens=516
+  - disconnect mode did not close the client on an oversized protected SSE event
+review_fix_batch_3_green_evidence:
+  - next dispatch occurs before synchronous old-attempt closeout and the same deterministic deadline injection passes
+  - field-prefix SSE sniffing, EOF CR flush and disconnect inspection overflow E2E all pass
+  - four sequential bundled-Node E2E suites, six JS syntax checks, three PowerShell AST checks, diff check and temporary-process audit pass
+full_verification_status: passed-awaiting-final-rereview
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
