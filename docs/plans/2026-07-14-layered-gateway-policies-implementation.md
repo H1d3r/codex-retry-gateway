@@ -361,6 +361,8 @@ README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retr
 
 第四轮双 reviewer 合并出的 6 个独立 Important 已继续 RED/GREEN：四种共享 retry 统一使用最终 deadline 派发闸门；旧 retry sample 不等待下一响应头并按捕获时间及时落盘；误标 SSE 使用字段内部跨 chunk 的有界待判/普通文本回退；支持流首 UTF-8 BOM；EOF 才确认的 reasoning/final-only disconnect 实际断连；policy retry 后 fetch failure 仍单独计入 failed 并保持 attempt 恒等式。对应 gateway E2E 已通过，等待完整验证与原 reviewer 最终复审。
 
+第五轮 reviewer 的 4 个 Important 已继续 RED/GREEN：误标首个超大 SSE 候选无法绕过检查上限；独立 BOM chunk 不算 progress；普通文本 fallback 后的尾随候选不覆盖本 chunk progress；首 progress/total 完成路径按墙钟复核，不依赖延迟 timer 回调顺序。两个采集 Minor 同步收紧：未派发 timeout 明确保持 retry 字段为空，旧 policy sample 的 evidence 上界不跨入下一 attempt。对应 gateway E2E 与三套生命周期 E2E 已通过，等待最终完整验证与复审。
+
 - [x] **Step 2：执行完整本地验证**
 
 ```powershell

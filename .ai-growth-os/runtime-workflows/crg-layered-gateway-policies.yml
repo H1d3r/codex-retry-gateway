@@ -121,7 +121,9 @@ post_implementation_review:
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-4 REQUEST_CHANGES, Critical=0, Important=4
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-4 REQUEST_CHANGES, Critical=0, Important=4
-  parent_review_status: review-fix-batch-4-verified-awaiting-final-rereview
+    - agent:019f620a-6d9c-7e12-97da-7d7a905684e1 => round-5 PASS, Critical=0, Important=0, Minor=2
+    - agent:019f620a-81e7-7783-a8c2-1a002493178d => round-5 REQUEST_CHANGES, Critical=0, Important=4, Minor=1
+  parent_review_status: review-fix-batch-5-e2e-passed-awaiting-final-verification-and-rereview
   review_fix_evidence:
     - Retry-After deadline and 1MiB hard-limit RED reproduced
     - upload disconnect no longer becomes request_rejected 413
@@ -144,6 +146,10 @@ post_implementation_review:
     - SSE field-token splits use bounded candidate/plain fallback and leading UTF-8 BOM is ignored
     - EOF-only reasoning and final-only matches disconnect instead of becoming observe-only
     - post-policy fetch failure increments failed per attempt and preserves the monitor identity
+    - oversized mislabeled SSE candidates fail closed before JSON confirmation
+    - standalone BOM and fallback-plus-tail preserve first-progress truth
+    - body/chunk/EOF completion paths enforce wall-clock deadlines despite delayed timers
+    - undispatched retry fields and old-attempt evidence bounds remain attempt-local
     - 2026-07-15 four sequential bundled-Node E2E suites PASS after latest source mutation
     - 2026-07-15 JS syntax, PowerShell AST, git diff check and temporary-process audit PASS
 git_progress_checkpoints:
@@ -154,6 +160,7 @@ git_progress_checkpoints:
   - pre-verification
   - review-fix-batch-3
   - review-fix-batch-4
+  - review-fix-batch-5
   - pre-pr
 rollout_draft:
   source_task: crg-layered-gateway-policies

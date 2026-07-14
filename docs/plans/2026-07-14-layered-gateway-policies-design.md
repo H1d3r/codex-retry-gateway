@@ -165,7 +165,7 @@ retry_then_502
 1. 建立本次 attempt 样本和 AbortController。
 2. 从第一次上游派发开始建立客户端请求总 deadline；内部重试不得重置总 deadline。
 3. 每次 attempt 单独建立首个有效输出 deadline。
-4. 如果计时器先触发，标记明确的 timeout phase 并中止当前 attempt。
+4. deadline 真源是绝对墙钟，计时器只负责唤醒；非流式 body、每个流式 chunk、EOF 和 retry 派发在完成或透传前都复核，事件循环阻塞导致回调延迟时仍标记明确 timeout phase 并中止当前 attempt。
 5. 收到完整错误响应后，先判断精确 Capacity，再判断剩余通用 429。
 6. 正常响应继续进入既有 reasoning 规则判断。
 7. 没有任何策略接管时按原始上游响应透传。
@@ -223,8 +223,8 @@ timeout > capacity > generic HTTP 429 > reasoning rule > pass through
 ### 8.5 SSE framing 与检查上限
 
 - SSE 空行边界按 LF、CR、CRLF 及其合法混合组合解析，不能只识别 `\n\n` 与 `\r\n\r\n`。
-- `stream:true` 的非 JSON 响应即使 Content-Type 缺失或误标，也使用有界待判状态识别行首 `data:`、`event:`、`id:`、`retry:` 或 comment；字段名和 JSON 可以跨 chunk。解析出 JSON data 后确认 SSE；完整但不可识别的候选事件回退为普通文本 progress，不能让普通 `id:` / `retry:` / comment 永久进入 SSE 模式。
-- parser 必须忽略流首一个 UTF-8 BOM，且 BOM 自身不改变下游原始字节。
+- `stream:true` 的非 JSON 响应即使 Content-Type 缺失或误标，也使用有界待判状态识别行首 `data:`、`event:`、`id:`、`retry:` 或 comment；字段名和 JSON 可以跨 chunk。解析出 JSON data 后确认 SSE；完整但不可识别的候选事件在本 chunk 回退为普通文本 progress，即使尾部又留下部分候选字段也不能覆盖该 fallback 事实。
+- parser 必须忽略流首一个可跨 chunk 的 UTF-8 BOM，且 BOM 自身不改变下游原始字节或首 progress；误标 SSE 在 BOM/字段候选阶段超过 1 MiB 时仍按检查失败 fail-closed。
 - EOF 必须 flush 已由完整空行终止的剩余事件，包括最后一个换行符为 CR 的 `\r\r`、`\n\r` 与 `\r\n\r` 组合；没有完整事件边界的残片不得强行解析。
 - `stream_action=disconnect` 在 EOF flush 后才确认 reasoning 或 final-answer-only 命中时，必须按已写响应路径断开连接并落 `final_action=disconnect`，不得降为 observe-only。
 - 单个 SSE 事件的 parser 状态使用 1 MiB 字节硬上限，拼接前检查剩余预算；超限后的 discard 状态只保留识别下一个事件边界所需的最多 3 字节尾部。

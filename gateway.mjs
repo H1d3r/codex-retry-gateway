@@ -1143,9 +1143,19 @@ function resolveLeadingSseBom(state) {
   }
   state.buffer = Buffer.from(state.buffer.subarray(bom.length));
   state.bom_pending = false;
+  state.bom_removed_count += 1;
+}
+
+function refreshSseCandidateState(state) {
+  state.sse_candidate =
+    !state.sse_like &&
+    bufferCouldBeSseCandidate(state.buffer, state.bom_pending);
 }
 
 function beginDiscardingOversizedSseEvent(state) {
+  if (state.sse_candidate) {
+    state.oversized_candidate_event_count += 1;
+  }
   state.discarding_oversized_event = true;
   state.oversized_event_count += 1;
   state.buffer = Buffer.from(state.buffer.subarray(Math.max(0, state.buffer.length - 3)));
@@ -1168,6 +1178,7 @@ function consumeDiscardedSseBytes(state, input, startOffset) {
       );
       state.buffer = Buffer.alloc(0);
       state.discarding_oversized_event = false;
+      state.sse_candidate = false;
       return offset + consumedFromPiece;
     }
     state.buffer = Buffer.from(combined.subarray(Math.max(0, combined.length - 3)));
@@ -1197,10 +1208,13 @@ function parseSsePayloads(state, chunk) {
       const parsedBlock = parseSseBlock(block);
       if (parsedBlock.recognized) {
         state.sse_like = true;
+      } else {
+        state.unrecognized_event_count += 1;
       }
       if (parsedBlock.payload) {
         payloads.push(parsedBlock.payload);
       }
+      refreshSseCandidateState(state);
       continue;
     }
 
@@ -1223,6 +1237,7 @@ function parseSsePayloads(state, chunk) {
       ? Buffer.concat([state.buffer, piece], state.buffer.length + piece.length)
       : Buffer.from(piece);
     resolveLeadingSseBom(state);
+    refreshSseCandidateState(state);
     offset += takeBytes;
   }
   return payloads;
@@ -1243,10 +1258,13 @@ function flushSsePayloads(state) {
     const parsedBlock = parseSseBlock(block);
     if (parsedBlock.recognized) {
       state.sse_like = true;
+    } else {
+      state.unrecognized_event_count += 1;
     }
     if (parsedBlock.payload) {
       payloads.push(parsedBlock.payload);
     }
+    refreshSseCandidateState(state);
   }
   return payloads;
 }
@@ -1924,6 +1942,7 @@ function completeReasoningBehaviorSample({
 function createAttemptLatencyGuard(config, requestTracking, abortController) {
   const latencyConfig = config?.latency_guard || DEFAULT_CONFIG.latency_guard;
   let firstProgressTimer = null;
+  let firstProgressDeadlineAtMs = null;
   let totalDeadlineTimer = null;
   let timeoutPhase = null;
   let timeoutLimitMs = null;
@@ -1939,6 +1958,7 @@ function createAttemptLatencyGuard(config, requestTracking, abortController) {
 
   if (latencyConfig.enabled) {
     if (latencyConfig.first_progress_timeout_ms > 0) {
+      firstProgressDeadlineAtMs = Date.now() + latencyConfig.first_progress_timeout_ms;
       firstProgressTimer = setTimeout(
         () => triggerTimeout("first_progress", latencyConfig.first_progress_timeout_ms),
         latencyConfig.first_progress_timeout_ms,
@@ -1957,6 +1977,18 @@ function createAttemptLatencyGuard(config, requestTracking, abortController) {
       totalDeadlineTimer.unref?.();
     }
   }
+
+  const expireFirstProgressDeadlineIfNeeded = () => {
+    if (
+      !timeoutPhase &&
+      firstProgressTimer &&
+      Number.isFinite(firstProgressDeadlineAtMs) &&
+      Date.now() >= firstProgressDeadlineAtMs
+    ) {
+      triggerTimeout("first_progress", latencyConfig.first_progress_timeout_ms);
+    }
+    return timeoutPhase === "first_progress";
+  };
 
   return {
     get timeoutPhase() {
@@ -1980,23 +2012,35 @@ function createAttemptLatencyGuard(config, requestTracking, abortController) {
       }
       return timeoutPhase === "total";
     },
+    expireFirstProgressDeadlineIfNeeded,
     markFirstProgress() {
+      if (expireFirstProgressDeadlineIfNeeded() || timeoutPhase) {
+        return false;
+      }
       if (firstProgressTimer) {
         clearTimeout(firstProgressTimer);
         firstProgressTimer = null;
       }
+      firstProgressDeadlineAtMs = null;
+      return true;
     },
     endFirstProgressWindow() {
+      if (expireFirstProgressDeadlineIfNeeded() || timeoutPhase) {
+        return false;
+      }
       if (firstProgressTimer) {
         clearTimeout(firstProgressTimer);
         firstProgressTimer = null;
       }
+      firstProgressDeadlineAtMs = null;
+      return true;
     },
     clear() {
       if (firstProgressTimer) {
         clearTimeout(firstProgressTimer);
         firstProgressTimer = null;
       }
+      firstProgressDeadlineAtMs = null;
       if (totalDeadlineTimer) {
         clearTimeout(totalDeadlineTimer);
         totalDeadlineTimer = null;
@@ -11126,7 +11170,10 @@ async function fetchUpstreamWithRetry(upstreamUrl, init, logger) {
 }
 
 function inspectSseChunk(state, chunk) {
+  const bomRemovedCountBefore = state.bom_removed_count;
   const oversizedEventCountBefore = state.oversized_event_count;
+  const oversizedCandidateEventCountBefore = state.oversized_candidate_event_count;
+  const unrecognizedEventCountBefore = state.unrecognized_event_count;
   const payloads = parseSsePayloads(state, chunk);
   let reasoning = null;
   for (const payload of payloads) {
@@ -11138,7 +11185,11 @@ function inspectSseChunk(state, chunk) {
   return {
     reasoning,
     payloads,
+    bomRemoved: state.bom_removed_count > bomRemovedCountBefore,
     oversizedEvent: state.oversized_event_count > oversizedEventCountBefore,
+    oversizedSseCandidate:
+      state.oversized_candidate_event_count > oversizedCandidateEventCountBefore,
+    unrecognizedEvent: state.unrecognized_event_count > unrecognizedEventCountBefore,
   };
 }
 
@@ -11157,7 +11208,12 @@ async function handleNonStreaming({
   latencyGuard,
 }) {
   const bodyBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
-  latencyGuard?.endFirstProgressWindow();
+  if (latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
+    throw new Error("upstream total deadline expired before non-stream completion");
+  }
+  if (!latencyGuard?.endFirstProgressWindow()) {
+    throw new Error("upstream first progress deadline expired before non-stream completion");
+  }
   if (bodyBuffer.length > 0) {
     markReasoningSampleFinalChunk(reasoningSample);
   }
@@ -11175,9 +11231,11 @@ async function handleNonStreaming({
     (!parsed && bodyBuffer.length > 0)
   ) {
     const progressAtMs = Date.now();
+    if (!latencyGuard?.markFirstProgress()) {
+      throw new Error("upstream first progress deadline expired before non-stream progress");
+    }
     markReasoningSampleFirstProgress(reasoningSample, progressAtMs);
     markReasoningSampleFirstContent(reasoningSample, progressAtMs);
-    latencyGuard?.markFirstProgress();
   }
   const reasoning = parsed ? extractReasoningTokens(parsed) : null;
   const ruleMatch = buildInterceptRuleMatch(config, reasoning, reasoningSample, structureAccumulator);
@@ -11403,9 +11461,13 @@ async function handleStreaming({
   const sseState = {
     buffer: Buffer.alloc(0),
     bom_pending: true,
+    bom_removed_count: 0,
     discarding_oversized_event: false,
+    oversized_candidate_event_count: 0,
     oversized_event_count: 0,
+    sse_candidate: parseAsSse,
     sse_like: parseAsSse,
+    unrecognized_event_count: 0,
   };
 
   let wroteAnyChunk = false;
@@ -11541,6 +11603,12 @@ async function handleStreaming({
 
     const { done, value } = readResult;
     if (done) {
+      if (latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
+        throw new Error("upstream total deadline expired before stream completion");
+      }
+      if (!latencyGuard?.endFirstProgressWindow()) {
+        throw new Error("upstream first progress deadline expired before stream completion");
+      }
       const finalPayloadAtMs = Date.now();
       for (const payload of flushSsePayloads(sseState)) {
         applyPayloadModelSignals(modelContext, payload, {
@@ -11553,8 +11621,10 @@ async function handleStreaming({
           markReasoningSampleFirstContent(reasoningSample, finalPayloadAtMs);
         }
         if (payloadHasMeaningfulProgress(payload)) {
+          if (!latencyGuard?.markFirstProgress()) {
+            throw new Error("upstream first progress deadline expired at stream EOF");
+          }
           markReasoningSampleFirstProgress(reasoningSample, finalPayloadAtMs);
-          latencyGuard?.markFirstProgress();
         }
         const finalPayloadReasoning = extractReasoningTokens(payload);
         if (Number.isInteger(finalPayloadReasoning)) {
@@ -11716,12 +11786,16 @@ async function handleStreaming({
     }
 
     const nowMs = Date.now();
+    if (latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
+      throw new Error("upstream total deadline expired before stream chunk processing");
+    }
     const chunkBuffer = Buffer.from(value);
     markReasoningSampleFirstChunk(reasoningSample, nowMs);
     markReasoningSampleFinalChunk(reasoningSample, nowMs);
     const inspectedChunk = inspectSseChunk(sseState, value);
     const { reasoning, payloads, oversizedEvent } = inspectedChunk;
-    const inspectionLimitError = oversizedEvent && sseState.sse_like
+    const inspectionLimitError =
+      oversizedEvent && (sseState.sse_like || inspectedChunk.oversizedSseCandidate)
       ? createResponseInspectionLimitError(PRE_PROGRESS_BUFFER_LIMIT_BYTES)
       : null;
     if (inspectionLimitError) {
@@ -11729,13 +11803,24 @@ async function handleStreaming({
     }
     const sseDetectionPending =
       !sseState.sse_like &&
-      bufferCouldBeSseCandidate(sseState.buffer, sseState.bom_pending);
+      sseState.sse_candidate;
+    const chunkContainsOnlyBom =
+      inspectedChunk.bomRemoved &&
+      !sseState.sse_like &&
+      !inspectedChunk.unrecognizedEvent &&
+      payloads.length === 0 &&
+      sseState.buffer.length === 0;
     let chunkHasMeaningfulProgress =
-      !sseState.sse_like && !sseDetectionPending && chunkBuffer.length > 0;
+      !sseState.sse_like &&
+      !chunkContainsOnlyBom &&
+      (inspectedChunk.unrecognizedEvent || !sseDetectionPending) &&
+      chunkBuffer.length > 0;
     if (chunkHasMeaningfulProgress) {
+      if (!latencyGuard?.markFirstProgress()) {
+        throw new Error("upstream first progress deadline expired before plain stream progress");
+      }
       markReasoningSampleFirstContent(reasoningSample, nowMs);
       markReasoningSampleFirstProgress(reasoningSample, nowMs);
-      latencyGuard?.markFirstProgress();
     }
     for (const payload of payloads) {
       applyPayloadModelSignals(modelContext, payload, {
@@ -11748,9 +11833,11 @@ async function handleStreaming({
         markReasoningSampleFirstContent(reasoningSample, nowMs);
       }
       if (payloadHasMeaningfulProgress(payload)) {
+        if (!latencyGuard?.markFirstProgress()) {
+          throw new Error("upstream first progress deadline expired before SSE progress");
+        }
         chunkHasMeaningfulProgress = true;
         markReasoningSampleFirstProgress(reasoningSample, nowMs);
-        latencyGuard?.markFirstProgress();
       }
     }
     if (Number.isInteger(reasoning)) {
@@ -12079,11 +12166,9 @@ async function proxyRequest(runtime, req, res) {
         const logPrefix = pendingRetry.upstreamPolicy.trigger === "capacity"
           ? "upstream-capacity"
           : "upstream-429";
-        const retryLogSeq = runtime.monitor.next_log_seq;
         logger(
           `[${logPrefix}] non-stream path=${pathname} status=${pendingRetry.reasoningSample.upstream_http_status} action=internal_retry remaining=${pendingRetry.retryRemaining}`,
         );
-        pendingRetry.latestLogSeq = retryLogSeq;
       }
       recordUpstreamPolicyOutcome(
         runtime.monitor,

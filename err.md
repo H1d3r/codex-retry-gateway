@@ -1534,6 +1534,24 @@
      - 第二 fetch 延迟 800 ms 且 latency guard 关闭时，旧 429 sample 必须在 250 ms 观测窗口内出现，且自身 duration 小于 500 ms。
      - E2E 覆盖 `d/eve/i/ret` 字段内部拆分、`id:`/comment 普通文本回退、BOM completed 516、纯 CR EOF reasoning/final-only disconnect，以及 429 后连续 fetch failure 的全局计数恒等式。
 
+45. SSE 候选组合与 latency 完成路径不能依赖剩余 buffer 或 timer 回调顺序
+   - 现象：
+     - 误标 `text/plain` 的首个 completed 事件超过 1 MiB 时，超限瞬间尚未解析 JSON，`sse_like=false`，516 事件被 discard 后可按未命中透传。
+     - UTF-8 BOM 单独占一个 chunk 时，parser 删除 BOM 后 buffer 为空，但原始 chunk 非空，旧逻辑会错误清除首 progress timer。
+     - 同一 chunk 为 `id: ordinary\n\nd` 时，完整非 JSON block 已应回退普通文本；parser 消费该 block 后只剩候选 `d`，旧逻辑重新进入 pending 并返回错误的首 progress 502。
+     - timer 回调被事件循环延迟时，非流式 body 或流式 progress/EOF 可先恢复并清 timer，使 first-progress 或 total 硬阈值失效。
+   - 根因：
+     - `sse_like` 只表达已确认 SSE，无法表达“超限前是候选”；progress 又只从解析后剩余 buffer 反推，丢失 BOM removal 与本 chunk fallback 事实。
+     - latency guard 只有 timer phase，没有保存首 progress 绝对截止时间；完成路径默认 timer 已按时执行。
+   - 处理：
+     - parser state 增加 BOM removal、unrecognized event、active candidate 与 oversized candidate 计数；`inspectSseChunk()` 返回本 chunk 事实。候选超限参与 inspection failure，BOM-only 不算 progress，unrecognized fallback 优先于尾随候选。
+     - guard 保存 `firstProgressDeadlineAtMs`；`markFirstProgress()` / `endFirstProgressWindow()` 先按墙钟判定。非流式 body、流式 chunk 和 EOF 先复核 total（可覆盖已触发 first-progress），再清 timer或写客户端。
+     - 未派发 total timeout 的 `retry_trigger/retry_delay_ms` 明确保持 `null`；policy 旧 sample 使用派发前捕获的 evidence 上界，不把下一 attempt 日志纳入自身范围。
+   - 防回归：
+     - E2E 覆盖 standalone BOM 后暂停、ordinary fallback + 尾随 `d`、误标超大 completed 516。
+     - 独立 fault gateway 把 45 ms first-progress 与 70 ms total timer 回调延迟到 200 ms；上游分别在 80/100 ms 产生 progress/body，仍必须按墙钟返回对应 502。
+     - pending sample 额外断言唯一性、`request_finished_at_ms` 早于第二次上游接收、duration 与 evidence 上界存在；未派发 Retry-After timeout 断言 retry 字段为空。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

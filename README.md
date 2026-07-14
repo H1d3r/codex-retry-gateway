@@ -270,7 +270,8 @@ Issue #26 收口说明：
 - `inspected_response_count` 按已取得上游响应的 attempt 计数；等待重试时客户端断连不会再同时增加 `failed_proxy_request_count`，总 timeout 也会进入 inspected 分母，使 `total = inspected + bypassed + failed + active` 保持可核对
 - `endpoints` 是 reasoning、Capacity、HTTP 429 和 latency guard 的共同管理边界；未列入的路径完全旁路这些策略，不会出现只启用超时但不处理 Capacity/429 的半旁路
 - `latency_guard.first_progress_timeout_ms` 与 `latency_guard.total_timeout_ms` 只接受 `0..2_147_483_647` 的整数；`0` 表示单独关闭该阈值，避免超过 Node 定时器上限后被缩短成近似立即超时
-- 流式 `text/plain` 或其它非 SSE 响应的首个非空 chunk 也算首 progress；误标 Content-Type 时使用有界待判状态识别 `data:` / `event:` / `id:` / `retry:` / comment，字段名和 JSON 都可跨 chunk，解析出 JSON data 后确认为 SSE，完整但不可识别的事件会回退为普通文本，避免保留字永久误判；parser 忽略流首 UTF-8 BOM，支持 LF、CR、CRLF 及混合空行，EOF 会 flush 以纯 CR 结束的完整终态事件
+- 首 progress 与总 deadline 都按绝对墙钟执行，timer 只负责唤醒；非流式 body 完成、每个流式 chunk、EOF 和 retry 派发在清 timer 或写客户端前都会复核，事件循环阻塞导致 timer 回调延迟也不能绕过硬阈值
+- 流式 `text/plain` 或其它非 SSE 响应的首个非空 chunk 也算首 progress；误标 Content-Type 时使用有界待判状态识别 `data:` / `event:` / `id:` / `retry:` / comment，字段名和 JSON 都可跨 chunk，解析出 JSON data 后确认为 SSE；完整不可识别事件会在本 chunk 明确回退普通文本，即使尾部又留下候选前缀也不重新压住 progress；独立 UTF-8 BOM 不算 progress，BOM 后的候选超限仍 fail-closed；支持 LF、CR、CRLF 及混合空行，EOF 会 flush 纯 CR 完整终态事件
 - `stream_action=disconnect` 在 chunk 阶段或 EOF 最终结构判定才命中 reasoning/final-answer-only 时都会实际断连并记录 `final_action=disconnect`，不会因为响应已写出而降成 observe-only
 - SSE 事件解析状态固定受 `1MiB` 字节硬上限约束；`none` 或 observe-only 场景继续原样透传并在样本中记录检查失败；reasoning 流式保护无法检查超大 SSE 事件时，尚未写响应则返回 `502 response_inspection_limit_exceeded`，已写响应则取消上游、断开下游并记录 `response_inspection_limit_disconnected_after_forward`，不会静默绕过 516/续写规则
 - 一旦响应头或不可撤回内容已经写给客户端，gateway 就不能把状态改成 502，也不能重新派发并拼接第二轮输出；后续总超时只能取消上游并断开连接，样本记录 `timeout_disconnected_after_forward`

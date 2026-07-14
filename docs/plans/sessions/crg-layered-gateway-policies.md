@@ -349,6 +349,8 @@ post_implementation_review:
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-4 REQUEST_CHANGES, Critical=0, Important=4
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-4 REQUEST_CHANGES, Critical=0, Important=4
+    - agent:019f620a-6d9c-7e12-97da-7d7a905684e1 => round-5 PASS, Critical=0, Important=0, Minor=2
+    - agent:019f620a-81e7-7783-a8c2-1a002493178d => round-5 REQUEST_CHANGES, Critical=0, Important=4, Minor=1
   latest_rereview_findings:
     - policy retry sample closeout can delay the next real upstream dispatch beyond total deadline
     - mislabeled SSE data prefix split across chunks can be misclassified as plain-text progress
@@ -359,6 +361,9 @@ post_implementation_review:
     - SSE field names split inside the token and a leading UTF-8 BOM remain unhandled
     - EOF-only disconnect matches are downgraded to observe-only
     - a fetch failure after an inspected retry attempt breaks the attempt-count identity
+    - mislabeled oversized first SSE event is discarded before candidate confirmation
+    - standalone BOM and fallback-plus-trailing-candidate corrupt first-progress classification
+    - delayed timer callbacks can lose first-progress and total hard deadlines on completion paths
   reject_if_hits:
     - retry-or-502-after-downstream-forwarding
     - total-deadline-reset-across-attempts
@@ -391,7 +396,11 @@ post_implementation_review:
     - mislabeled SSE uses bounded candidate/confirmed/plain fallback and ignores a leading UTF-8 BOM
     - EOF-only reasoning and final-only matches disconnect instead of becoming observe-only
     - fetch failures are classified per attempt even when an earlier attempt was inspected
-  completion_status: review-fix-batch-4-verified-awaiting-final-rereview
+    - oversized SSE candidates fail closed before JSON confirmation
+    - BOM-only chunks and unrecognized fallback facts survive remaining-buffer changes
+    - body/chunk/EOF completion paths enforce first-progress and total deadlines by wall clock
+    - undispatched retry fields and old-attempt evidence ranges remain attempt-local
+  completion_status: review-fix-batch-5-e2e-passed-awaiting-final-verification-and-rereview
 post_implementation_review_policy:
   review_phase: post-implementation
   freshness_rule: review-after-last-mutation
@@ -418,6 +427,7 @@ implementation_commit_refs:
   - git:da20dee
   - git:2f63d97
   - git:6a42655
+  - git:92c189d
 ```
 
 ## Stop Gates
@@ -460,7 +470,16 @@ review_fix_batch_4_green_evidence:
   - policy/reasoning/continuation/first-progress retries all reach upstream before the shared deadline
   - old retry sample appears with its own duration while the next fetch is still pending
   - BOM, EOF reasoning/final-only disconnect and post-policy fetch-failure count identity pass
-full_verification_status: passed-awaiting-final-rereview
+review_fix_batch_5_red_evidence:
+  - standalone BOM was accepted as first progress
+  - delayed first-progress timer allowed a late stream to return 200
+  - delayed total timer allowed a late non-stream body to return 200
+  - reviewer code path showed mislabeled oversized candidate and fallback-plus-tail ambiguity
+review_fix_batch_5_green_evidence:
+  - standalone BOM, fallback-plus-tail and mislabeled oversized candidate E2E pass
+  - delayed first-progress and total timer callbacks still return wall-clock 502
+  - undispatched retry fields, pending sample uniqueness/finish time and evidence bounds are asserted
+full_verification_status: review-fix-batch-5-e2e-passed-awaiting-final-verification-and-rereview
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
