@@ -211,8 +211,8 @@ superpowers_method_discipline:
 tdd:
   skill: superpowers:test-driven-development
   red_required: true
-  red_evidence_ref: pending
-  green_evidence_ref: pending
+  red_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs failed at 管理页缺少三种 reasoning 规则模式; node scripts/test-install-restore.mjs failed at missing capacity_error_action default
+  green_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs => PASS codex-retry-gateway e2e; node scripts/test-install-restore.mjs => PASS install-restore flow; node syntax and git diff check passed
   production_edit_before_red: forbidden
   test_files:
     - scripts/test-gateway-e2e.mjs

@@ -35,9 +35,11 @@ const HISTORICAL_IMPORT_SESSION_FILE_LIMIT = 2000;
 const REASONING_ANALYSIS_PROFILE_NAME = "516_candidate_review_v1";
 const INTERCEPT_RULE_MODE_REASONING_TOKENS = "reasoning_tokens";
 const INTERCEPT_RULE_MODE_FINAL_ONLY_HIGH_XHIGH = "final_answer_only_high_xhigh";
+const INTERCEPT_RULE_MODE_NONE = "none";
 const INTERCEPT_RULE_MODES = new Set([
   INTERCEPT_RULE_MODE_REASONING_TOKENS,
   INTERCEPT_RULE_MODE_FINAL_ONLY_HIGH_XHIGH,
+  INTERCEPT_RULE_MODE_NONE,
 ]);
 const REASONING_MATCH_MODE_MANUAL = "manual";
 const REASONING_MATCH_MODE_FORMULA_518N_MINUS_2 = "formula_518n_minus_2";
@@ -64,6 +66,20 @@ const CONTEXT_COMPACTION_MARKERS = [
 ];
 const UPSTREAM_CAPACITY_ERROR_MESSAGE =
   "Selected model is at capacity. Please try a different model.";
+const UPSTREAM_ERROR_ACTION_PASS_THROUGH = "pass_through";
+const UPSTREAM_ERROR_ACTION_RETURN_502 = "return_502";
+const UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH = "retry_then_pass_through";
+const UPSTREAM_ERROR_ACTION_RETRY_THEN_502 = "retry_then_502";
+const UPSTREAM_ERROR_ACTIONS = new Set([
+  UPSTREAM_ERROR_ACTION_PASS_THROUGH,
+  UPSTREAM_ERROR_ACTION_RETURN_502,
+  UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH,
+  UPSTREAM_ERROR_ACTION_RETRY_THEN_502,
+]);
+const FIRST_PROGRESS_ACTIONS = new Set([
+  UPSTREAM_ERROR_ACTION_RETURN_502,
+  UPSTREAM_ERROR_ACTION_RETRY_THEN_502,
+]);
 const REASONING_ANALYSIS_CORE_FIELDS = [
   "reasoning_tokens",
   "final_answer_only",
@@ -94,6 +110,14 @@ const DEFAULT_CONFIG = {
   intercept_non_streaming: true,
   non_stream_status_code: 502,
   guard_retry_attempts: 5,
+  capacity_error_action: UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH,
+  http_429_action: UPSTREAM_ERROR_ACTION_PASS_THROUGH,
+  latency_guard: {
+    enabled: false,
+    first_progress_timeout_ms: 0,
+    first_progress_action: UPSTREAM_ERROR_ACTION_RETURN_502,
+    total_timeout_ms: 0,
+  },
   retry_upstream_capacity_errors: true,
   stream_action: STREAM_ACTION_CONTINUATION_RECOVERY,
   log_match: true,
@@ -826,6 +850,65 @@ function normalizeGuardRetryAttempts(value) {
     throw new Error("guard_retry_attempts 必须是大于等于 0 的整数");
   }
   return parsed;
+}
+
+function normalizeUpstreamErrorAction(value, fallback) {
+  if (value === undefined || value === null || `${value}`.trim() === "") {
+    return fallback;
+  }
+  const normalized = `${value}`.trim().toLowerCase();
+  if (!UPSTREAM_ERROR_ACTIONS.has(normalized)) {
+    throw new Error(
+      "上游错误动作必须是 pass_through、return_502、retry_then_pass_through 或 retry_then_502",
+    );
+  }
+  return normalized;
+}
+
+function normalizeLatencyGuardInteger(value, fallback, fieldName) {
+  if (value === undefined || value === null || `${value}`.trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${fieldName} 必须是大于等于 0 的安全整数`);
+  }
+  return parsed;
+}
+
+function normalizeLatencyGuardConfig(input, fallback = DEFAULT_CONFIG.latency_guard) {
+  if (input !== undefined && input !== null && (typeof input !== "object" || Array.isArray(input))) {
+    throw new Error("latency_guard 必须是对象");
+  }
+  const source = input || {};
+  const normalized = {
+    enabled: source.enabled === undefined ? Boolean(fallback.enabled) : Boolean(source.enabled),
+    first_progress_timeout_ms: normalizeLatencyGuardInteger(
+      source.first_progress_timeout_ms,
+      fallback.first_progress_timeout_ms,
+      "latency_guard.first_progress_timeout_ms",
+    ),
+    first_progress_action: normalizeUpstreamErrorAction(
+      source.first_progress_action,
+      fallback.first_progress_action,
+    ),
+    total_timeout_ms: normalizeLatencyGuardInteger(
+      source.total_timeout_ms,
+      fallback.total_timeout_ms,
+      "latency_guard.total_timeout_ms",
+    ),
+  };
+  if (!FIRST_PROGRESS_ACTIONS.has(normalized.first_progress_action)) {
+    throw new Error("latency_guard.first_progress_action 必须是 return_502 或 retry_then_502");
+  }
+  if (
+    normalized.enabled &&
+    normalized.first_progress_timeout_ms === 0 &&
+    normalized.total_timeout_ms === 0
+  ) {
+    throw new Error("启用 latency_guard 时至少一个超时阈值必须大于 0");
+  }
+  return normalized;
 }
 
 function normalizeContinuationMarkerText(value, fallback = CONTINUATION_MARKER_TEXT_DEFAULT) {
@@ -4270,7 +4353,27 @@ async function loadConfig(configPath) {
   config.intercept_non_streaming = config.intercept_non_streaming !== false;
   config.guard_retry_attempts = normalizeGuardRetryAttempts(config.guard_retry_attempts);
   config.retry_upstream_capacity_errors = config.retry_upstream_capacity_errors !== false;
-  if (!config.intercept_streaming && !config.intercept_non_streaming) {
+  const legacyCapacityAction =
+    loaded.retry_upstream_capacity_errors === false
+      ? UPSTREAM_ERROR_ACTION_PASS_THROUGH
+      : UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH;
+  config.capacity_error_action = normalizeUpstreamErrorAction(
+    loaded.capacity_error_action,
+    legacyCapacityAction,
+  );
+  config.http_429_action = normalizeUpstreamErrorAction(
+    loaded.http_429_action,
+    DEFAULT_CONFIG.http_429_action,
+  );
+  config.latency_guard = normalizeLatencyGuardConfig(
+    loaded.latency_guard,
+    DEFAULT_CONFIG.latency_guard,
+  );
+  if (
+    config.intercept_rule_mode !== INTERCEPT_RULE_MODE_NONE &&
+    !config.intercept_streaming &&
+    !config.intercept_non_streaming
+  ) {
     throw new Error("流式与非流式至少选择一个拦截目标");
   }
   config.active_probe = normalizeActiveProbeConfig(loaded.active_probe);
@@ -5435,6 +5538,23 @@ function buildEditableConfig(currentConfig, payload) {
     payload.guard_retry_attempts === undefined
       ? currentConfig.guard_retry_attempts
       : normalizeGuardRetryAttempts(payload.guard_retry_attempts);
+  const nextCapacityErrorAction = normalizeUpstreamErrorAction(
+    payload.capacity_error_action,
+    currentConfig.capacity_error_action || DEFAULT_CONFIG.capacity_error_action,
+  );
+  const nextHttp429Action = normalizeUpstreamErrorAction(
+    payload.http_429_action,
+    currentConfig.http_429_action || DEFAULT_CONFIG.http_429_action,
+  );
+  const nextLatencyGuard = normalizeLatencyGuardConfig(
+    payload.latency_guard === undefined
+      ? currentConfig.latency_guard
+      : {
+          ...currentConfig.latency_guard,
+          ...payload.latency_guard,
+        },
+    DEFAULT_CONFIG.latency_guard,
+  );
   const nextRetryUpstreamCapacityErrors =
     payload.retry_upstream_capacity_errors === undefined
       ? currentConfig.retry_upstream_capacity_errors !== false
@@ -5464,7 +5584,7 @@ function buildEditableConfig(currentConfig, payload) {
         ? Boolean(currentConfig.active_probe?.enabled)
         : Boolean(payload.active_probe.enabled);
 
-  if (nextReasoning.length === 0) {
+  if (nextInterceptRuleMode !== INTERCEPT_RULE_MODE_NONE && nextReasoning.length === 0) {
     throw new Error("reasoning_equals 不能为空");
   }
   if (nextEndpoints.length === 0) {
@@ -5473,7 +5593,11 @@ function buildEditableConfig(currentConfig, payload) {
   if (!Number.isInteger(nextStatusCode) || nextStatusCode < 100 || nextStatusCode > 599) {
     throw new Error("non_stream_status_code 必须是 100-599 的整数");
   }
-  if (!nextInterceptStreaming && !nextInterceptNonStreaming) {
+  if (
+    nextInterceptRuleMode !== INTERCEPT_RULE_MODE_NONE &&
+    !nextInterceptStreaming &&
+    !nextInterceptNonStreaming
+  ) {
     throw new Error("流式与非流式至少选择一个拦截目标");
   }
   if (requestedActiveProbeEnabled && nextActiveProbe.target_families.length === 0) {
@@ -5490,6 +5614,9 @@ function buildEditableConfig(currentConfig, payload) {
     intercept_non_streaming: nextInterceptNonStreaming,
     non_stream_status_code: nextStatusCode,
     guard_retry_attempts: nextGuardRetryAttempts,
+    capacity_error_action: nextCapacityErrorAction,
+    http_429_action: nextHttp429Action,
+    latency_guard: nextLatencyGuard,
     retry_upstream_capacity_errors: nextRetryUpstreamCapacityErrors,
     stream_action: nextStreamAction,
     continuation_marker_text: nextContinuationMarkerText,
@@ -6693,17 +6820,14 @@ function buildManagementHtml() {
 
               <div class="setting-group">
                 <div class="setting-group-title">命中条件</div>
-                <div class="field rule-mode-field">
-                  <label>规则模式</label>
-                  <div class="inline-toggle rule-mode-toggle">
-                    <input id="interceptRuleModeReasoningTokensInput" name="intercept_rule_mode" type="radio" value="reasoning_tokens" />
-                    <label for="interceptRuleModeReasoningTokensInput">reasoning_tokens 长度（推荐）</label>
-                  </div>
-                  <div class="inline-toggle rule-mode-toggle">
-                    <input id="interceptRuleModeFinalOnlyInput" name="intercept_rule_mode" type="radio" value="final_answer_only_high_xhigh" />
-                    <label for="interceptRuleModeFinalOnlyInput">final answer only（实验，排除 0）</label>
-                  </div>
-                  <div class="hint">推荐使用 reasoning_tokens；final answer only 仅作实验收窄规则。</div>
+                <div class="field compact-config-field">
+                  <label for="interceptRuleModeSelect">规则模式</label>
+                  <select id="interceptRuleModeSelect" name="intercept_rule_mode">
+                    <option value="reasoning_tokens">reasoning_tokens 长度（推荐）</option>
+                    <option value="final_answer_only_high_xhigh">final answer only（实验，排除 0）</option>
+                    <option value="none">不使用 reasoning 规则（直接透传）</option>
+                  </select>
+                  <div class="hint">不使用 reasoning 规则时，仍可独立启用 Capacity、HTTP 429 与响应超时保护。</div>
                 </div>
 
                 <div class="field compact-config-field">
@@ -6753,7 +6877,7 @@ function buildManagementHtml() {
                     <input id="statusCodeInput" name="non_stream_status_code" type="number" min="100" max="599" />
                   </div>
                 </div>
-                <div class="hint">所有命中后内部动作共用这里的次数：普通内部重试、Responses 流式续写恢复、以及开启 capacity 选项后的上游 capacity 错误内重试；0 表示不做内部尝试。</div>
+                <div class="hint">所有命中后内部动作共用这里的次数：reasoning、续写恢复、Capacity、HTTP 429 与首个有效输出超时；0 表示不做内部追加尝试。</div>
                 <div class="field rule-mode-field">
                   <label>拦截范围</label>
                   <div class="inline-toggle rule-mode-toggle">
@@ -6768,11 +6892,56 @@ function buildManagementHtml() {
                 </div>
               </div>
 
-              <div class="inline-toggle rule-mode-toggle">
-                <input id="retryUpstreamCapacityErrorsInput" name="retry_upstream_capacity_errors" type="checkbox" />
-                <label for="retryUpstreamCapacityErrorsInput">上游 capacity 错误内重试</label>
+              <div class="setting-group">
+                <div class="setting-group-title">上游错误策略</div>
+                <div class="setting-row">
+                  <div class="field compact-config-field">
+                    <label for="capacityErrorActionSelect">Capacity</label>
+                    <select id="capacityErrorActionSelect" name="capacity_error_action">
+                      <option value="pass_through">直接透传</option>
+                      <option value="return_502">直接返回 502</option>
+                      <option value="retry_then_pass_through">重试，耗尽后透传</option>
+                      <option value="retry_then_502">重试，耗尽后返回 502</option>
+                    </select>
+                  </div>
+                  <div class="field compact-config-field">
+                    <label for="http429ActionSelect">HTTP 429</label>
+                    <select id="http429ActionSelect" name="http_429_action">
+                      <option value="pass_through">直接透传</option>
+                      <option value="return_502">直接返回 502</option>
+                      <option value="retry_then_pass_through">重试，耗尽后透传</option>
+                      <option value="retry_then_502">重试，耗尽后返回 502</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="hint">Capacity 仅匹配明确容量错误；普通 HTTP 429 使用独立动作，二者不会重复扣减重试预算。</div>
               </div>
-              <div class="hint">仅匹配 “Selected model is at capacity. Please try a different model.”，普通 429 / 502 仍按原样透传。</div>
+
+              <div class="setting-group">
+                <div class="setting-group-title">响应超时保护</div>
+                <div class="inline-toggle rule-mode-toggle">
+                  <input id="latencyGuardEnabledInput" name="latency_guard.enabled" type="checkbox" />
+                  <label for="latencyGuardEnabledInput">启用响应超时保护</label>
+                </div>
+                <div class="setting-row">
+                  <div class="field compact-config-field">
+                    <label for="firstProgressTimeoutMsInput">首个有效输出超时（ms）</label>
+                    <input id="firstProgressTimeoutMsInput" name="latency_guard.first_progress_timeout_ms" type="number" min="0" step="1" />
+                  </div>
+                  <div class="field compact-config-field">
+                    <label for="firstProgressActionSelect">首输出超时动作</label>
+                    <select id="firstProgressActionSelect" name="latency_guard.first_progress_action">
+                      <option value="return_502">直接返回 502</option>
+                      <option value="retry_then_502">重试，耗尽后返回 502</option>
+                    </select>
+                  </div>
+                  <div class="field compact-config-field">
+                    <label for="totalTimeoutMsInput">请求总 deadline（ms）</label>
+                    <input id="totalTimeoutMsInput" name="latency_guard.total_timeout_ms" type="number" min="0" step="1" />
+                  </div>
+                </div>
+                <div class="hint">0 表示单独关闭该阈值；启用后至少填写一个大于 0 的阈值。总 deadline 跨内部重试不重置。</div>
+              </div>
 
               <div class="inline-toggle rule-mode-toggle">
                 <input id="logMatchInput" name="log_match" type="checkbox" />
@@ -7328,8 +7497,7 @@ function buildManagementHtml() {
         reasoningEqualsField: document.getElementById('reasoningEqualsField'),
         reasoningEqualsHint: document.getElementById('reasoningEqualsHint'),
         reasoningMatchModeSelect: document.getElementById('reasoningMatchModeSelect'),
-        interceptRuleModeReasoningTokensInput: document.getElementById('interceptRuleModeReasoningTokensInput'),
-        interceptRuleModeFinalOnlyInput: document.getElementById('interceptRuleModeFinalOnlyInput'),
+        interceptRuleModeSelect: document.getElementById('interceptRuleModeSelect'),
         interceptStreamingInput: document.getElementById('interceptStreamingInput'),
         interceptNonStreamingInput: document.getElementById('interceptNonStreamingInput'),
         interceptModeValue: document.getElementById('interceptModeValue'),
@@ -7340,7 +7508,12 @@ function buildManagementHtml() {
         endpointsInput: document.getElementById('endpointsInput'),
         statusCodeInput: document.getElementById('statusCodeInput'),
         guardRetryAttemptsInput: document.getElementById('guardRetryAttemptsInput'),
-        retryUpstreamCapacityErrorsInput: document.getElementById('retryUpstreamCapacityErrorsInput'),
+        capacityErrorActionSelect: document.getElementById('capacityErrorActionSelect'),
+        http429ActionSelect: document.getElementById('http429ActionSelect'),
+        latencyGuardEnabledInput: document.getElementById('latencyGuardEnabledInput'),
+        firstProgressTimeoutMsInput: document.getElementById('firstProgressTimeoutMsInput'),
+        firstProgressActionSelect: document.getElementById('firstProgressActionSelect'),
+        totalTimeoutMsInput: document.getElementById('totalTimeoutMsInput'),
         logMatchInput: document.getElementById('logMatchInput'),
         probeTargetFamily54Input: document.getElementById('probeTargetFamily54Input'),
         probeTargetFamily55Input: document.getElementById('probeTargetFamily55Input'),
@@ -7812,7 +7985,10 @@ function buildManagementHtml() {
       }
 
       function describeRuleTargetFromForm() {
-        if (refs.interceptRuleModeFinalOnlyInput.checked) {
+        if (refs.interceptRuleModeSelect.value === 'none') {
+          return 'reasoning 直接透传';
+        }
+        if (refs.interceptRuleModeSelect.value === 'final_answer_only_high_xhigh') {
           return 'final answer only（high/xhigh，排除普通 0）';
         }
         if (refs.reasoningMatchModeSelect.value === 'formula_518n_minus_2') {
@@ -7827,12 +8003,38 @@ function buildManagementHtml() {
       }
 
       function syncReasoningMatchModeFromForm() {
+        const ruleDisabled = refs.interceptRuleModeSelect.value === 'none';
         const formulaMode = refs.reasoningMatchModeSelect.value === 'formula_518n_minus_2';
-        refs.reasoningInput.disabled = formulaMode;
-        refs.reasoningEqualsField.classList.toggle('is-formula-locked', formulaMode);
-        refs.reasoningEqualsHint.textContent = formulaMode
+        refs.reasoningMatchModeSelect.disabled = ruleDisabled;
+        refs.reasoningInput.disabled = ruleDisabled || formulaMode;
+        refs.reasoningEqualsField.classList.toggle('is-formula-locked', ruleDisabled || formulaMode);
+        refs.reasoningEqualsHint.textContent = ruleDisabled
+          ? '当前不使用 reasoning 规则；这些值会保留，切回规则模式后继续使用。'
+          : formulaMode
           ? '公式模式已接管命中条件：这里仅保留为回退/参考列表，不能直接编辑。'
           : '手动模式下多个值用英文逗号或空格分隔；选择 518*n - 2 规则时，这里只保留为回退/参考列表。';
+      }
+
+      function syncInterceptRuleModeFromForm() {
+        const ruleDisabled = refs.interceptRuleModeSelect.value === 'none';
+        [
+          refs.streamActionStrict502Input,
+          refs.streamActionDisconnectInput,
+          refs.streamActionContinuationRecoveryInput,
+          refs.interceptStreamingInput,
+          refs.interceptNonStreamingInput,
+        ].forEach((control) => {
+          control.disabled = ruleDisabled;
+        });
+        syncReasoningMatchModeFromForm();
+        syncPolicySummaryFromForm();
+      }
+
+      function syncLatencyGuardControlsFromForm() {
+        const disabled = !refs.latencyGuardEnabledInput.checked;
+        refs.firstProgressTimeoutMsInput.disabled = disabled;
+        refs.firstProgressActionSelect.disabled = disabled;
+        refs.totalTimeoutMsInput.disabled = disabled;
       }
 
       function describeStreamActionFromForm() {
@@ -7849,15 +8051,21 @@ function buildManagementHtml() {
       }
 
       function syncPolicySummaryFromForm() {
-        refs.policySummaryValue.textContent =
-          describeRuleTargetFromForm() + ' -> ' + describeStreamActionFromForm();
+        const ruleSummary = refs.interceptRuleModeSelect.value === 'none'
+          ? describeRuleTargetFromForm()
+          : describeRuleTargetFromForm() + ' -> ' + describeStreamActionFromForm();
+        const protectionSummary = [
+          'Capacity: ' + refs.capacityErrorActionSelect.value,
+          'HTTP 429: ' + refs.http429ActionSelect.value,
+        ];
+        if (refs.latencyGuardEnabledInput.checked) {
+          protectionSummary.push('响应超时保护已启用');
+        }
+        refs.policySummaryValue.textContent = ruleSummary + '；' + protectionSummary.join('；');
       }
 
       function getInterceptRuleModeFromForm() {
-        if (refs.interceptRuleModeFinalOnlyInput.checked) {
-          return 'final_answer_only_high_xhigh';
-        }
-        return 'reasoning_tokens';
+        return refs.interceptRuleModeSelect.value;
       }
 
       function getStreamActionFromForm() {
@@ -7873,7 +8081,7 @@ function buildManagementHtml() {
       function collectInterceptPayloadFromForm() {
         const interceptStreaming = Boolean(refs.interceptStreamingInput.checked);
         const interceptNonStreaming = Boolean(refs.interceptNonStreamingInput.checked);
-        if (!interceptStreaming && !interceptNonStreaming) {
+        if (getInterceptRuleModeFromForm() !== 'none' && !interceptStreaming && !interceptNonStreaming) {
           throw new Error('流式与非流式至少选择一个拦截目标。');
         }
         return {
@@ -8021,11 +8229,12 @@ function buildManagementHtml() {
         refs.reasoningMatchModeSelect.value = config?.reasoning_match_mode === 'formula_518n_minus_2'
           ? 'formula_518n_minus_2'
           : 'manual';
-        const interceptRuleMode = config?.intercept_rule_mode === 'final_answer_only_high_xhigh'
-            ? 'final_answer_only_high_xhigh'
-            : 'reasoning_tokens';
-        refs.interceptRuleModeFinalOnlyInput.checked = interceptRuleMode === 'final_answer_only_high_xhigh';
-        refs.interceptRuleModeReasoningTokensInput.checked = interceptRuleMode === 'reasoning_tokens';
+        const interceptRuleMode = ['reasoning_tokens', 'final_answer_only_high_xhigh', 'none'].includes(
+          config?.intercept_rule_mode,
+        )
+          ? config.intercept_rule_mode
+          : 'reasoning_tokens';
+        refs.interceptRuleModeSelect.value = interceptRuleMode;
         const streamAction = config?.stream_action === 'continuation_recovery'
           ? 'continuation_recovery'
           : config?.stream_action === 'disconnect'
@@ -8040,9 +8249,17 @@ function buildManagementHtml() {
         refs.endpointsInput.value = Array.isArray(config?.endpoints) ? config.endpoints.join('\\n') : '';
         refs.statusCodeInput.value = config?.non_stream_status_code ?? 502;
         refs.guardRetryAttemptsInput.value = String(config?.guard_retry_attempts ?? 5);
-        syncReasoningMatchModeFromForm();
-        syncPolicySummaryFromForm();
-        refs.retryUpstreamCapacityErrorsInput.checked = config?.retry_upstream_capacity_errors !== false;
+        refs.capacityErrorActionSelect.value = config?.capacity_error_action || 'retry_then_pass_through';
+        refs.http429ActionSelect.value = config?.http_429_action || 'pass_through';
+        const latencyGuard = config?.latency_guard || {};
+        refs.latencyGuardEnabledInput.checked = Boolean(latencyGuard.enabled);
+        refs.firstProgressTimeoutMsInput.value = String(latencyGuard.first_progress_timeout_ms ?? 0);
+        refs.firstProgressActionSelect.value = latencyGuard.first_progress_action === 'retry_then_502'
+          ? 'retry_then_502'
+          : 'return_502';
+        refs.totalTimeoutMsInput.value = String(latencyGuard.total_timeout_ms ?? 0);
+        syncLatencyGuardControlsFromForm();
+        syncInterceptRuleModeFromForm();
         refs.logMatchInput.checked = Boolean(config?.log_match);
         const activeProbe = config?.active_probe || {};
         const targetFamilies = Array.isArray(activeProbe?.target_families) ? activeProbe.target_families : [];
@@ -8845,7 +9062,14 @@ function buildManagementHtml() {
               ...interceptPayload,
               non_stream_status_code: Number.parseInt(refs.statusCodeInput.value, 10),
               guard_retry_attempts: Number.parseInt(refs.guardRetryAttemptsInput.value, 10),
-              retry_upstream_capacity_errors: refs.retryUpstreamCapacityErrorsInput.checked,
+              capacity_error_action: refs.capacityErrorActionSelect.value,
+              http_429_action: refs.http429ActionSelect.value,
+              latency_guard: {
+                enabled: refs.latencyGuardEnabledInput.checked,
+                first_progress_timeout_ms: Number.parseInt(refs.firstProgressTimeoutMsInput.value, 10),
+                first_progress_action: refs.firstProgressActionSelect.value,
+                total_timeout_ms: Number.parseInt(refs.totalTimeoutMsInput.value, 10),
+              },
               log_match: refs.logMatchInput.checked,
               active_probe: collectActiveProbeFormPayload(),
             }),
@@ -8947,18 +9171,25 @@ function buildManagementHtml() {
       [
         refs.reasoningInput,
         refs.reasoningMatchModeSelect,
-        refs.interceptRuleModeReasoningTokensInput,
-        refs.interceptRuleModeFinalOnlyInput,
+        refs.interceptRuleModeSelect,
         refs.streamActionStrict502Input,
         refs.streamActionDisconnectInput,
         refs.streamActionContinuationRecoveryInput,
         refs.statusCodeInput,
         refs.guardRetryAttemptsInput,
+        refs.capacityErrorActionSelect,
+        refs.http429ActionSelect,
+        refs.latencyGuardEnabledInput,
+        refs.firstProgressTimeoutMsInput,
+        refs.firstProgressActionSelect,
+        refs.totalTimeoutMsInput,
       ].forEach((control) => {
         control.addEventListener('input', syncPolicySummaryFromForm);
         control.addEventListener('change', syncPolicySummaryFromForm);
       });
       refs.reasoningMatchModeSelect.addEventListener('change', syncReasoningMatchModeFromForm);
+      refs.interceptRuleModeSelect.addEventListener('change', syncInterceptRuleModeFromForm);
+      refs.latencyGuardEnabledInput.addEventListener('change', syncLatencyGuardControlsFromForm);
       refs.interceptStreamingInput.addEventListener('change', () => {
         syncInterceptModeValueFromForm();
         syncPolicySummaryFromForm();

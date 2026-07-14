@@ -702,6 +702,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "reasoningEqualsField",
     "reasoningEqualsHint",
     "reasoningMatchModeSelect",
+    "interceptRuleModeSelect",
     "interceptRuleModeReasoningTokensInput",
     "interceptRuleModeFinalOnlyInput",
     "interceptStreamingInput",
@@ -714,6 +715,12 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "endpointsInput",
     "statusCodeInput",
     "guardRetryAttemptsInput",
+    "capacityErrorActionSelect",
+    "http429ActionSelect",
+    "latencyGuardEnabledInput",
+    "firstProgressTimeoutMsInput",
+    "firstProgressActionSelect",
+    "totalTimeoutMsInput",
     "retryUpstreamCapacityErrorsInput",
     "logMatchInput",
     "probeTargetFamily54Input",
@@ -830,6 +837,12 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   );
   elements.statusCodeInput.value = "502";
   elements.guardRetryAttemptsInput.value = "3";
+  elements.capacityErrorActionSelect.value = "retry_then_502";
+  elements.http429ActionSelect.value = "return_502";
+  elements.latencyGuardEnabledInput.checked = true;
+  elements.firstProgressTimeoutMsInput.value = "1500";
+  elements.firstProgressActionSelect.value = "retry_then_502";
+  elements.totalTimeoutMsInput.value = "9000";
   elements.retryUpstreamCapacityErrorsInput.checked = true;
   elements.reasoningAnalysisTokenInput.value = "516";
   elements.reasoningAnalysisModelFamilyInput.value = "gpt-5.4,gpt-5.5";
@@ -852,6 +865,14 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
       endpoints: ["/responses"],
       non_stream_status_code: 502,
       guard_retry_attempts: 3,
+      capacity_error_action: "retry_then_pass_through",
+      http_429_action: "pass_through",
+      latency_guard: {
+        enabled: false,
+        first_progress_timeout_ms: 0,
+        first_progress_action: "return_502",
+        total_timeout_ms: 0,
+      },
       retry_upstream_capacity_errors: true,
       log_match: true,
       active_probe: {
@@ -1713,8 +1734,23 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "管理页未回填网关内重试次数",
   );
   assert(
-    elements.retryUpstreamCapacityErrorsInput.checked === true,
-    "管理页未回填上游 capacity 错误内重试开关",
+    elements.interceptRuleModeSelect.value === "reasoning_tokens",
+    "管理页未回填 reasoning 规则模式",
+  );
+  assert(
+    elements.capacityErrorActionSelect.value === "retry_then_pass_through",
+    "管理页未回填 Capacity 动作",
+  );
+  assert(
+    elements.http429ActionSelect.value === "pass_through",
+    "管理页未回填 HTTP 429 动作",
+  );
+  assert(
+    elements.latencyGuardEnabledInput.checked === false &&
+      elements.firstProgressTimeoutMsInput.value === "0" &&
+      elements.firstProgressActionSelect.value === "return_502" &&
+      elements.totalTimeoutMsInput.value === "0",
+    "管理页未回填 latency_guard",
   );
   assert(
     elements.interceptModeValue.textContent.includes("流式+非流式"),
@@ -2299,8 +2335,21 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   );
   elements.interceptStreamingInput.checked = true;
   elements.interceptNonStreamingInput.checked = false;
-  elements.interceptRuleModeReasoningTokensInput.checked = false;
-  elements.interceptRuleModeFinalOnlyInput.checked = true;
+  elements.interceptRuleModeSelect.value = "none";
+  elements.capacityErrorActionSelect.value = "retry_then_502";
+  elements.http429ActionSelect.value = "return_502";
+  elements.latencyGuardEnabledInput.checked = true;
+  elements.firstProgressTimeoutMsInput.value = "1500";
+  elements.firstProgressActionSelect.value = "retry_then_502";
+  elements.totalTimeoutMsInput.value = "9000";
+  elements.interceptRuleModeSelect.emit("change", {});
+  assert(
+    elements.reasoningMatchModeSelect.disabled === true &&
+      elements.reasoningInput.disabled === true &&
+      elements.streamActionStrict502Input.disabled === true &&
+      elements.interceptStreamingInput.disabled === true,
+    "选择 none 后，管理页未禁用 reasoning 专属控件",
+  );
   await sandbox.saveConfig({ preventDefault() {} });
   const saveConfigCall = fetchBodies
     .filter((entry) => entry.url.includes("/api/config"))
@@ -2316,8 +2365,8 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "saveConfig 未提交 intercept_non_streaming",
   );
   assert(
-    savedPayload.intercept_rule_mode === "final_answer_only_high_xhigh",
-    "saveConfig 未提交 final answer only 拦截模式",
+    savedPayload.intercept_rule_mode === "none",
+    "saveConfig 未提交 none 拦截模式",
   );
   assert(
     savedPayload.reasoning_match_mode === "manual",
@@ -2328,8 +2377,19 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "saveConfig 未提交 guard_retry_attempts",
   );
   assert(
-    savedPayload.retry_upstream_capacity_errors === true,
-    "saveConfig 未提交 retry_upstream_capacity_errors",
+    savedPayload.capacity_error_action === "retry_then_502",
+    "saveConfig 未提交 Capacity 动作",
+  );
+  assert(
+    savedPayload.http_429_action === "return_502",
+    "saveConfig 未提交 HTTP 429 动作",
+  );
+  assert(
+    savedPayload.latency_guard?.enabled === true &&
+      savedPayload.latency_guard?.first_progress_timeout_ms === 1500 &&
+      savedPayload.latency_guard?.first_progress_action === "retry_then_502" &&
+      savedPayload.latency_guard?.total_timeout_ms === 9000,
+    "saveConfig 未提交完整 latency_guard",
   );
   assert(savedPayload.active_probe, "saveConfig 未提交 active_probe");
   assert(
@@ -2345,8 +2405,8 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
       JSON.stringify(["gpt-5.4", "gpt-5.6-sol", "gpt-5.6-luna"]),
     "saveConfig 未提交 active_probe.target_families",
   );
-  elements.interceptRuleModeFinalOnlyInput.checked = false;
-  elements.interceptRuleModeReasoningTokensInput.checked = true;
+  elements.interceptRuleModeSelect.value = "reasoning_tokens";
+  elements.interceptRuleModeSelect.emit("change", {});
   elements.streamActionStrict502Input.checked = false;
   elements.streamActionContinuationRecoveryInput.checked = true;
   await sandbox.saveConfig({ preventDefault() {} });
@@ -2377,8 +2437,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     },
   });
   assert(
-    elements.interceptRuleModeReasoningTokensInput.checked === true &&
-      elements.interceptRuleModeFinalOnlyInput.checked === false &&
+    elements.interceptRuleModeSelect.value === "reasoning_tokens" &&
       elements.streamActionContinuationRecoveryInput.checked === true &&
       elements.streamActionStrict502Input.checked === false,
     "fillForm 未正确回填 reasoning_tokens 规则 + 续写恢复流式动作状态",
@@ -2404,7 +2463,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   );
   elements.streamActionContinuationRecoveryInput.checked = false;
   elements.streamActionStrict502Input.checked = true;
-  elements.interceptRuleModeReasoningTokensInput.checked = true;
+  elements.interceptRuleModeSelect.value = "reasoning_tokens";
   assert(
     elements.probeEnabledValue.textContent.includes("未开启"),
     "保存为关闭自动探测后，主动探针状态应显示未开启",
@@ -4033,15 +4092,14 @@ async function run() {
       "管理页缺少非流式拦截复选框",
     );
     assert(
-      uiHtml.includes('id="interceptRuleModeReasoningTokensInput"') &&
+      uiHtml.includes('id="interceptRuleModeSelect"') &&
         uiHtml.includes('value="reasoning_tokens"') &&
-        uiHtml.includes('id="interceptRuleModeFinalOnlyInput"') &&
         uiHtml.includes('value="final_answer_only_high_xhigh"') &&
+        uiHtml.includes('<option value="none">') &&
         uiHtml.includes("final answer only") &&
-        uiHtml.includes("reasoning_tokens 长度（推荐）") &&
-        uiHtml.includes("final answer only（实验，排除 0）") &&
+        uiHtml.includes("不使用 reasoning 规则") &&
         uiHtml.includes("命中条件"),
-      "管理页缺少 reasoning_tokens 与 final answer only 规则提示",
+      "管理页缺少三种 reasoning 规则模式",
     );
     assert(
       uiHtml.includes('id="reasoningMatchModeSelect"') &&
@@ -4081,17 +4139,13 @@ async function run() {
       "管理页缺少一眼可读的当前策略摘要与内部尝试次数说明",
     );
     assert(
-      uiHtml.includes('class="field rule-mode-field"') &&
-        uiHtml.includes('class="inline-toggle rule-mode-toggle"') &&
-        uiHtml.includes('.rule-mode-toggle input[type="radio"]') &&
-        uiHtml.includes('width: 16px;') &&
-        uiHtml.includes('font-size: 12px;'),
-      "拦截规则模式 radio 应使用紧凑样式，避免按钮和字体过大",
-    );
-    assert(
-      (uiHtml.match(/class="inline-toggle rule-mode-toggle"/g) || []).length >= 4 &&
-        uiHtml.includes('.rule-mode-toggle input[type="checkbox"]'),
-      "拦截目标 checkbox 应复用紧凑选项样式，尺寸需与拦截规则模式一致",
+      uiHtml.includes('id="capacityErrorActionSelect"') &&
+        uiHtml.includes('id="http429ActionSelect"') &&
+        uiHtml.includes('id="latencyGuardEnabledInput"') &&
+        uiHtml.includes('id="firstProgressTimeoutMsInput"') &&
+        uiHtml.includes('id="firstProgressActionSelect"') &&
+        uiHtml.includes('id="totalTimeoutMsInput"'),
+      "管理页缺少 Capacity、HTTP 429 或响应超时策略控件",
     );
     assert(
       (uiHtml.match(/class="field compact-config-field"/g) || []).length >= 3 &&
@@ -4108,10 +4162,10 @@ async function run() {
       "endpoints 多行输入框应使用紧凑配置样式，避免组件和字体过大",
     );
     assert(
-      (uiHtml.match(/class="inline-toggle rule-mode-toggle"/g) || []).length >= 6 &&
-        uiHtml.indexOf('name="retry_upstream_capacity_errors"') > -1 &&
+      uiHtml.indexOf('name="capacity_error_action"') > -1 &&
+        uiHtml.indexOf('name="http_429_action"') > -1 &&
         uiHtml.indexOf('name="log_match"') > -1,
-      "capacity 与 log_match 开关应复用紧凑选项样式",
+      "Capacity、HTTP 429 与 log_match 控件缺失",
     );
     assert(
       uiHtml.includes('id="interceptModeValue"'),
@@ -4123,12 +4177,12 @@ async function run() {
     );
     assert(uiHtml.includes("命中后最大内部尝试次数"), "管理页缺少命中后最大内部尝试次数标签");
     assert(
-      uiHtml.includes('id="retryUpstreamCapacityErrorsInput"'),
-      "管理页缺少上游 capacity 错误内重试开关",
+      uiHtml.includes('id="capacityErrorActionSelect"'),
+      "管理页缺少上游 Capacity 动作选择",
     );
     assert(
-      uiHtml.includes("上游 capacity 错误内重试"),
-      "管理页缺少上游 capacity 错误内重试标签",
+      uiHtml.includes("Capacity") && uiHtml.includes("HTTP 429"),
+      "管理页缺少上游 Capacity 或 HTTP 429 策略标签",
     );
     assert(uiHtml.includes("TG群："), "管理页缺少 TG 群入口文案");
     assert(
@@ -4139,10 +4193,10 @@ async function run() {
       uiHtml.indexOf('name="guard_retry_attempts"') <
         uiHtml.indexOf('name="non_stream_status_code"') &&
         uiHtml.indexOf('name="non_stream_status_code"') <
-          uiHtml.indexOf('name="retry_upstream_capacity_errors"') &&
-        uiHtml.indexOf('name="retry_upstream_capacity_errors"') <
+          uiHtml.indexOf('name="capacity_error_action"') &&
+        uiHtml.indexOf('name="capacity_error_action"') <
           uiHtml.indexOf('name="log_match"'),
-      "命中后最大内部尝试次数、最终状态码和上游 capacity 开关应位于 log_match 之前",
+      "命中后最大内部尝试次数、最终状态码和上游 Capacity 策略应位于 log_match 之前",
     );
     assert(
       !uiHtml.includes("516 命中次数"),
