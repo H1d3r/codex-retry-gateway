@@ -171,7 +171,7 @@ git commit -m "feat: stream directly when reasoning rules are disabled"
 - `buildUpstreamPolicyErrorBody()` 生成稳定、无敏感信息的 502。
 - handler 返回 `{ policyRetry, retryReason, retryDelayMs }`，由 `proxyRequest()` 唯一扣减共享预算。
 
-- [ ] **Step 1：写 Capacity 四动作与 429 RED 测试**
+- [x] **Step 1：写 Capacity 四动作与 429 RED 测试**
 
 mock upstream 支持按 attempt 返回 Capacity、通用 429、`Retry-After` 与恢复 200。逐项断言：
 
@@ -184,7 +184,7 @@ retry_then_502 -> 尝试耗尽后 502
 
 再断言 Capacity+429 只执行 Capacity，普通 429 默认不重试，429 与 reasoning 共用预算。
 
-- [ ] **Step 2：运行 RED**
+- [x] **Step 2：运行 RED**
 
 ```powershell
 node .\scripts\test-gateway-e2e.mjs
@@ -192,15 +192,15 @@ node .\scripts\test-gateway-e2e.mjs
 
 预期：当前 Capacity 仅支持布尔重试并在耗尽后透传，通用 429 不受控。
 
-- [ ] **Step 3：实现错误分类与稳定动作**
+- [x] **Step 3：实现错误分类与稳定动作**
 
 精确 Capacity 优先。只有未命中 Capacity 的 HTTP 429 才进入 `http_429_action`。`return_502` 和 `retry_then_502` 使用不同稳定 reason/code；原样透传必须保留上游 status/body。
 
-- [ ] **Step 4：实现 Retry-After 与可中止等待**
+- [x] **Step 4：实现 Retry-After 与可中止等待**
 
 合法 header 按值等待；超过 60 秒直接走耗尽分支。无 header 使用 `0..min(30000, 1000 * 2^attemptIndex)` full-jitter。等待计入总 deadline，并可被客户端断开或总 deadline 取消。
 
-- [ ] **Step 5：运行 GREEN**
+- [x] **Step 5：运行 GREEN**
 
 ```powershell
 node .\scripts\test-gateway-e2e.mjs

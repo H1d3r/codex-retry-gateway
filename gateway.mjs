@@ -80,6 +80,7 @@ const FIRST_PROGRESS_ACTIONS = new Set([
   UPSTREAM_ERROR_ACTION_RETURN_502,
   UPSTREAM_ERROR_ACTION_RETRY_THEN_502,
 ]);
+const MAX_RETRY_AFTER_MS = 60 * 1000;
 const REASONING_ANALYSIS_CORE_FIELDS = [
   "reasoning_tokens",
   "final_answer_only",
@@ -1565,6 +1566,130 @@ function payloadHasMeaningfulProgress(payload) {
   );
 }
 
+function classifyUpstreamErrorPolicy(config, upstreamResponse, parsedPayload, bodyBuffer) {
+  if (isUpstreamCapacityErrorResponse(upstreamResponse, parsedPayload, bodyBuffer)) {
+    return {
+      trigger: "capacity",
+      action: normalizeUpstreamErrorAction(
+        config?.capacity_error_action,
+        DEFAULT_CONFIG.capacity_error_action,
+      ),
+      reasonHeader: "upstream-capacity",
+      errorCode: "upstream_capacity_policy_triggered",
+      message: "上游模型容量不足，gateway 已按 Capacity 策略终止本次请求。",
+    };
+  }
+  if (upstreamResponse?.status === 429) {
+    return {
+      trigger: "http_429",
+      action: normalizeUpstreamErrorAction(
+        config?.http_429_action,
+        DEFAULT_CONFIG.http_429_action,
+      ),
+      reasonHeader: "upstream-rate-limited",
+      errorCode: "upstream_rate_limit_policy_triggered",
+      message: "上游返回 HTTP 429，gateway 已按限流策略终止本次请求。",
+    };
+  }
+  return null;
+}
+
+function actionRequestsRetry(action) {
+  return (
+    action === UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH ||
+    action === UPSTREAM_ERROR_ACTION_RETRY_THEN_502
+  );
+}
+
+function actionExhaustsTo502(action) {
+  return (
+    action === UPSTREAM_ERROR_ACTION_RETURN_502 ||
+    action === UPSTREAM_ERROR_ACTION_RETRY_THEN_502
+  );
+}
+
+function parseRetryAfterMs(rawValue, nowMs = Date.now()) {
+  if (rawValue === undefined || rawValue === null) {
+    return null;
+  }
+  const text = `${rawValue}`.trim();
+  if (!text) {
+    return null;
+  }
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    const seconds = Number(text);
+    return Number.isFinite(seconds) ? Math.max(0, Math.round(seconds * 1000)) : null;
+  }
+  const timestampMs = Date.parse(text);
+  return Number.isFinite(timestampMs) ? Math.max(0, timestampMs - nowMs) : null;
+}
+
+function resolveUpstreamPolicyRetryDelay(policy, upstreamResponse, attemptIndex) {
+  if (policy?.trigger !== "http_429") {
+    return {
+      retryAfterRaw: null,
+      retryAfterMs: null,
+      retryDelayMs: 0,
+      delayAllowed: true,
+    };
+  }
+  const retryAfterRaw = upstreamResponse.headers.get("retry-after");
+  const retryAfterMs = parseRetryAfterMs(retryAfterRaw);
+  if (Number.isFinite(retryAfterMs)) {
+    return {
+      retryAfterRaw,
+      retryAfterMs,
+      retryDelayMs: retryAfterMs,
+      delayAllowed: retryAfterMs <= MAX_RETRY_AFTER_MS,
+    };
+  }
+  const cappedBackoffMs = Math.min(30_000, 1000 * 2 ** Math.max(0, attemptIndex));
+  return {
+    retryAfterRaw,
+    retryAfterMs: null,
+    retryDelayMs: Math.floor(Math.random() * (cappedBackoffMs + 1)),
+    delayAllowed: true,
+  };
+}
+
+function buildUpstreamPolicyErrorBody(policy, requestTracking) {
+  return JSON.stringify({
+    error: {
+      type: "codex_retry_gateway_upstream_policy_error",
+      code: policy.errorCode,
+      message: policy.message,
+    },
+    retry_attempt_index: requestTracking?.guardRetryAttemptsUsed ?? 0,
+    retry_attempts_used: requestTracking?.guardRetryAttemptsUsed ?? 0,
+    retry_attempts_remaining: requestTracking?.guardRetryRemaining ?? 0,
+  });
+}
+
+function waitForRetryDelay(delayMs, signal) {
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    return Promise.resolve(!signal?.aborted);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (completed) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    const timer = setTimeout(() => finish(true), delayMs);
+    if (signal?.aborted) {
+      finish(false);
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function completeReasoningBehaviorSample({
   runtime,
   sample,
@@ -1643,6 +1768,14 @@ function buildReasoningBehaviorAttemptSample(runtime, requestTracking, attemptIn
     client_first_write_at: null,
     client_first_write_at_ms: null,
     response_forwarding_started: false,
+    policy_trigger: null,
+    policy_action: null,
+    retry_trigger: null,
+    retry_delay_ms: null,
+    retry_after_raw: null,
+    retry_after_ms: null,
+    retry_budget_used: attemptIndex,
+    retry_budget_remaining: null,
     input_tokens: null,
     reasoning_tokens: null,
     output_tokens: null,
@@ -1811,6 +1944,10 @@ function finalizeReasoningBehaviorSample(sample, structure, overrides = {}) {
   }
   sample.internal_retry_remaining =
     overrides.internal_retry_remaining ?? sample.internal_retry_remaining;
+  sample.retry_budget_remaining =
+    overrides.retry_budget_remaining ??
+    sample.retry_budget_remaining ??
+    sample.internal_retry_remaining;
   sample.matched_current_rule =
     overrides.matched_current_rule ?? sample.matched_current_rule;
   sample.blocked_by_gateway =
@@ -5594,9 +5731,18 @@ function buildEditableConfig(currentConfig, payload) {
     payload.guard_retry_attempts === undefined
       ? currentConfig.guard_retry_attempts
       : normalizeGuardRetryAttempts(payload.guard_retry_attempts);
+  const nextRetryUpstreamCapacityErrors =
+    payload.retry_upstream_capacity_errors === undefined
+      ? currentConfig.retry_upstream_capacity_errors !== false
+      : Boolean(payload.retry_upstream_capacity_errors);
+  const legacyCapacityAction = nextRetryUpstreamCapacityErrors
+    ? UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH
+    : UPSTREAM_ERROR_ACTION_PASS_THROUGH;
   const nextCapacityErrorAction = normalizeUpstreamErrorAction(
     payload.capacity_error_action,
-    currentConfig.capacity_error_action || DEFAULT_CONFIG.capacity_error_action,
+    payload.retry_upstream_capacity_errors === undefined
+      ? currentConfig.capacity_error_action || DEFAULT_CONFIG.capacity_error_action
+      : legacyCapacityAction,
   );
   const nextHttp429Action = normalizeUpstreamErrorAction(
     payload.http_429_action,
@@ -5611,10 +5757,6 @@ function buildEditableConfig(currentConfig, payload) {
         },
     DEFAULT_CONFIG.latency_guard,
   );
-  const nextRetryUpstreamCapacityErrors =
-    payload.retry_upstream_capacity_errors === undefined
-      ? currentConfig.retry_upstream_capacity_errors !== false
-      : Boolean(payload.retry_upstream_capacity_errors);
   const nextStreamAction =
     payload.stream_action === undefined
       ? normalizeStreamAction(currentConfig.stream_action)
@@ -10444,21 +10586,43 @@ async function handleNonStreaming({
   const ruleMatch = buildInterceptRuleMatch(config, reasoning, reasoningSample, structureAccumulator);
   applyInterceptExemptionToSample(reasoningSample, ruleMatch);
   const matched = ruleMatch.matched;
-  const capacityRetryMatched =
-    config.retry_upstream_capacity_errors !== false &&
-    isUpstreamCapacityErrorResponse(upstreamResponse, parsed, bodyBuffer);
+  const upstreamPolicy = classifyUpstreamErrorPolicy(
+    config,
+    upstreamResponse,
+    parsed,
+    bodyBuffer,
+  );
 
-  recordInspectedResponse(monitor, reasoning, matched, "non-stream");
+  recordInspectedResponse(monitor, reasoning, upstreamPolicy ? false : matched, "non-stream");
   setRequestTrackingOutcome(requestTracking, "inspected");
 
-  if (capacityRetryMatched) {
-    const canGuardRetry = requestTracking?.guardRetryRemaining > 0;
+  if (upstreamPolicy) {
+    const retryDelay = resolveUpstreamPolicyRetryDelay(
+      upstreamPolicy,
+      upstreamResponse,
+      requestTracking?.guardRetryAttemptsUsed ?? 0,
+    );
+    const retryRequested = actionRequestsRetry(upstreamPolicy.action);
+    const canGuardRetry =
+      retryRequested &&
+      retryDelay.delayAllowed &&
+      requestTracking?.guardRetryRemaining > 0;
+    reasoningSample.policy_trigger = upstreamPolicy.trigger;
+    reasoningSample.policy_action = upstreamPolicy.action;
+    reasoningSample.retry_trigger = canGuardRetry ? upstreamPolicy.trigger : null;
+    reasoningSample.retry_delay_ms = canGuardRetry ? retryDelay.retryDelayMs : null;
+    reasoningSample.retry_after_raw = retryDelay.retryAfterRaw;
+    reasoningSample.retry_after_ms = retryDelay.retryAfterMs;
+    reasoningSample.retry_budget_remaining = requestTracking?.guardRetryRemaining ?? 0;
     if (config.log_match) {
       const action = canGuardRetry
         ? `internal_retry remaining=${requestTracking.guardRetryRemaining}`
-        : "pass_through";
+        : actionExhaustsTo502(upstreamPolicy.action)
+          ? "return_status_502"
+          : "pass_through";
+      const logPrefix = upstreamPolicy.trigger === "capacity" ? "upstream-capacity" : "upstream-429";
       logger(
-        `[upstream-capacity] non-stream path=${pathname} status=${upstreamResponse.status} action=${action}`,
+        `[${logPrefix}] non-stream path=${pathname} status=${upstreamResponse.status} action=${action}`,
       );
     }
     if (canGuardRetry) {
@@ -10469,14 +10633,55 @@ async function handleNonStreaming({
         sample: reasoningSample,
         structure: structureAccumulator,
         modelContext,
-        finalAction: "upstream_capacity_internal_retry",
+        finalAction: `${upstreamPolicy.trigger}_internal_retry`,
         clientHttpStatus: null,
         matchedCurrentRule: false,
         blockedByGateway: true,
         failureSummary: buildFailureSummary(null, parsed),
       });
-      return { guardRetry: true, retryReason: "upstream_capacity" };
+      return {
+        policyRetry: true,
+        retryReason: upstreamPolicy.trigger,
+        retryDelayMs: retryDelay.retryDelayMs,
+      };
     }
+    if (actionExhaustsTo502(upstreamPolicy.action)) {
+      recordBlockedResponse(monitor, "non-stream");
+      finalizeModelInsights(monitor, pathname, modelContext, parsed);
+      res.writeHead(502, {
+        "content-type": "application/json; charset=utf-8",
+        "x-codex-retry-gateway-reason": upstreamPolicy.reasonHeader,
+      });
+      res.end(buildUpstreamPolicyErrorBody(upstreamPolicy, requestTracking));
+      completeReasoningBehaviorSample({
+        runtime,
+        sample: reasoningSample,
+        structure: structureAccumulator,
+        modelContext,
+        finalAction: `${upstreamPolicy.trigger}_returned_502`,
+        clientHttpStatus: 502,
+        matchedCurrentRule: false,
+        blockedByGateway: true,
+        failureSummary: buildFailureSummary(null, parsed),
+      });
+      return { handled: true };
+    }
+    finalizeModelInsights(monitor, pathname, modelContext, parsed);
+    copyHeadersToClient(upstreamResponse.headers, res);
+    res.writeHead(upstreamResponse.status);
+    res.end(bodyBuffer);
+    completeReasoningBehaviorSample({
+      runtime,
+      sample: reasoningSample,
+      structure: structureAccumulator,
+      modelContext,
+      finalAction: `${upstreamPolicy.trigger}_passed_through`,
+      clientHttpStatus: upstreamResponse.status,
+      matchedCurrentRule: false,
+      blockedByGateway: false,
+      failureSummary: buildFailureSummary(null, parsed),
+    });
+    return { handled: true };
   }
 
   if (matched) {
@@ -10947,6 +11152,15 @@ async function proxyRequest(runtime, req, res) {
     continuation_recovery_success_recorded: false,
     continuation_recovery_base_request_json: null,
   };
+  const clientDisconnectController = new AbortController();
+  const abortForClientDisconnect = () => {
+    if (!res.writableEnded) {
+      clientDisconnectController.abort();
+    }
+  };
+  req.once("aborted", abortForClientDisconnect);
+  res.once("close", abortForClientDisconnect);
+  requestTracking.client_disconnect_signal = clientDisconnectController.signal;
 
   if (pathname === config.health_path) {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
@@ -11046,7 +11260,9 @@ async function proxyRequest(runtime, req, res) {
       0,
       Number(config.guard_retry_attempts || 0) - guardRetryAttemptsUsed,
     );
+    requestTracking.guardRetryAttemptsUsed = guardRetryAttemptsUsed;
     reasoningSample.internal_retry_remaining = requestTracking.guardRetryRemaining;
+    reasoningSample.retry_budget_remaining = requestTracking.guardRetryRemaining;
     reasoningSample.upstream_fetch_started_at_ms = Date.now();
     reasoningSample.upstream_fetch_started_at = toIsoStringOrNull(
       reasoningSample.upstream_fetch_started_at_ms,
@@ -11135,6 +11351,21 @@ async function proxyRequest(runtime, req, res) {
             upstreamResponse,
             res,
           });
+
+      if (
+        handlerResult?.policyRetry &&
+        guardRetryAttemptsUsed < Number(config.guard_retry_attempts || 0)
+      ) {
+        const delayCompleted = await waitForRetryDelay(
+          handlerResult.retryDelayMs,
+          requestTracking.client_disconnect_signal,
+        );
+        if (!delayCompleted) {
+          return;
+        }
+        guardRetryAttemptsUsed += 1;
+        continue;
+      }
 
       if (
         handlerResult?.continuationRecovery &&

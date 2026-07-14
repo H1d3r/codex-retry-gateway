@@ -211,8 +211,8 @@ superpowers_method_discipline:
 tdd:
   skill: superpowers:test-driven-development
   red_required: true
-  red_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs failed at 管理页缺少三种 reasoning 规则模式; node scripts/test-install-restore.mjs failed at missing capacity_error_action default; Task2 node scripts/test-gateway-e2e.mjs failed with none firstChunkAtMs equal completedAtMs
-  green_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs => PASS codex-retry-gateway e2e; node scripts/test-install-restore.mjs => PASS install-restore flow; Task2 node scripts/test-gateway-e2e.mjs => PASS with direct-stream timing, encrypted content preservation and first-progress telemetry; node syntax and git diff checks passed
+  red_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs failed at 管理页缺少三种 reasoning 规则模式; node scripts/test-install-restore.mjs failed at missing capacity_error_action default; Task2 node scripts/test-gateway-e2e.mjs failed with none firstChunkAtMs equal completedAtMs; Task3 node scripts/test-gateway-e2e.mjs failed because capacity pass_through still retried under legacy boolean logic
+  green_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs => PASS codex-retry-gateway e2e; node scripts/test-install-restore.mjs => PASS install-restore flow; Task2 node scripts/test-gateway-e2e.mjs => PASS with direct-stream timing, encrypted content preservation and first-progress telemetry; Task3 node scripts/test-gateway-e2e.mjs => PASS with Capacity/429 four-action matrices, Retry-After and shared budget, plus install-restore PASS; node syntax and git diff checks passed
   production_edit_before_red: forbidden
   test_files:
     - scripts/test-gateway-e2e.mjs

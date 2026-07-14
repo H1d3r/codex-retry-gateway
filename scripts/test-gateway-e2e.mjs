@@ -2867,6 +2867,7 @@ function startFakeUpstream(port) {
   const failBeforeResponseCounts = new Map();
   const reasoningSequenceCounts = new Map();
   const capacityErrorCounts = new Map();
+  const http429Counts = new Map();
   const identityProbeCounts = new Map();
   const probeRequests = [];
   const responseRequests = [];
@@ -2959,11 +2960,17 @@ function startFakeUpstream(port) {
           res.socket?.destroy();
           return;
         }
-        if (parsed.test_capacity_error_once) {
+        const capacityErrorAttempts = parsed.test_capacity_error_attempts ??
+          (parsed.test_capacity_error_once ? 1 : 0);
+        if (capacityErrorAttempts > 0) {
           const capacityKey = `${req.url}:capacity:${parsed.test_sequence_key || "default"}`;
           const capacityCount = (capacityErrorCounts.get(capacityKey) || 0) + 1;
           capacityErrorCounts.set(capacityKey, capacityCount);
-          if (capacityCount === 1) {
+          if (capacityCount <= capacityErrorAttempts) {
+            const capacityHeaders = { "x-upstream-test": "responses-capacity-error" };
+            if (parsed.test_retry_after !== undefined) {
+              capacityHeaders["retry-after"] = `${parsed.test_retry_after}`;
+            }
             createJsonResponse(
               res,
               parsed.test_capacity_error_status ?? 429,
@@ -2975,7 +2982,7 @@ function startFakeUpstream(port) {
                     "Selected model is at capacity. Please try a different model.",
                 },
               },
-              { "x-upstream-test": "responses-capacity-error" },
+              capacityHeaders,
             );
             return;
           }
@@ -3261,6 +3268,30 @@ function startFakeUpstream(port) {
             { "x-upstream-test": "responses-probe-knowledge-anchor-2" },
           );
           return;
+        }
+        if (parsed.test_http_429_attempts > 0) {
+          const rateLimitKey = `${req.url}:http-429:${parsed.test_sequence_key || "default"}`;
+          const rateLimitCount = (http429Counts.get(rateLimitKey) || 0) + 1;
+          http429Counts.set(rateLimitKey, rateLimitCount);
+          if (rateLimitCount <= parsed.test_http_429_attempts) {
+            const rateLimitHeaders = { "x-upstream-test": "responses-http-429" };
+            if (parsed.test_retry_after !== undefined) {
+              rateLimitHeaders["retry-after"] = `${parsed.test_retry_after}`;
+            }
+            createJsonResponse(
+              res,
+              429,
+              parsed.test_http_429_payload ?? {
+                error: {
+                  type: "rate_limit_error",
+                  code: "rate_limit_exceeded",
+                  message: "Too Many Requests",
+                },
+              },
+              rateLimitHeaders,
+            );
+            return;
+          }
         }
         if (parsed.test_error_payload) {
           createJsonResponse(
@@ -6059,6 +6090,249 @@ async function run() {
       ).length === 1,
       "上游真实 429 不应触发规则内部重试",
     );
+
+    const runUpstreamPolicyCase = async ({
+      key,
+      capacityAction,
+      http429Action,
+      requestBody,
+      expectedStatus,
+      expectedRequests,
+      expectedCode = null,
+      expectedReason = null,
+    }) => {
+      const configResponse = await fetch(
+        `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 2,
+            capacity_error_action: capacityAction,
+            http_429_action: http429Action,
+          }),
+        },
+      );
+      assert(configResponse.status === 200, `${key} 配置失败: ${configResponse.status}`);
+      const response = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ test_sequence_key: key, ...requestBody }),
+      });
+      const responseBody = await response.json();
+      assert(response.status === expectedStatus, `${key} 状态错误: ${response.status}`);
+      assert(
+        upstream.responseRequests.filter((entry) => entry.body?.test_sequence_key === key).length ===
+          expectedRequests,
+        `${key} 上游请求次数错误`,
+      );
+      if (expectedCode) {
+        assert(responseBody?.error?.code === expectedCode, `${key} 502 code 错误: ${JSON.stringify(responseBody)}`);
+      } else {
+        assert(responseBody?.error?.message, `${key} 应原样透传上游错误体`);
+      }
+      assert(
+        response.headers.get("x-codex-retry-gateway-reason") === expectedReason,
+        `${key} reason header 错误: ${response.headers.get("x-codex-retry-gateway-reason")}`,
+      );
+    };
+
+    for (const policyCase of [
+      {
+        key: "capacity-action-pass-through",
+        capacityAction: "pass_through",
+        http429Action: "return_502",
+        expectedStatus: 429,
+        expectedRequests: 1,
+        expectedReason: null,
+      },
+      {
+        key: "capacity-action-return-502",
+        capacityAction: "return_502",
+        http429Action: "pass_through",
+        expectedStatus: 502,
+        expectedRequests: 1,
+        expectedCode: "upstream_capacity_policy_triggered",
+        expectedReason: "upstream-capacity",
+      },
+      {
+        key: "capacity-action-retry-then-pass-through",
+        capacityAction: "retry_then_pass_through",
+        http429Action: "return_502",
+        expectedStatus: 429,
+        expectedRequests: 3,
+        expectedReason: null,
+      },
+      {
+        key: "capacity-action-retry-then-502",
+        capacityAction: "retry_then_502",
+        http429Action: "pass_through",
+        expectedStatus: 502,
+        expectedRequests: 3,
+        expectedCode: "upstream_capacity_policy_triggered",
+        expectedReason: "upstream-capacity",
+      },
+    ]) {
+      await runUpstreamPolicyCase({
+        ...policyCase,
+        requestBody: {
+          test_capacity_error_attempts: 10,
+          test_retry_after: "0",
+        },
+      });
+    }
+
+    for (const policyCase of [
+      {
+        key: "http-429-action-pass-through",
+        capacityAction: "return_502",
+        http429Action: "pass_through",
+        expectedStatus: 429,
+        expectedRequests: 1,
+        expectedReason: null,
+      },
+      {
+        key: "http-429-action-return-502",
+        capacityAction: "pass_through",
+        http429Action: "return_502",
+        expectedStatus: 502,
+        expectedRequests: 1,
+        expectedCode: "upstream_rate_limit_policy_triggered",
+        expectedReason: "upstream-rate-limited",
+      },
+      {
+        key: "http-429-action-retry-then-pass-through",
+        capacityAction: "return_502",
+        http429Action: "retry_then_pass_through",
+        expectedStatus: 429,
+        expectedRequests: 3,
+        expectedReason: null,
+      },
+      {
+        key: "http-429-action-retry-then-502",
+        capacityAction: "pass_through",
+        http429Action: "retry_then_502",
+        expectedStatus: 502,
+        expectedRequests: 3,
+        expectedCode: "upstream_rate_limit_policy_triggered",
+        expectedReason: "upstream-rate-limited",
+      },
+    ]) {
+      await runUpstreamPolicyCase({
+        ...policyCase,
+        requestBody: {
+          test_http_429_attempts: 10,
+          test_retry_after: "0",
+        },
+      });
+    }
+
+    const retryAfterDateKey = "http-429-retry-after-date";
+    const retryAfterDateConfig = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          guard_retry_attempts: 1,
+          http_429_action: "retry_then_502",
+        }),
+      },
+    );
+    assert(retryAfterDateConfig.status === 200, "Retry-After date 配置失败");
+    const retryAfterDateStartedAt = Date.now();
+    const retryAfterDateResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: retryAfterDateKey,
+          test_http_429_attempts: 1,
+          test_retry_after: new Date(Date.now() + 2500).toUTCString(),
+        }),
+      },
+    );
+    assert(retryAfterDateResponse.status === 200, `Retry-After date 后未恢复: ${retryAfterDateResponse.status}`);
+    assert(Date.now() - retryAfterDateStartedAt >= 1000, "HTTP-date Retry-After 未被遵守");
+
+    const excessiveRetryAfterKey = "http-429-excessive-retry-after";
+    const excessiveRetryAfterResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: excessiveRetryAfterKey,
+          test_http_429_attempts: 10,
+          test_retry_after: "61",
+        }),
+      },
+    );
+    assert(
+      excessiveRetryAfterResponse.status === 502 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === excessiveRetryAfterKey,
+        ).length === 1,
+      "超过 60 秒的 Retry-After 不应继续内部重试",
+    );
+
+    const sharedBudgetConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          reasoning_match_mode: "formula_518n_minus_2",
+          guard_retry_attempts: 1,
+          capacity_error_action: "pass_through",
+          http_429_action: "retry_then_502",
+        }),
+      },
+    );
+    assert(sharedBudgetConfigResponse.status === 200, "共享预算配置失败");
+    const sharedBudgetKey = "http-429-then-reasoning-516-shared-budget";
+    const sharedBudgetResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: sharedBudgetKey,
+          test_http_429_attempts: 1,
+          test_retry_after: "0",
+          test_reasoning_tokens: 516,
+        }),
+      },
+    );
+    const sharedBudgetBody = await sharedBudgetResponse.json();
+    assert(
+      sharedBudgetResponse.status === 502 &&
+        sharedBudgetBody?.error?.code === "reasoning_guard_triggered" &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === sharedBudgetKey,
+        ).length === 2,
+      "HTTP 429 与 reasoning 未共用 guard_retry_attempts",
+    );
+
+    const restoreLegacyCapacityConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          reasoning_match_mode: "manual",
+          guard_retry_attempts: 1,
+          retry_upstream_capacity_errors: true,
+          http_429_action: "pass_through",
+        }),
+      },
+    );
+    assert(restoreLegacyCapacityConfigResponse.status === 200, "恢复旧 Capacity 配置失败");
 
     const capacityRetryKey = "upstream-capacity-then-ok";
     const capacityRetryResponse = await fetch(
