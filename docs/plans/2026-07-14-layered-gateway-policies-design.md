@@ -181,12 +181,12 @@ timeout > capacity > generic HTTP 429 > reasoning rule > pass through
 ## 7. 429 等待策略
 
 1. 同时支持 `Retry-After: <seconds>` 和 HTTP-date。
-2. 有合法 `Retry-After` 时按该值等待。
+2. 有合法 `Retry-After` 时按该值等待；只要实际 HTTP 状态是 429 就适用，包括被 Capacity 特征优先分类的响应。
 3. 没有合法 header 时使用 full-jitter 退避：`0..min(30000, 1000 * 2^retry_attempt_index)` 毫秒。
 4. `Retry-After` 单次等待上限固定为 60 秒，不增加新的管理页配置。
 5. `Retry-After` 超过 60 秒或超过请求剩余总 deadline 时，不提前轰击上游，直接执行当前动作的耗尽分支。
 6. 所有等待必须可被客户端断开、总超时或 gateway 关闭中止。
-7. 已开始等待后若总 deadline 先到，timeout 优先；当前 attempt 直接返回 `upstream-total-timeout` 502，不先记录为策略重试，也不重复创建样本。
+7. 已开始等待后若总 deadline 先到，timeout 优先；当前 attempt 直接返回 `upstream-total-timeout` 502，不先记录为策略重试，也不重复创建样本。等待 timer 恢复后必须按当前墙钟再次检查 deadline，不能只依赖 timer 回调顺序。
 8. 等待中客户端断开时，当前 attempt 记录 `client_disconnected`，不得继续重试或伪造客户端状态。
 
 ## 8. 流式响应约束
@@ -219,6 +219,14 @@ timeout > capacity > generic HTTP 429 > reasoning rule > pass through
 
 `endpoints` 是 reasoning、Capacity、HTTP 429 与 latency guard 的共同管理边界。列表外路径完整旁路四类策略，只做原始代理与旁路样本采集，不允许出现 latency 生效而 Capacity/429 不生效的半旁路。
 
+### 8.5 SSE framing 与检查上限
+
+- SSE 空行边界按 LF、CR、CRLF 及其合法混合组合解析，不能只识别 `\n\n` 与 `\r\n\r\n`。
+- `stream:true` 的非 JSON 响应即使 Content-Type 缺失或误标，也对 `data: {json}` 做有界 SSE 内容识别；真正的普通文本首个非空 chunk 仍按首 progress 处理。
+- 单个 SSE 事件的 parser 状态使用 1 MiB 字节硬上限，拼接前检查剩余预算；超限后的 discard 状态只保留识别下一个事件边界所需的最多 3 字节尾部。
+- `intercept_rule_mode=none` 或 `intercept_streaming=false` 时，超大事件不改变既有透传/observe-only 语义，但样本必须记录检查失败。
+- reasoning 流式严格保护开启且尚未向客户端写回时，无法完整检查的超大 SSE 事件必须返回专用 502，不能按未命中静默透传。
+
 ## 9. 502 契约
 
 新策略返回 502 时使用稳定响应头：
@@ -228,11 +236,12 @@ x-codex-retry-gateway-reason: upstream-capacity
 x-codex-retry-gateway-reason: upstream-rate-limited
 x-codex-retry-gateway-reason: upstream-first-progress-timeout
 x-codex-retry-gateway-reason: upstream-total-timeout
+x-codex-retry-gateway-reason: response-inspection-limit-exceeded
 ```
 
 JSON 错误体包含：
 
-- `error.type=codex_retry_gateway_upstream_policy_error`
+- 上游策略/timeout 使用 `error.type=codex_retry_gateway_upstream_policy_error`；SSE 检查上限使用 `error.type=codex_retry_gateway_error`。
 - 稳定 `error.code`
 - 人类可读 message。
 - `retry_attempt_index`。
@@ -241,6 +250,8 @@ JSON 错误体包含：
 - timeout 场景的 `timeout_limit_ms` 与 `timeout_phase`。
 
 不得把上游鉴权 header、token、完整请求体或 encrypted reasoning 写入错误体。
+
+SSE 检查上限响应固定使用 `error.code=response_inspection_limit_exceeded`，并返回 `inspection_limit_bytes`；对应样本使用 `final_action=response_inspection_limit_exceeded`、`blocked_by_gateway=true` 和同码 `failure_summary`。
 
 ## 10. 采集与统计
 

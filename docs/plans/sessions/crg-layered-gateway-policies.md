@@ -213,6 +213,8 @@ tdd:
   red_required: true
   red_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs failed at 管理页缺少三种 reasoning 规则模式; node scripts/test-install-restore.mjs failed at missing capacity_error_action default; Task2 node scripts/test-gateway-e2e.mjs failed with none firstChunkAtMs equal completedAtMs; Task3 node scripts/test-gateway-e2e.mjs failed because capacity pass_through still retried under legacy boolean logic; Task4 node scripts/test-gateway-e2e.mjs failed for missing first-progress enforcement, policy counters, non-stream client timing, and 429 Retry-After first-progress timer isolation; Task5 node scripts/test-install-restore.mjs、test-launch-ui.mjs、test-launch-ui-unix.mjs 分别因首装缺少 capacity_error_action 而按预期失败; reviewer-fix 2026-07-14 gateway E2E failed with Retry-After deadline client timeout/no response and pre-progress buffer hard-limit injected 502; reviewer-round-2 2026-07-15 upload disconnect reproduced request_rejected+413, reordered nested config rewrote files/restarted PID, launch E2E reproduced exited-process PID-file cleanup failure
   green_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs => PASS codex-retry-gateway e2e; node scripts/test-install-restore.mjs => PASS install-restore flow; Task2 node scripts/test-gateway-e2e.mjs => PASS with direct-stream timing, encrypted content preservation and first-progress telemetry; Task3 node scripts/test-gateway-e2e.mjs => PASS with Capacity/429 four-action matrices, Retry-After and shared budget; Task4 node scripts/test-gateway-e2e.mjs => PASS with first-progress/total deadlines, after-forward disconnect, schema v3 metrics and JSON/CSV telemetry, plus install-restore PASS; Task5 node scripts/test-install-restore.mjs、test-launch-ui.mjs、test-launch-ui-unix.mjs => PASS，合法 none/动作/latency 配置保持字节、mtime、PID 不变，PowerShell AST 与 Node syntax 通过; reviewer-fix 2026-07-14 bundled Node gateway E2E => PASS with deadline wait single-sample 502 and strict pre-progress buffer limit; reviewer-round-2 2026-07-15 four sequential E2E PASS with bounded SSE framing, non-SSE progress, upload/Retry-After/observe-only disconnect accounting, canonical config comparison and HasExited cleanup
+  reviewer_round_2_red_evidence_ref: 2026-07-15 gateway E2E failed sequentially at Capacity 429 positive Retry-After, late retry timer after total deadline, parser state exceeding 1MiB before discard, and observe-only timeout losing matched_current_rule; mislabeled SSE, mixed newline and oversized protected-event tests were present behind those RED gates
+  reviewer_round_2_green_evidence_ref: 2026-07-15 Codex bundled Node four sequential E2E suites PASS with HTTP-status-based Retry-After, wall-clock deadline recheck, byte-bounded mixed-newline SSE framing, content sniffing, dedicated oversized-event 502 and preserved observe-only timeout match
   production_edit_before_red: forbidden
   test_files:
     - scripts/test-gateway-e2e.mjs
@@ -232,8 +234,8 @@ agent_lifecycle:
   reclaim_before_spawn: required
   completion_status:
     completed:
-      - 019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => REQUEST_CHANGES
-      - 019f6040-69fe-72b0-89c9-d24b9e12b6bc => REQUEST_CHANGES
+      - 019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
+      - 019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
     idle: []
     timeout: []
     failed: []
@@ -343,8 +345,8 @@ post_implementation_review:
   required_agent_count: 2
   same_question_ref: session-plan:crg-layered-gateway-policies#agent-lifecycle
   reviewer_output_refs:
-    - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => REQUEST_CHANGES
-    - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => REQUEST_CHANGES
+    - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
+    - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
   reject_if_hits:
     - retry-or-502-after-downstream-forwarding
     - total-deadline-reset-across-attempts
@@ -362,7 +364,13 @@ post_implementation_review:
     - canonical object-key comparison prevents valid config rewrite/restart
     - observe-only disconnect preserves matched_current_rule
     - exited Windows process objects use HasExited before PID cleanup
-  completion_status: fixes-verified-awaiting-rereview
+    - Capacity HTTP 429 honors Retry-After after priority classification
+    - Retry-After completion rechecks total deadline against wall clock
+    - byte-bounded SSE framing supports mixed LF/CR/CRLF boundaries
+    - mislabeled JSON SSE remains inspectable without breaking plain-text progress
+    - oversized protected SSE returns response_inspection_limit_exceeded instead of bypassing rules
+    - observe-only timeout preserves matched_current_rule
+  completion_status: round-2-fixes-verified-awaiting-rereview
 post_implementation_review_policy:
   review_phase: post-implementation
   freshness_rule: review-after-last-mutation

@@ -83,6 +83,7 @@ const FIRST_PROGRESS_ACTIONS = new Set([
 const MAX_RETRY_AFTER_MS = 60 * 1000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const PRE_PROGRESS_BUFFER_LIMIT_BYTES = 1024 * 1024;
+const SSE_DISCARD_SCAN_CHUNK_BYTES = 64 * 1024;
 const REASONING_ANALYSIS_CORE_FIELDS = [
   "reasoning_tokens",
   "final_answer_only",
@@ -1047,21 +1048,35 @@ function buildGatewayErrorBody(message) {
   });
 }
 
-function findSseEventBoundary(value) {
-  const lfIndex = value.indexOf("\n\n");
-  const crlfIndex = value.indexOf("\r\n\r\n");
-  if (lfIndex < 0 && crlfIndex < 0) {
-    return null;
+function getSseLineEndingLength(buffer, index) {
+  const byte = buffer[index];
+  if (byte === 0x0a) {
+    return 1;
   }
-  if (crlfIndex >= 0 && (lfIndex < 0 || crlfIndex < lfIndex)) {
-    return { index: crlfIndex, length: 4 };
+  if (byte !== 0x0d || index + 1 >= buffer.length) {
+    return 0;
   }
-  return { index: lfIndex, length: 2 };
+  return buffer[index + 1] === 0x0a ? 2 : 1;
+}
+
+function findSseEventBoundary(buffer) {
+  for (let index = 0; index < buffer.length; index += 1) {
+    const firstLength = getSseLineEndingLength(buffer, index);
+    if (firstLength === 0) {
+      continue;
+    }
+    const secondLength = getSseLineEndingLength(buffer, index + firstLength);
+    if (secondLength > 0) {
+      return { index, length: firstLength + secondLength };
+    }
+  }
+  return null;
 }
 
 function parseSseBlockPayload(block) {
   const lines = block
-    .split(/\r?\n/)
+    .toString("utf8")
+    .split(/\r\n|\r|\n/)
     .map((line) => line.trimEnd())
     .filter(Boolean);
   const dataLines = lines
@@ -1081,41 +1096,92 @@ function parseSseBlockPayload(block) {
   }
 }
 
-function parseSsePayloads(state, chunk) {
-  let decoded = state.decoder.decode(chunk, { stream: true });
-  const payloads = [];
+function bufferLooksLikeJsonSse(buffer) {
+  const preview = buffer
+    .subarray(0, Math.min(buffer.length, 4096))
+    .toString("utf8");
+  return /(?:^|\r\n|\r|\n)data:\s*(?:\{|\[DONE\])/.test(preview);
+}
 
-  if (state.discarding_oversized_event) {
-    const discardBuffer = `${state.buffer || ""}${decoded}`;
-    const discardBoundary = findSseEventBoundary(discardBuffer);
-    if (!discardBoundary) {
-      state.buffer = discardBuffer.slice(-3);
-      return payloads;
+function beginDiscardingOversizedSseEvent(state) {
+  state.discarding_oversized_event = true;
+  state.oversized_event_count += 1;
+  state.buffer = Buffer.from(state.buffer.subarray(Math.max(0, state.buffer.length - 3)));
+}
+
+function consumeDiscardedSseBytes(state, input, startOffset) {
+  let offset = startOffset;
+  while (offset < input.length) {
+    const endOffset = Math.min(input.length, offset + SSE_DISCARD_SCAN_CHUNK_BYTES);
+    const piece = input.subarray(offset, endOffset);
+    const prefixLength = state.buffer.length;
+    const combined = prefixLength > 0
+      ? Buffer.concat([state.buffer, piece], prefixLength + piece.length)
+      : piece;
+    const boundary = findSseEventBoundary(combined);
+    if (boundary) {
+      const consumedFromPiece = Math.max(
+        0,
+        boundary.index + boundary.length - prefixLength,
+      );
+      state.buffer = Buffer.alloc(0);
+      state.discarding_oversized_event = false;
+      return offset + consumedFromPiece;
     }
-    decoded = discardBuffer.slice(discardBoundary.index + discardBoundary.length);
-    state.buffer = "";
-    state.discarding_oversized_event = false;
+    state.buffer = Buffer.from(combined.subarray(Math.max(0, combined.length - 3)));
+    offset = endOffset;
   }
+  return offset;
+}
 
-  state.buffer += decoded;
+function parseSsePayloads(state, chunk) {
+  const input = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  const payloads = [];
+  let offset = 0;
+
   while (true) {
-    const boundary = findSseEventBoundary(state.buffer);
-    if (!boundary) {
-      if (Buffer.byteLength(state.buffer, "utf8") > PRE_PROGRESS_BUFFER_LIMIT_BYTES) {
-        state.discarding_oversized_event = true;
-        state.buffer = state.buffer.slice(-3);
+    if (state.discarding_oversized_event) {
+      if (offset >= input.length) {
+        break;
       }
-      break;
-    }
-    const block = state.buffer.slice(0, boundary.index);
-    state.buffer = state.buffer.slice(boundary.index + boundary.length);
-    if (Buffer.byteLength(block, "utf8") > PRE_PROGRESS_BUFFER_LIMIT_BYTES) {
+      offset = consumeDiscardedSseBytes(state, input, offset);
       continue;
     }
-    const payload = parseSseBlockPayload(block);
-    if (payload) {
-      payloads.push(payload);
+
+    const boundary = findSseEventBoundary(state.buffer);
+    if (boundary) {
+      const block = state.buffer.subarray(0, boundary.index);
+      state.buffer = Buffer.from(state.buffer.subarray(boundary.index + boundary.length));
+      const payload = parseSseBlockPayload(block);
+      if (payload) {
+        state.sse_like = true;
+        payloads.push(payload);
+      }
+      continue;
     }
+
+    if (state.buffer.length >= PRE_PROGRESS_BUFFER_LIMIT_BYTES) {
+      beginDiscardingOversizedSseEvent(state);
+      continue;
+    }
+    if (offset >= input.length) {
+      break;
+    }
+
+    const remainingBytes = PRE_PROGRESS_BUFFER_LIMIT_BYTES - state.buffer.length;
+    const takeBytes = Math.min(
+      remainingBytes,
+      SSE_DISCARD_SCAN_CHUNK_BYTES,
+      input.length - offset,
+    );
+    const piece = input.subarray(offset, offset + takeBytes);
+    state.buffer = state.buffer.length > 0
+      ? Buffer.concat([state.buffer, piece], state.buffer.length + piece.length)
+      : Buffer.from(piece);
+    if (!state.sse_like && bufferLooksLikeJsonSse(state.buffer)) {
+      state.sse_like = true;
+    }
+    offset += takeBytes;
   }
   return payloads;
 }
@@ -1672,7 +1738,7 @@ function parseRetryAfterMs(rawValue, nowMs = Date.now()) {
 }
 
 function resolveUpstreamPolicyRetryDelay(policy, upstreamResponse, attemptIndex) {
-  if (policy?.trigger !== "http_429") {
+  if (upstreamResponse?.status !== 429) {
     return {
       retryAfterRaw: null,
       retryAfterMs: null,
@@ -1709,6 +1775,23 @@ function buildUpstreamPolicyErrorBody(policy, requestTracking) {
     retry_attempt_index: requestTracking?.guardRetryAttemptsUsed ?? 0,
     retry_attempts_used: requestTracking?.guardRetryAttemptsUsed ?? 0,
     retry_attempts_remaining: requestTracking?.guardRetryRemaining ?? 0,
+  });
+}
+
+function createResponseInspectionLimitError(limitBytes) {
+  const error = new Error(`SSE event exceeds inspection limit: ${limitBytes} bytes`);
+  error.code = "response_inspection_limit_exceeded";
+  return error;
+}
+
+function buildResponseInspectionLimitBody(pathname, limitBytes) {
+  return JSON.stringify({
+    error: {
+      message: `codex retry gateway could not safely inspect an oversized SSE event on ${pathname}`,
+      type: "codex_retry_gateway_error",
+      code: "response_inspection_limit_exceeded",
+      inspection_limit_bytes: limitBytes,
+    },
   });
 }
 
@@ -1803,6 +1886,18 @@ function createAttemptLatencyGuard(config, requestTracking, abortController) {
     },
     get timeoutLimitMs() {
       return timeoutLimitMs;
+    },
+    expireTotalDeadlineIfNeeded() {
+      if (
+        !timeoutPhase &&
+        latencyConfig.enabled &&
+        latencyConfig.total_timeout_ms > 0 &&
+        Number.isFinite(requestTracking?.total_deadline_at_ms) &&
+        Date.now() >= requestTracking.total_deadline_at_ms
+      ) {
+        triggerTimeout("total", latencyConfig.total_timeout_ms);
+      }
+      return timeoutPhase === "total";
     },
     markFirstProgress() {
       if (firstProgressTimer) {
@@ -1908,7 +2003,7 @@ function handleAttemptLatencyTimeout({
       modelContext,
       finalAction: "timeout_disconnected_after_forward",
       clientHttpStatus: null,
-      matchedCurrentRule: false,
+      matchedCurrentRule: Boolean(reasoningSample.matched_current_rule),
       blockedByGateway: true,
       failureSummary,
     });
@@ -1925,7 +2020,7 @@ function handleAttemptLatencyTimeout({
       modelContext,
       finalAction: "first_progress_timeout_internal_retry",
       clientHttpStatus: null,
-      matchedCurrentRule: false,
+      matchedCurrentRule: Boolean(reasoningSample.matched_current_rule),
       blockedByGateway: true,
       failureSummary,
     });
@@ -1951,7 +2046,7 @@ function handleAttemptLatencyTimeout({
     modelContext,
     finalAction: phase === "first_progress" ? "first_progress_timeout_returned_502" : "total_timeout_returned_502",
     clientHttpStatus: 502,
-    matchedCurrentRule: false,
+    matchedCurrentRule: Boolean(reasoningSample.matched_current_rule),
     blockedByGateway: true,
     failureSummary,
   });
@@ -4351,6 +4446,9 @@ function recordInspectedResponseForSample(
   matched,
   streamKind = null,
 ) {
+  if (matched) {
+    sample.matched_current_rule = true;
+  }
   if (inspectedReasoningSamples.has(sample)) {
     return false;
   }
@@ -10953,6 +11051,7 @@ async function fetchUpstreamWithRetry(upstreamUrl, init, logger) {
 }
 
 function inspectSseChunk(state, chunk) {
+  const oversizedEventCountBefore = state.oversized_event_count;
   const payloads = parseSsePayloads(state, chunk);
   let reasoning = null;
   for (const payload of payloads) {
@@ -10961,7 +11060,11 @@ function inspectSseChunk(state, chunk) {
       reasoning = extracted;
     }
   }
-  return { reasoning, payloads };
+  return {
+    reasoning,
+    payloads,
+    oversizedEvent: state.oversized_event_count > oversizedEventCountBefore,
+  };
 }
 
 async function handleNonStreaming({
@@ -11231,8 +11334,10 @@ async function handleStreaming({
   const parseAsSse = isSseContentType(upstreamResponse.headers.get("content-type"));
   const reader = upstreamResponse.body.getReader();
   const sseState = {
-    decoder: new TextDecoder("utf8"),
-    buffer: "",
+    buffer: Buffer.alloc(0),
+    discarding_oversized_event: false,
+    oversized_event_count: 0,
+    sse_like: parseAsSse,
   };
 
   let wroteAnyChunk = false;
@@ -11517,11 +11622,15 @@ async function handleStreaming({
     const chunkBuffer = Buffer.from(value);
     markReasoningSampleFirstChunk(reasoningSample, nowMs);
     markReasoningSampleFinalChunk(reasoningSample, nowMs);
-    const inspectedChunk = parseAsSse
-      ? inspectSseChunk(sseState, value)
-      : { reasoning: null, payloads: [] };
-    const { reasoning, payloads } = inspectedChunk;
-    let chunkHasMeaningfulProgress = !parseAsSse && chunkBuffer.length > 0;
+    const inspectedChunk = inspectSseChunk(sseState, value);
+    const { reasoning, payloads, oversizedEvent } = inspectedChunk;
+    const inspectionLimitError = oversizedEvent && sseState.sse_like
+      ? createResponseInspectionLimitError(PRE_PROGRESS_BUFFER_LIMIT_BYTES)
+      : null;
+    if (inspectionLimitError) {
+      reasoningSample.failure_summary = buildFailureSummary(inspectionLimitError);
+    }
+    let chunkHasMeaningfulProgress = !sseState.sse_like && chunkBuffer.length > 0;
     if (chunkHasMeaningfulProgress) {
       markReasoningSampleFirstContent(reasoningSample, nowMs);
       markReasoningSampleFirstProgress(reasoningSample, nowMs);
@@ -11660,6 +11769,48 @@ async function handleStreaming({
           blockedByGateway: true,
         });
       }
+      return { handled: true };
+    }
+
+    if (
+      inspectionLimitError &&
+      strict502Mode &&
+      config.intercept_streaming !== false
+    ) {
+      if (!inspectedRecorded) {
+        recordInspectedResponseForSample(
+          monitor,
+          reasoningSample,
+          observedReasoning,
+          false,
+          "stream",
+        );
+        inspectedRecorded = true;
+      }
+      setRequestTrackingOutcome(requestTracking, "inspected");
+      recordBlockedResponse(monitor, "stream");
+      abortController.abort();
+      reader.cancel().catch(() => {});
+      finalizeModelInsights(monitor, pathname, modelContext);
+      res.writeHead(502, {
+        "content-type": "application/json; charset=utf-8",
+        "x-codex-retry-gateway-reason": "response-inspection-limit-exceeded",
+      });
+      markReasoningSampleClientHeadersSent(reasoningSample);
+      markReasoningSampleClientWrite(reasoningSample);
+      res.end(
+        buildResponseInspectionLimitBody(
+          pathname,
+          PRE_PROGRESS_BUFFER_LIMIT_BYTES,
+        ),
+      );
+      finishReasoningSample({
+        finalAction: "response_inspection_limit_exceeded",
+        clientHttpStatus: 502,
+        matchedCurrentRule: false,
+        blockedByGateway: true,
+        failureSummary: buildFailureSummary(inspectionLimitError),
+      });
       return { handled: true };
     }
 
@@ -12006,6 +12157,23 @@ async function proxyRequest(runtime, req, res) {
             return;
           }
           throw new Error("upstream policy retry wait aborted");
+        }
+        if (latencyGuard.expireTotalDeadlineIfNeeded()) {
+          handleAttemptLatencyTimeout({
+            runtime,
+            config,
+            monitor: runtime.monitor,
+            pathname,
+            requestTracking,
+            modelContext,
+            reasoningSample,
+            structureAccumulator,
+            res,
+            latencyGuard,
+            upstreamStatus: reasoningSample.upstream_http_status,
+            errorPayload: handlerResult.errorPayload,
+          });
+          return;
         }
         const upstreamPolicy = handlerResult.upstreamPolicy;
         if (config.log_match) {

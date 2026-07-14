@@ -129,12 +129,13 @@ function createTextResponse(res, statusCode, body, contentType, extraHeaders = {
   res.end(`${body}`);
 }
 
-function createSseResponse(res, chunks, intervalMs = 20) {
+function createSseResponse(res, chunks, intervalMs = 20, extraHeaders = {}) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache",
     connection: "keep-alive",
     "x-upstream-test": "sse",
+    ...extraHeaders,
   });
 
   let index = 0;
@@ -218,12 +219,19 @@ function createSseResponseWithInitialDelay(res, chunks, initialDelayMs, interval
   });
 }
 
-function createSseResponseWithPauseBeforeOutput(res, chunks, pauseMs, intervalMs = 20) {
+function createSseResponseWithPauseBeforeOutput(
+  res,
+  chunks,
+  pauseMs,
+  intervalMs = 20,
+  extraHeaders = {},
+) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache",
     connection: "keep-alive",
     "x-upstream-test": "sse-paused-before-output",
+    ...extraHeaders,
   });
   let index = 0;
   let timer = null;
@@ -706,22 +714,24 @@ function buildResponsesStreamChunks(parsed, reasoning, sequenceCount = 0) {
     chunks.push(`data: ${JSON.stringify(deltaPayload)}\n\n`);
   });
 
-  chunks.push(
-    `data: ${JSON.stringify({
-      type: "response.completed",
-      system_fingerprint: finalFingerprint,
-      service_tier: serviceTier,
-      response: {
-        id: finalResponseId,
-        model: finalModel,
-        usage: {
-          output_tokens_details: {
-            reasoning_tokens: reasoning,
-          },
+  const completedPayload = {
+    type: "response.completed",
+    system_fingerprint: finalFingerprint,
+    service_tier: serviceTier,
+    response: {
+      id: finalResponseId,
+      model: finalModel,
+      usage: {
+        output_tokens_details: {
+          reasoning_tokens: reasoning,
         },
       },
-    })}\n\n`,
-  );
+    },
+  };
+  if (Number.isInteger(parsed.test_stream_completed_padding_bytes)) {
+    completedPayload.response.test_padding = "x".repeat(parsed.test_stream_completed_padding_bytes);
+  }
+  chunks.push(`data: ${JSON.stringify(completedPayload)}\n\n`);
   chunks.push("data: [DONE]\n\n");
   return chunks;
 }
@@ -3538,7 +3548,12 @@ function startFakeUpstream(port) {
             finishJsonResponse();
             return;
           }
-          const streamChunks = buildResponsesStreamChunks(parsed, reasoning, sequenceCount);
+          let streamChunks = buildResponsesStreamChunks(parsed, reasoning, sequenceCount);
+          if (typeof parsed.test_stream_event_separator === "string") {
+            streamChunks = streamChunks.map((chunk) =>
+              chunk.replaceAll("\n\n", parsed.test_stream_event_separator),
+            );
+          }
           const initialDelayMs = selectStreamSequenceValue(
             parsed,
             "test_stream_initial_delay_ms_sequence",
@@ -3557,6 +3572,9 @@ function startFakeUpstream(port) {
               streamChunks,
               parsed.test_stream_pause_before_output_ms,
               parsed.test_stream_chunk_delay_ms ?? 20,
+              parsed.test_stream_response_content_type
+                ? { "content-type": parsed.test_stream_response_content_type }
+                : {},
             );
           } else if (parsed.test_stream_pause_after_empty_commentary_ms) {
             createSseResponseWithPauseAfterOutput(
@@ -3586,6 +3604,9 @@ function startFakeUpstream(port) {
               res,
               streamChunks,
               parsed.test_stream_chunk_delay_ms ?? 20,
+              parsed.test_stream_response_content_type
+                ? { "content-type": parsed.test_stream_response_content_type }
+                : {},
             );
           }
           return;
@@ -6579,6 +6600,43 @@ async function run() {
     assert(retryAfterDateResponse.status === 200, `Retry-After date 后未恢复: ${retryAfterDateResponse.status}`);
     assert(Date.now() - retryAfterDateStartedAt >= 1000, "HTTP-date Retry-After 未被遵守");
 
+    const capacityRetryAfterConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          guard_retry_attempts: 1,
+          capacity_error_action: "retry_then_502",
+          http_429_action: "retry_then_502",
+        }),
+      },
+    );
+    assert(capacityRetryAfterConfigResponse.status === 200, "Capacity Retry-After 配置失败");
+    const capacityRetryAfterKey = "capacity-429-positive-retry-after";
+    const capacityRetryAfterStartedAt = Date.now();
+    const capacityRetryAfterResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: capacityRetryAfterKey,
+          test_capacity_error_attempts: 1,
+          test_retry_after: "0.15",
+        }),
+      },
+    );
+    assert(
+      capacityRetryAfterResponse.status === 200 &&
+        Date.now() - capacityRetryAfterStartedAt >= 100 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === capacityRetryAfterKey,
+        ).length === 2,
+      "HTTP 429 Capacity 响应也必须遵守正值 Retry-After",
+    );
+
     const excessiveRetryAfterKey = "http-429-excessive-retry-after";
     const excessiveRetryAfterResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
@@ -6803,6 +6861,24 @@ async function run() {
     assert(
       lifecycleTimeoutResponse.status === 502,
       "仅收到 response.created/in_progress 不应结束首 progress 计时",
+    );
+
+    const mislabeledLifecycleTimeoutKey = "latency-mislabeled-sse-lifecycle-is-not-progress";
+    const mislabeledLifecycleTimeoutResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: mislabeledLifecycleTimeoutKey,
+        test_reasoning_tokens: 128,
+        test_include_stream_lifecycle: true,
+        test_stream_pause_before_output_ms: 200,
+        test_stream_chunk_delay_ms: 10,
+        test_stream_response_content_type: "text/plain; charset=utf-8",
+      },
+    );
+    assert(
+      mislabeledLifecycleTimeoutResponse.status === 502,
+      "误标 Content-Type 的 SSE lifecycle 也不应结束首 progress 计时",
     );
 
     await configureLatencyGuard({ firstProgressTimeoutMs: 500, totalTimeoutMs: 1000 });
@@ -7041,11 +7117,20 @@ async function run() {
       [
         "const originalSetTimeout = global.setTimeout;",
         "let acceleratedTotalDeadline = false;",
+        "let stalledRetryDelay = false;",
         "global.setTimeout = function patchedSetTimeout(callback, delay, ...args) {",
         "  const numericDelay = Number(delay);",
         "  if (!acceleratedTotalDeadline && numericDelay >= 600 && numericDelay <= 731) {",
         "    acceleratedTotalDeadline = true;",
         "    return originalSetTimeout(callback, 100, ...args);",
+        "  }",
+        "  if (!stalledRetryDelay && numericDelay === 50) {",
+        "    stalledRetryDelay = true;",
+        "    return originalSetTimeout(() => {",
+        "      const stalledUntil = Date.now() + 100;",
+        "      while (Date.now() < stalledUntil) {}",
+        "      callback(...args);",
+        "    }, delay);",
         "  }",
         "  return originalSetTimeout(callback, delay, ...args);",
         "};",
@@ -7130,6 +7215,51 @@ async function run() {
           ).length === 1,
         `Retry-After deadline 收口必须复用同一 attempt 样本且不得创建新 attempt: ${JSON.stringify(policyDeadlineSamples)}`,
       );
+
+      const lateTimerConfigResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 1,
+            http_429_action: "retry_then_502",
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 0,
+              first_progress_action: "return_502",
+              total_timeout_ms: 120,
+            },
+          }),
+        },
+      );
+      assert(lateTimerConfigResponse.status === 200, "过期 timer 顺序反例配置失败");
+      const lateTimerDeadlineKey = "latency-total-deadline-after-late-retry-timer";
+      const lateTimerDeadlineResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/responses`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            test_sequence_key: lateTimerDeadlineKey,
+            test_http_429_attempts: 1,
+            test_retry_after: "0.05",
+          }),
+          signal: AbortSignal.timeout(1500),
+        },
+      );
+      const lateTimerDeadlineBody = await lateTimerDeadlineResponse.json();
+      assert(
+        lateTimerDeadlineResponse.status === 502 &&
+          lateTimerDeadlineResponse.headers.get("x-codex-retry-gateway-reason") ===
+            "upstream-total-timeout" &&
+          lateTimerDeadlineBody?.error?.code === "upstream_total_timeout" &&
+          upstream.responseRequests.filter(
+            (entry) => entry.body?.test_sequence_key === lateTimerDeadlineKey,
+          ).length === 1,
+        "Retry-After timer 恢复时总 deadline 已过期，不得派发新 attempt",
+      );
     } finally {
       await stopGateway(policyDeadlineGateway);
     }
@@ -7159,6 +7289,14 @@ async function run() {
         "    throw new Error('SSE parser buffer exceeded hard limit before framing');",
         "  }",
         "  return Reflect.apply(originalSplit, value, [separator, ...args]);",
+        "};",
+        "const originalByteLength = Buffer.byteLength;",
+        "Buffer.byteLength = function guardedByteLength(value, ...args) {",
+        "  const length = Reflect.apply(originalByteLength, Buffer, [value, ...args]);",
+        "  if (length > 1024 * 1024 && new Error().stack.includes('parseSsePayloads')) {",
+        "    throw new Error('SSE parser state exceeded hard limit before discard');",
+        "  }",
+        "  return length;",
         "};",
         "",
       ].join("\n"),
@@ -7219,7 +7357,8 @@ async function run() {
       );
       assert(
         bufferLimitSample?.timeout_response_control_lost === true &&
-          bufferLimitSample?.response_forwarding_started === true,
+          bufferLimitSample?.response_forwarding_started === true &&
+          bufferLimitSample?.failure_summary?.code === "response_inspection_limit_exceeded",
         `触及前导缓冲上限后应记录响应控制权已交给客户端: ${JSON.stringify(bufferLimitSample)}`,
       );
     } finally {
@@ -7461,6 +7600,163 @@ async function run() {
       restoreInterceptAfterObservedDisconnectResponse.status === 200,
       "observe-only 断连用例后恢复流式拦截配置失败",
     );
+
+    const strictParserConfig = {
+      intercept_rule_mode: "reasoning_tokens",
+      reasoning_match_mode: "formula_518n_minus_2",
+      intercept_streaming: true,
+      intercept_non_streaming: true,
+      stream_action: "strict_502",
+      guard_retry_attempts: 0,
+      latency_guard: {
+        enabled: false,
+        first_progress_timeout_ms: 0,
+        first_progress_action: "return_502",
+        total_timeout_ms: 0,
+      },
+    };
+    const strictParserConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(strictParserConfig),
+      },
+    );
+    assert(strictParserConfigResponse.status === 200, "严格 SSE parser 场景配置失败");
+
+    const mislabeledSseKey = "mislabeled-sse-reasoning-516";
+    const mislabeledSseResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: mislabeledSseKey,
+        test_reasoning_tokens: 516,
+        test_stream_reasoning_in_output_chunk: true,
+        test_stream_response_content_type: "text/plain; charset=utf-8",
+      },
+    );
+    assert(
+      mislabeledSseResponse.status === 502 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === mislabeledSseKey,
+        ).length === 1,
+      `误标为 text/plain 的合法 SSE 不得绕过 516: status=${mislabeledSseResponse.status}`,
+    );
+
+    const mixedNewlineSseKey = "mixed-newline-sse-reasoning-516";
+    const mixedNewlineSseResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: mixedNewlineSseKey,
+        test_reasoning_tokens: 516,
+        test_stream_event_separator: "\n\r\n",
+      },
+    );
+    assert(
+      mixedNewlineSseResponse.status === 502,
+      `混合换行 SSE 边界不得绕过 516: status=${mixedNewlineSseResponse.status}`,
+    );
+
+    const oversizedProtectedSseKey = "oversized-protected-sse-event";
+    const oversizedProtectedSseResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: oversizedProtectedSseKey,
+        test_reasoning_tokens: 516,
+        test_stream_completed_padding_bytes: 1024 * 1024 + 64 * 1024,
+      },
+    );
+    let oversizedProtectedSseBody = null;
+    try {
+      oversizedProtectedSseBody = JSON.parse(oversizedProtectedSseResponse.text);
+    } catch {
+      oversizedProtectedSseBody = null;
+    }
+    assert(
+      oversizedProtectedSseResponse.status === 502 &&
+        oversizedProtectedSseResponse.headers.get("x-codex-retry-gateway-reason") ===
+          "response-inspection-limit-exceeded" &&
+        oversizedProtectedSseBody?.error?.code === "response_inspection_limit_exceeded",
+      `严格保护下超大 SSE 事件不得静默放行: status=${oversizedProtectedSseResponse.status} body=${oversizedProtectedSseResponse.text.slice(0, 200)}`,
+    );
+    const oversizedProtectedAnalytics = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+    ).then((response) => response.json());
+    const oversizedProtectedSample = (oversizedProtectedAnalytics.recent_samples || []).find((sample) =>
+      `${sample.request_payload_excerpt || ""}`.includes(oversizedProtectedSseKey),
+    );
+    assert(
+      oversizedProtectedSample?.final_action === "response_inspection_limit_exceeded" &&
+        oversizedProtectedSample?.blocked_by_gateway === true,
+      `超大 SSE 检查失败必须详细落盘: ${JSON.stringify(oversizedProtectedSample)}`,
+    );
+
+    const observedTimeoutConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...strictParserConfig,
+          intercept_streaming: false,
+          stream_action: "disconnect",
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 100,
+          },
+        }),
+      },
+    );
+    assert(observedTimeoutConfigResponse.status === 200, "observe-only 命中后 timeout 配置失败");
+    const observedTimeoutKey = "observed-rule-match-total-timeout";
+    const observedTimeoutResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: observedTimeoutKey,
+        test_reasoning_tokens: 516,
+        test_stream_reasoning_in_output_chunk: true,
+        test_stream_text: "observed-before-timeout",
+        test_stream_pause_after_output_ms: 350,
+      },
+    );
+    assert(
+      observedTimeoutResponse.status === 200 && observedTimeoutResponse.closedByError,
+      "observe-only 命中后总超时应在已透传状态下断开连接",
+    );
+    let observedTimeoutSample = null;
+    const observedTimeoutSampleDeadline = Date.now() + 3000;
+    while (!observedTimeoutSample && Date.now() < observedTimeoutSampleDeadline) {
+      const payload = await fetch(
+        `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      observedTimeoutSample = (payload.recent_samples || []).find((sample) =>
+        `${sample.request_payload_excerpt || ""}`.includes(observedTimeoutKey),
+      );
+      if (!observedTimeoutSample) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    assert(
+      observedTimeoutSample?.final_action === "timeout_disconnected_after_forward" &&
+        observedTimeoutSample?.matched_current_rule === true,
+      `observe-only 命中后 timeout 必须保留命中事实: ${JSON.stringify(observedTimeoutSample)}`,
+    );
+
+    const restoreStrictParserConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(strictParserConfig),
+      },
+    );
+    assert(restoreStrictParserConfigResponse.status === 200, "parser 反例后恢复严格配置失败");
     const layeredPolicyMetrics = await fetch(
       `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
     ).then((response) => response.json());

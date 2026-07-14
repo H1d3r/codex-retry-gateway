@@ -353,7 +353,9 @@ README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retr
 
 - [x] **Reviewer 修复：补齐状态机边界与对应 E2E**
 
-已按 RED/GREEN 补齐：Retry-After 等待中的总 deadline 502、客户端断连独立收口、已写响应禁止重试/502、非 JSON 流式 Capacity/429、首 progress 前断流保留前导块与响应头、空 commentary 不算 progress、endpoints 完整旁路、Node timer 最大值、非对象 latency 配置拒绝，以及严格 1 MiB 前导缓冲上限。当前状态为“修复完成、待 fresh 全量验证和原 reviewer 复审”。
+第一轮已按 RED/GREEN 补齐：Retry-After 等待中的总 deadline 502、客户端断连独立收口、已写响应禁止重试/502、非 JSON 流式 Capacity/429、首 progress 前断流保留前导块与响应头、空 commentary 不算 progress、endpoints 完整旁路、Node timer 最大值、非对象 latency 配置拒绝，以及严格 1 MiB 前导缓冲上限。
+
+第二轮 reviewer 的 7 个 Important 也已逐项 RED/GREEN：Capacity 429 遵守正值 Retry-After、等待 timer 恢复后墙钟复核总 deadline、SSE LF/CR/CRLF 混合边界、observe-only timeout 保留命中事实、误标 Content-Type 的 JSON SSE 有界识别、parser 状态拼接前执行 1 MiB 硬限制、严格保护下超大事件返回专用 `response_inspection_limit_exceeded` 502。当前状态为“修复已 fresh 验证、待原 reviewer 再复审”。
 
 - [x] **Step 2：执行完整本地验证**
 

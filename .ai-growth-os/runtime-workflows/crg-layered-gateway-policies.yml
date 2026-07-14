@@ -117,9 +117,9 @@ post_implementation_review:
   required_agent_count: 2
   same_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏 516、final-only、压缩豁免、续写与真实路由语义
   reviewer_refs:
-    - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => REQUEST_CHANGES
-    - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => REQUEST_CHANGES
-  parent_review_status: fixes-verified-awaiting-rereview
+    - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
+    - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
+  parent_review_status: round-2-fixes-verified-awaiting-rereview
   review_fix_evidence:
     - Retry-After deadline and 1MiB hard-limit RED reproduced
     - upload disconnect no longer becomes request_rejected 413
@@ -128,6 +128,11 @@ post_implementation_review:
     - timeout, Retry-After disconnect and observe-only match accounting preserve final facts
     - reordered object keys do not rewrite config or restart a healthy gateway
     - exited Windows process objects use HasExited before PID cleanup
+    - Capacity HTTP 429 honors Retry-After after Capacity priority classification
+    - retry wait completion rechecks total deadline against wall clock
+    - byte-bounded SSE framing supports mixed LF/CR/CRLF and mislabeled JSON SSE
+    - oversized protected SSE returns response_inspection_limit_exceeded instead of bypassing rules
+    - observe-only timeout preserves matched_current_rule
     - 2026-07-15 four sequential bundled-Node E2E suites PASS after latest source mutation
     - 2026-07-15 JS syntax, PowerShell AST, git diff check and temporary-process audit PASS
 git_progress_checkpoints:

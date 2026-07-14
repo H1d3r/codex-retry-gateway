@@ -1469,6 +1469,26 @@
      - RED：`node .\scripts\test-launch-ui.mjs` 稳定失败于失败启动 PID 文件残留。
      - GREEN：同一命令通过 `PASS launch-ui flow`；随后四套 E2E 串行 fresh 通过。
 
+42. SSE 检查与 Retry-After 必须防止协议误标、超大事件和 timer 排序绕过
+   - 现象：
+     - 精确 Capacity 特征优先于通用 429 后，Capacity 429 会忽略正值 `Retry-After` 并立即重试。
+     - 事件循环阻塞时，Retry-After timer 可在总 deadline timer 回调前恢复 continuation，导致 deadline 已过仍派发新 attempt。
+     - SSE parser 只识别 `\n\n` / `\r\n\r\n`，误标为 `text/plain` 的合法 JSON SSE、`\n\r\n` 混合空行和单个超过 1 MiB 的 completed 事件会丢失 reasoning/结构信号。
+     - parser 旧实现先拼接完整字符串再检查长度，不是严格 1 MiB 状态上限；observe-only 命中后 timeout 又会把样本 `matched_current_rule` 覆盖为 false。
+   - 根因：
+     - Retry-After 解析错误地依赖策略 trigger，而不是实际 HTTP 429 状态；等待结束后只依赖 timer abort，没有按墙钟复核 deadline。
+     - SSE framing 使用字符串固定分隔符和 Content-Type 单一判定；超限事件被静默丢弃，严格保护把“无法检查”误当成“未命中”。
+     - inspected helper 只更新计数，不把已经观察到的命中事实写回 attempt sample；timeout 收口硬编码 `matched=false`。
+   - 处理：
+     - 所有实际 HTTP 429（包括 Capacity）统一解析 `Retry-After`；等待完成后调用 latency guard 墙钟检查，过期时复用当前 attempt 返回总 timeout 502。
+     - parser 改为 Buffer 字节级 framing，支持 LF、CR、CRLF 混合空行；正常状态最多保存 1 MiB，discard 状态最多保存 3 字节边界尾巴，并按 64 KiB 分片扫描输入。
+     - 非 JSON 流式响应同时做有界 `data: {json}` 识别；普通非 SSE 非空 chunk 仍算首 progress。
+     - `none`/observe-only 的超大事件保持透传并记录检查失败；严格 reasoning 保护返回 `502 response_inspection_limit_exceeded`，样本落 `final_action=response_inspection_limit_exceeded` 与同码 failure summary。
+     - attempt inspected helper 一旦观察到命中即写回 sample；timeout 三个最终分支继承该值。
+   - 防回归：
+     - `test-gateway-e2e.mjs` 新增 Capacity 正值等待、late timer deadline、混合换行、误标 Content-Type、超大 protected completed、parser 硬上限故障注入和 observe-only timeout 七组反例。
+     - 2026-07-15 Codex bundled Node 四套 E2E 串行 PASS，六个 JS syntax、PowerShell AST、`git diff --check` 与临时进程审计 PASS。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E
