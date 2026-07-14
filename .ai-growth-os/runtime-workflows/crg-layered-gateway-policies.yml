@@ -139,7 +139,7 @@ post_implementation_review:
     - agent:019f620a-81e7-7783-a8c2-1a002493178d => round-5 REQUEST_CHANGES, Critical=0, Important=4, Minor=1
     - agent:019f622a-eb8e-7012-a0d8-363d91794436 => round-6 REQUEST_CHANGES, Critical=0, Important=1, Minor=2
     - agent:019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
-  parent_review_status: reviewer-round-7-changes-requested-remediation-approved
+  parent_review_status: review-fix-batch-7-full-local-verification-passed-awaiting-original-reviewer-rereview
   reject_if_hits:
     - retry-dispatch-final-deadline-gap
     - synchronous-processing-crosses-deadline-before-client-write
@@ -149,15 +149,15 @@ post_implementation_review:
     - lifecycle-wall-clock-regression-crosses-before-first-chunk
   parent_resolution:
     status: blocked
-    reason: verified-review-findings-awaiting-red-green-remediation
-  implementation_freeze_status: released-for-bounded-remediation
+    reason: round-7-fixes-verified-awaiting-stable-snapshot-and-original-reviewer-rereview
+  implementation_freeze_status: active
   allowed_ops:
-    - write-test
-    - source-edit
-    - test
+    - local-review
+    - evidence-reconciliation
     - project-doc-write
     - commit
   forbidden_ops:
+    - source-edit
     - pr
     - merge
     - claim-done
@@ -192,9 +192,16 @@ post_implementation_review:
     - every stream chunk rechecks first-progress wall clock before progress classification
     - UTF-8 BOM coverage splits encoded bytes across chunks
     - pending policy evidence ends before the current internal-retry completion log; only cross-process wall clock comparison has a 50ms tolerance
+    - retry request preparation precedes final deadline gating and counters start only after fetch dispatch
+    - non-stream/stream synchronous processing, EOF, reader errors and forwarding boundaries recheck total deadline
+    - observe-only persistence follows client forwarding markers
+    - upstream policy trigger and final outcome counters are independent
+    - PowerShell canonical JSON preserves scalar array values and order
+    - lifecycle wall-clock regression crosses on a later metadata chunk
     - 2026-07-15 four sequential bundled-Node E2E suites PASS after latest source mutation
     - 2026-07-15 JS syntax, PowerShell AST, git diff check and temporary-process audit PASS
     - 2026-07-15 gateway E2E stability replay 5/5 PASS before evidence tightening and 3/3 PASS after final evidence correction
+    - 2026-07-15 round-7 gateway E2E stability replay 3/3 PASS and three lifecycle E2E suites PASS
 git_progress_checkpoints:
   - startup-baseline
   - after-config-ui-batch
@@ -205,6 +212,7 @@ git_progress_checkpoints:
   - review-fix-batch-4
   - review-fix-batch-5
   - review-fix-batch-6
+  - review-fix-batch-7
   - pre-pr
 rollout_draft:
   source_task: crg-layered-gateway-policies

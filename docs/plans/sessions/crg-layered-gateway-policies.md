@@ -444,18 +444,24 @@ post_implementation_review:
     - every stream chunk rechecks the first-progress wall clock before progress classification
     - UTF-8 BOM coverage splits the three encoded bytes across network chunks
     - pending policy evidence ends before the request's internal-retry completion log; cross-process wall-clock comparison alone has a bounded 50ms tolerance
-  completion_status: reviewer-round-7-changes-requested-remediation-approved
+    - retry request preparation precedes the final deadline gate and budget/total/active start only after fetch dispatch
+    - non-stream JSON/redaction and stream SSE/structure/EOF/error/forwarding boundaries recheck the wall clock
+    - non-stream observe-only samples record after client forwarding markers
+    - upstream policy trigger and final outcome counters are independent
+    - PowerShell canonical JSON preserves scalar array values and order
+    - lifecycle regression crosses the deadline on a later metadata chunk, not the first chunk
+  completion_status: review-fix-batch-7-full-local-verification-passed-awaiting-original-reviewer-rereview
   parent_resolution:
     status: blocked
-    reason: verified-review-findings-awaiting-red-green-remediation
-  implementation_freeze_status: released-for-bounded-remediation
+    reason: round-7-fixes-verified-awaiting-stable-snapshot-and-original-reviewer-rereview
+  implementation_freeze_status: active
   allowed_ops:
-    - write-test
-    - source-edit
-    - test
+    - local-review
+    - evidence-reconciliation
     - project-doc-write
     - commit
   forbidden_ops:
+    - source-edit
     - pr
     - merge
     - claim-done
@@ -516,6 +522,8 @@ verification_results:
   - 2026-07-15 gateway E2E stability replay before evidence tightening => 5/5 PASS
   - 2026-07-15 gateway E2E stability replay after evidence tightening and 50ms cross-process clock tolerance => 3/3 PASS
   - 2026-07-15 final implementation snapshot f789066 four sequential bundled-Node E2E suites => PASS
+  - 2026-07-15 round-7 gateway E2E stability replay => 3/3 PASS
+  - 2026-07-15 round-7 install-restore, Windows launch and Unix launch E2E => PASS
 review_fix_batch_3_red_evidence:
   - next attempt reached upstream at 239ms with a 220ms total deadline when synchronous retry sample closeout ran before real dispatch
   - terminal CR-only completed SSE returned 200 instead of intercepting reasoning_tokens=516
@@ -554,12 +562,28 @@ review_fix_batch_6_green_evidence:
   - UTF-8 BOM bytes split across chunks do not count as progress
   - pending sample evidence upper bound is lower than the current internal-retry completion log sequence
   - gateway E2E passed once and then passed three consecutive stability replays after the final test correction
-full_verification_status: review-fix-batch-6-full-local-verification-passed-awaiting-final-rereview
+review_fix_batch_7_red_evidence:
+  - non-stream observe-only returned 200 while persisted client forwarding fields remained null/false
+  - interrupted Retry-After wait preserved sample policy_trigger but did not increment http_429_trigger_count
+  - header clone crossed total deadline before the second fetch, which still reached upstream and consumed retry budget
+  - non-stream JSON parse and stream SSE parse crossed total deadline but returned 200
+  - reader termination after total deadline returned upstream 200 because the delayed timer had not set timeoutPhase
+  - PowerShell canonical JSON converted string arrays to Length objects and scalar arrays to empty objects
+review_fix_batch_7_green_evidence:
+  - observe-only samples persist after client write markers
+  - policy trigger increments at classification and retry outcome only after actual dispatch
+  - final retry gate prevents post-deadline fetch, budget and total/active increments
+  - synchronous non-stream/stream parse and late reader termination return total-timeout 502
+  - scalar arrays preserve values/order and object-key-only reordering remains idempotent
+  - gateway E2E stability replay 3/3 PASS and three lifecycle E2E suites PASS
+full_verification_status: review-fix-batch-7-full-local-verification-passed-awaiting-original-reviewer-rereview
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
   - agent:019f622a-eb8e-7012-a0d8-363d91794436
   - agent:019f622a-ffce-7980-92b3-ef6b51ca9b73
+  - agent:019f6266-a7c6-7571-8982-73d9a90d2393
+  - agent:019f6266-bbcd-7870-9e23-2838fd017498
 pr_ref: pending
 merge_ref: pending
 rollout_ref: pending

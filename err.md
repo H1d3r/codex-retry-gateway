@@ -1573,6 +1573,28 @@
      - 47ms first-progress timer 被延迟时，上游 80ms 后连续发送 lifecycle，首个过期 chunk 必须立即返回 502。
      - 修正后 `test-gateway-e2e.mjs` 单轮 GREEN，并连续 3 轮稳定性复跑全部 GREEN；此前五轮稳定性基线也全部 GREEN。
 
+47. 总 deadline 必须覆盖同步处理、真实派发和异常终态，采集/配置比较要按最终事实
+   - 现象：
+     - pending retry 在 loop 顶部通过 deadline 检查后，header clone 等同步工作仍可跨线，随后错误增加预算、代理总数并真实派发第二次上游请求。
+     - 上游 body/chunk 在 deadline 前到达，但 JSON/SSE 解析或结构遍历跨线后仍可写出 200；reader 在 deadline 后异常且 timer 回调被阻塞时会被误记为普通 stream termination。
+     - 非流式 observe-only 在客户端写入前先 clone/落盘，导致 `client_*` 与 `response_forwarding_started` 永久为空。
+     - Capacity/429 trigger 与最终 outcome 一起延后，Retry-After 等待中断时 trigger 漏计。
+     - PowerShell canonical helper 把函数参数里的字符串、数字、布尔当成对象，字符串数组变成 `Length` 对象，标量数组变成 `{}`。
+   - 根因：
+     - deadline 复核没有紧邻真实 fetch 和不可撤回客户端写入，过度依赖 timer 在同步 JavaScript 执行期间抢占。
+     - attempt 计数早于 fetch；observe-only 样本早于 `markReasoningSampleClient*`；策略 trigger/outcome 由一个 helper 同时累加。
+     - PowerShell 的参数包装让标量在递归函数里可能命中 `PSCustomObject` 分支，标量判断顺序错误。
+   - 处理：
+     - 先完成 header/request 准备，再执行 pending/current total deadline 最终闸门；调用 fetch 后才更新预算、total 和 active。
+     - 非流式解析/脱敏后、流式解析/结构后、EOF、reader catch 与每次 forwarding 前复核 total；reader catch 同时复核 first-progress。
+     - observe-only 样本在 `res.end()` 后完成；策略分类时记 trigger，动作完成时分别记 retry/pass/502。
+     - canonical helper 在对象递归前直接返回 `string` 与 CLR `ValueType`，数组继续按原序递归。
+   - 防回归：
+     - header clone 故障注入只阻塞第二次真实 dispatch 到 deadline 后，断言只发 1 次上游、预算仍为 0、代理总数只加 1。
+     - JSON 与完整 SSE payload 解析分别阻塞 100ms，70ms timer 延迟到 200ms；reader 在 100ms 断流，三种路径都必须返回 total-timeout 502。
+     - observe-only 断言客户端首写字段；Retry-After 断连断言 trigger+1/retry 不变；Windows launch 断言标量数组 canonical JSON。
+     - gateway E2E 连续 3 轮 GREEN，三套生命周期 E2E 全部 GREEN，临时 gateway 进程残留为 0。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

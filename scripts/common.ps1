@@ -209,6 +209,9 @@ function ConvertTo-CanonicalJsonNode {
   if ($null -eq $Value) {
     return $null
   }
+  if ($Value -is [string] -or $Value.GetType().IsValueType) {
+    return $Value
+  }
   if ($Value -is [System.Collections.IDictionary]) {
     $ordered = [ordered]@{}
     foreach ($key in @($Value.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive)) {

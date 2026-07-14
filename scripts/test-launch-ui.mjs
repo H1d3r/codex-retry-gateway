@@ -183,6 +183,27 @@ async function run() {
   assert(!expectedPidParameterMissing, "PowerShell health wait does not support ExpectedProcessId");
   assert(wrongPidHealthRejected, "PowerShell health wait accepted HTTP 200 from the wrong process_id");
 
+  const canonicalArrayCheckScript = path.join(tempRoot, "canonical-array-check.ps1");
+  await writeFile(
+    canonicalArrayCheckScript,
+    [
+      `$ErrorActionPreference = "Stop"`,
+      `. '${commonScriptPath}'`,
+      `Write-Output ("FORWARD=" + (ConvertTo-CanonicalJson -Value @("/responses", "/v1/responses")))`,
+      `Write-Output ("REVERSE=" + (ConvertTo-CanonicalJson -Value @("/v1/responses", "/responses")))`,
+      `Write-Output ("SCALARS=" + (ConvertTo-CanonicalJson -Value @(516, 1034, $true, $false)))`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const canonicalArrayCheck = await runPowerShellScript(canonicalArrayCheckScript, []);
+  assert(
+    canonicalArrayCheck.stdout.includes('FORWARD=["/responses","/v1/responses"]') &&
+      canonicalArrayCheck.stdout.includes('REVERSE=["/v1/responses","/responses"]') &&
+      canonicalArrayCheck.stdout.includes('SCALARS=[516,1034,true,false]'),
+    `PowerShell canonical JSON 必须保留基本类型数组的值与顺序: ${canonicalArrayCheck.stdout}`,
+  );
+
   const failedStartProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     stdio: "ignore",
     windowsHide: true,

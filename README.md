@@ -247,8 +247,8 @@ Issue #26 收口说明：
 
 - `intercept_rule_mode=none` 只关闭 reasoning 规则，Capacity、HTTP 429、响应超时与全量采集仍可独立叠加；未启用首 progress 控制时，流式响应边读边透传。
 - Capacity、HTTP 429、reasoning、Responses 续写恢复和首 progress 超时共用 `guard_retry_attempts`，同一次上游响应只由优先级最高的策略接管一次。
-- 每次上游 attempt 都落独立样本；上传阶段客户端断连、Retry-After 等待中断连、总超时、已透传后断连和 observe-only 命中会按最终事实收口，不伪装成 413、重复失败或丢失规则命中事实。
-- 合法配置比较忽略对象成员顺序但保留数组顺序，Windows/Unix 复用启动不会因 `latency_guard` 等对象仅换序而重写配置或重启健康 gateway。
+- 每次上游 attempt 都落独立样本；上传阶段客户端断连、Retry-After 等待中断连、总超时、已透传后断连和 observe-only 命中会按最终事实收口，不伪装成 413、重复失败或丢失规则命中事实。非流式 observe-only 会在实际写头/写 body 后再冻结样本，客户端首写与 forwarding 字段不会保持空值。
+- 合法配置比较忽略对象成员顺序但保留数组值和顺序，Windows/Unix 复用启动不会因 `latency_guard` 等对象仅换序而重写配置或重启健康 gateway，也不会把 `endpoints`、`reasoning_equals` 这类字符串/数字/布尔数组错误归一化为对象。
 - 本次可叠加策略由 GitHub Issue #26 跟踪：`https://github.com/nonononull/codex-retry-gateway/issues/26`。
 
 说明：
@@ -266,11 +266,11 @@ Issue #26 收口说明：
 - 续写恢复命中后，命中轮会计入实际拦截；网关丢弃中间命中轮 lifecycle、reasoning item、tentative final answer、message、tool call、`response.completed` 与 `[DONE]`，最终只保留干净完成轮自带的 `response.created` / `response.in_progress` / `response.completed` / `[DONE]`；后续轮再次命中会继续安全续写，直到 `guard_retry_attempts` 耗尽；只有最终成功透传给客户端时，才计入续写成功，耗尽后仍命中则返回 `502`
 - Capacity 只精确匹配 `Selected model is at capacity. Please try a different model.`；其余 HTTP 429 才进入通用 429 策略，普通非 Capacity 5xx 继续原样透传
 - HTTP 429 重试会遵守秒数或 HTTP-date 格式的 `Retry-After`，包括被精确 Capacity 特征优先分类的 HTTP 429；单次等待最多 60 秒，无合法 header 时使用 full-jitter，等待超过总 deadline 时直接执行当前动作的耗尽分支
-- 已进入 Retry-After 等待后如果总 deadline 到期，timeout 优先并用当前 attempt 返回 `upstream-total-timeout` 502，不会重复落样本或创建新 attempt；Capacity/429、reasoning、续写和首 progress retry 都在下一 attempt 派发前按墙钟复核同一总 deadline；允许派发时先启动 fetch 并让出两个有界事件循环轮次，再按旧 attempt 预先捕获的结束时间同步落盘，不等待下一响应头，也不让旧样本阻塞真实派发或污染 duration/TPS；客户端在等待中断开时只记录 `client_disconnected`
+- 已进入 Retry-After 等待后如果总 deadline 到期，timeout 优先并用当前 attempt 返回 `upstream-total-timeout` 502，不会重复落样本或创建新 attempt；Capacity/429、reasoning、续写和首 progress retry 会先完成 header/request 等同步准备，再紧邻真实 fetch 复核同一总 deadline；fetch 已启动后才增加共享预算、代理总数和 active。允许派发时让出两个有界事件循环轮次，再按旧 attempt 预先捕获的结束时间同步落盘，不等待下一响应头，也不让旧样本阻塞真实派发或污染 duration/TPS；客户端在等待中断开时只记录 `client_disconnected`
 - `inspected_response_count` 按已取得上游响应的 attempt 计数；等待重试时客户端断连不会再同时增加 `failed_proxy_request_count`，总 timeout 也会进入 inspected 分母，使 `total = inspected + bypassed + failed + active` 保持可核对
 - `endpoints` 是 reasoning、Capacity、HTTP 429 和 latency guard 的共同管理边界；未列入的路径完全旁路这些策略，不会出现只启用超时但不处理 Capacity/429 的半旁路
 - `latency_guard.first_progress_timeout_ms` 与 `latency_guard.total_timeout_ms` 只接受 `0..2_147_483_647` 的整数；`0` 表示单独关闭该阈值，避免超过 Node 定时器上限后被缩短成近似立即超时
-- 首 progress 与总 deadline 都按绝对墙钟执行，timer 只负责唤醒；非流式 body 完成、每个流式 chunk、EOF 和 retry 派发在清 timer 或写客户端前都会复核。每个流式 chunk 会先处理检查上限，再在判定 progress 前无条件复核首 progress 墙钟，因此持续 lifecycle/metadata 也不能把迟到 timeout 拖到下一条有效输出；事件循环阻塞导致 timer 回调延迟同样不能绕过硬阈值
+- 首 progress 与总 deadline 都按绝对墙钟执行，timer 只负责唤醒；非流式 JSON/脱敏、流式 SSE 解析与结构遍历、每个 chunk、EOF、reader 异常、retry 派发和客户端写入前都会复核。每个流式 chunk 会先处理检查上限，再按 total、first-progress 的顺序复核；前序 lifecycle 可以在 deadline 前到达，首个跨线 lifecycle 会立即超时，事件循环阻塞或迟到 timer 不能把 200 写出后再补救
 - 流式 `text/plain` 或其它非 SSE 响应的首个非空 chunk 也算首 progress；误标 Content-Type 时使用有界待判状态识别 `data:` / `event:` / `id:` / `retry:` / comment，字段名和 JSON 都可跨 chunk，解析出 JSON data 后确认为 SSE；完整不可识别事件会在本 chunk 明确回退普通文本，即使尾部又留下候选前缀也不重新压住 progress；独立 UTF-8 BOM 即使三个 UTF-8 字节跨网络 chunk 也不算 progress，BOM 后的候选超限仍 fail-closed；支持 LF、CR、CRLF 及混合空行，EOF 会 flush 纯 CR 完整终态事件
 - `stream_action=disconnect` 在 chunk 阶段或 EOF 最终结构判定才命中 reasoning/final-answer-only 时都会实际断连并记录 `final_action=disconnect`，不会因为响应已写出而降成 observe-only
 - SSE 事件解析状态固定受 `1MiB` 字节硬上限约束；即使误标流的首个事件就是超大 `response.completed`，也会先按检查失败 fail-closed，不会先误算 progress 或转入 timeout。`none` 或 observe-only 场景继续原样透传并在样本中记录检查失败；reasoning 流式保护无法检查超大 SSE 事件时，尚未写响应则返回 `502 response_inspection_limit_exceeded`，已写响应则取消上游、断开下游并记录 `response_inspection_limit_disconnected_after_forward`，不会静默绕过 516/续写规则

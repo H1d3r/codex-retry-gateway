@@ -115,8 +115,10 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - `latency_guard` 默认关闭；首个有效输出超时可直接 502 或按共享预算重试后 502，总 deadline 跨 attempt 不重置。已经透传后不能改写 502，只能断连并落盘。
 - `endpoints` 同时限定 reasoning、Capacity、HTTP 429 与 latency guard；列表外路径必须全部旁路这些策略。
 - 两个 latency 阈值只接受 `0..2_147_483_647` 的整数；Retry-After 等待中命中总 deadline 必须复用当前 attempt 返回 timeout 502，不能静默结束或重复落盘。
-- timer 回调不是 deadline 的唯一真源；非流式 body、每个流式 chunk、EOF 与 retry 派发都必须在完成/透传前按绝对时间复核。流式 chunk 必须先收口检查上限，再在 progress 分类前无条件复核 first-progress 墙钟；重复 lifecycle/metadata 不能延后超时。
-- Capacity/429、reasoning、续写和首 progress retry 共用统一 pending 派发闸门；旧 attempt 的结束时间/日志范围在 retry 决策时捕获，下一 fetch 启动并让出两个有界事件循环轮次后立即落盘，不得等待下一响应头。过期分支不得增加代理请求总数、active 计数、预算或保留新 attempt 样本。
+- timer 回调不是 deadline 的唯一真源；非流式 JSON/脱敏、流式 SSE/结构解析、每个 chunk、EOF、reader 异常、retry 派发与客户端写入前都必须按绝对时间复核。流式 chunk 必须先收口检查上限，再按 total、first-progress 顺序复核；测试要让前几个 lifecycle 在 deadline 前到达、后续 lifecycle 首次跨线，不能只测首 chunk 已过期。
+- Capacity/429、reasoning、续写和首 progress retry 共用统一 pending 派发闸门；header/request 等同步准备必须在最终 deadline 复核之前完成，真实 fetch 启动后才增加共享预算、代理总数和 active。旧 attempt 的结束时间/日志范围在 retry 决策时捕获，下一 fetch 启动并让出两个有界事件循环轮次后立即落盘，不得等待下一响应头。过期分支不得保留新 attempt 样本。
+- Capacity/429 的 trigger 在分类时计数，retry/pass-through/502 在动作确定时分别计数；Retry-After 等待被客户端断连或 total deadline 中断时，trigger 仍必须保留且 retry 不得增加。
+- Windows canonical 配置比较必须保留字符串、数字、布尔数组的值和顺序，同时只忽略对象键顺序。
 - SSE framing 必须覆盖字段名与 JSON 跨 chunk、fallback 后尾随候选、独立/同块/UTF-8 字节级跨 chunk 的 BOM、首个事件即超大的误标候选、LF/CR/CRLF 混合空行和 EOF 纯 CR 终态；检查上限优先于同一 chunk 中迟到的 first-progress timeout；reasoning 保护下的超大事件在未写响应时返回专用 502，在已写响应时 fail-closed 断连；EOF 才命中的 disconnect 规则也必须实际断连。
 - 每个已启动 attempt 必须且只能归入 inspected、bypassed、failed 或 active；已有前序 inspected attempt 时，后续 fetch failure 仍单独增加 failed，保持 `total = inspected + bypassed + failed + active`。
 - none + latency guard 的首 progress 前导缓冲是严格 `1MiB` 硬上限；越界 chunk 不能先进入缓冲数组。

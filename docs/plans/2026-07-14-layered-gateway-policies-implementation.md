@@ -365,6 +365,8 @@ README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retr
 
 第六轮 reviewer 合并出的 3 个独立 Important 已继续关闭：超大候选测试改为首个且唯一事件就是 `response.completed`；检查上限在 progress/first-progress timeout 之前 fail-closed；每个流式 chunk 在 progress 分类前无条件复核 first-progress 墙钟。BOM 测试改为按 UTF-8 字节跨 chunk，旧 policy sample 进一步断言 evidence 上界早于当前请求的内部重试完成日志。Windows 跨进程 `Date.now()` 曾出现 4ms 回拨，测试只对该跨进程比较保留 50ms 容差，样本唯一性、800ms 挂起期间及时可见、duration 上界和日志 evidence 顺序仍为硬断言。修正后 gateway E2E 单轮通过并连续 3 轮稳定性复跑通过。
 
+第七轮双 reviewer 合并出的 3 个独立 Important 和 3 个独立 Minor 已核实并按 RED/GREEN 关闭：所有 request/header 同步准备移到 retry 最终 deadline 闸门前，fetch 启动后才记预算、total/active；非流式 JSON/脱敏、流式 SSE/结构、EOF、reader 异常和客户端写入前补绝对墙钟复核；非流式 observe-only 在实际透传后再冻结样本；Capacity/429 trigger 与最终 outcome 分开计数；PowerShell canonical JSON 先保留标量再递归对象；lifecycle 反例改为前序 chunk 在 deadline 前、后续 chunk 首次跨线。RED 分别复现 200 误透传、第二次 fetch 在 deadline 后仍派发、采集字段空值、trigger 漏计和标量数组对象化；GREEN 后 gateway E2E 连续 3 轮通过，安装恢复、Windows launch、Unix launch 三套 E2E 全部通过。
+
 - [x] **Step 2：执行完整本地验证**
 
 ```powershell
