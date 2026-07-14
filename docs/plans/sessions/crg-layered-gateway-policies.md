@@ -350,11 +350,21 @@ protected_feature_replay:
 ```yaml
 post_implementation_review:
   required: true
-  review_phase: after-latest-source-mutation
-  review_scope: whole-source
-  required_agent_count: 2
+  review_phase: post-implementation
   same_question_ref: session-plan:crg-layered-gateway-policies#agent-lifecycle
+  review_scope: whole-source
+  owner_requested_scope: all-source
+  baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
+  implementation_snapshot_ref: git:f789066c685e565fe57cc4292ce346f2d898f9a4
+  last_mutation_ref: git:f789066c685e565fe57cc4292ce346f2d898f9a4
+  review_after_last_mutation: true
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..f789066c685e565fe57cc4292ce346f2d898f9a4
+  reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
+  required_agent_count: 2
+  returned_agent_count: 0
   reviewer_output_refs:
+    - none
+  historical_reviewer_output_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-4 REQUEST_CHANGES, Critical=0, Important=4
@@ -381,7 +391,7 @@ post_implementation_review:
     - lifecycle-only chunks did not independently recheck the first-progress wall clock
     - JavaScript character splitting did not cover UTF-8 BOM bytes split across chunks
     - pending policy evidence assertion did not prove the captured range excluded retry-completion logs
-  reject_if_hits:
+  reject_if_patterns:
     - retry-or-502-after-downstream-forwarding
     - total-deadline-reset-across-attempts
     - retry-budget-multiplication
@@ -390,6 +400,8 @@ post_implementation_review:
     - config-migration-rewrites-valid-settings
     - incomplete-attempt-telemetry
     - protected-feature-regression
+  reject_if_hits:
+    - pending-final-review
   resolved_findings_pending_rereview:
     - upload disconnect is client_disconnected with actual bytes, not request_rejected 413
     - unfinished SSE event and pre-progress buffers are bounded at 1MiB
@@ -423,6 +435,21 @@ post_implementation_review:
     - UTF-8 BOM coverage splits the three encoded bytes across network chunks
     - pending policy evidence ends before the request's internal-retry completion log; cross-process wall-clock comparison alone has a bounded 50ms tolerance
   completion_status: review-fix-batch-6-full-local-verification-passed-awaiting-final-rereview
+  parent_resolution:
+    status: blocked
+    reason: awaiting-two-same-question-reviewers
+  implementation_freeze_status: active
+  allowed_ops:
+    - local-review
+    - evidence-reconciliation
+    - project-doc-write
+    - commit
+  forbidden_ops:
+    - source-edit
+    - current-gate-execute
+    - pr
+    - merge
+    - claim-done
 post_implementation_review_policy:
   review_phase: post-implementation
   freshness_rule: review-after-last-mutation
@@ -451,6 +478,7 @@ implementation_commit_refs:
   - git:6a42655
   - git:92c189d
   - git:248d001
+  - git:f789066c685e565fe57cc4292ce346f2d898f9a4
 ```
 
 ## Stop Gates
@@ -478,6 +506,7 @@ verification_results:
   - 2026-07-15 latest gateway E2E after round-6 fixes => PASS codex-retry-gateway e2e
   - 2026-07-15 gateway E2E stability replay before evidence tightening => 5/5 PASS
   - 2026-07-15 gateway E2E stability replay after evidence tightening and 50ms cross-process clock tolerance => 3/3 PASS
+  - 2026-07-15 final implementation snapshot f789066 four sequential bundled-Node E2E suites => PASS
 review_fix_batch_3_red_evidence:
   - next attempt reached upstream at 239ms with a 220ms total deadline when synchronous retry sample closeout ran before real dispatch
   - terminal CR-only completed SSE returned 200 instead of intercepting reasoning_tokens=516

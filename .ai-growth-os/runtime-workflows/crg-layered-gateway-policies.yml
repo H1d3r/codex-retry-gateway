@@ -114,9 +114,22 @@ protected_feature_replay:
     - Windows and Unix idempotent launch/recovery
 post_implementation_review:
   required: true
+  review_phase: post-implementation
+  same_question_ref: session-plan:crg-layered-gateway-policies#agent-lifecycle
+  review_scope: whole-source
+  owner_requested_scope: all-source
+  baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
+  implementation_snapshot_ref: git:f789066c685e565fe57cc4292ce346f2d898f9a4
+  last_mutation_ref: git:f789066c685e565fe57cc4292ce346f2d898f9a4
+  review_after_last_mutation: true
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..f789066c685e565fe57cc4292ce346f2d898f9a4
+  reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
+  returned_agent_count: 0
   same_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏 516、final-only、压缩豁免、续写与真实路由语义
-  reviewer_refs:
+  reviewer_output_refs:
+    - none
+  historical_reviewer_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-4 REQUEST_CHANGES, Critical=0, Important=4
@@ -126,6 +139,23 @@ post_implementation_review:
     - agent:019f622a-eb8e-7012-a0d8-363d91794436 => round-6 REQUEST_CHANGES, Critical=0, Important=1, Minor=2
     - agent:019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
   parent_review_status: review-fix-batch-6-full-local-verification-passed-awaiting-final-rereview
+  reject_if_hits:
+    - pending-final-review
+  parent_resolution:
+    status: blocked
+    reason: awaiting-two-same-question-reviewers
+  implementation_freeze_status: active
+  allowed_ops:
+    - local-review
+    - evidence-reconciliation
+    - project-doc-write
+    - commit
+  forbidden_ops:
+    - source-edit
+    - current-gate-execute
+    - pr
+    - merge
+    - claim-done
   review_fix_evidence:
     - Retry-After deadline and 1MiB hard-limit RED reproduced
     - upload disconnect no longer becomes request_rejected 413
