@@ -119,10 +119,10 @@ post_implementation_review:
   review_scope: whole-source
   owner_requested_scope: all-source
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
-  implementation_snapshot_ref: pending-round-8-source-snapshot
-  last_mutation_ref: working-tree:round-8-review-remediation
+  implementation_snapshot_ref: git:06067bd1f52243c18aa0e6d2791152de08b09685
+  last_mutation_ref: git:06067bd1f52243c18aa0e6d2791152de08b09685
   review_after_last_mutation: false
-  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..working-tree
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..06067bd1f52243c18aa0e6d2791152de08b09685
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
   returned_agent_count: 0
@@ -148,7 +148,7 @@ post_implementation_review:
     - header cloning that crosses first-progress deadline must prevent upstream dispatch
     - lifecycle evidence must record actual upstream send timing
     - full frozen diff has three trailing-whitespace violations
-  parent_review_status: review-fix-batch-8-full-local-verification-passed-awaiting-source-snapshot
+  parent_review_status: review-fix-batch-8-full-local-verification-passed-awaiting-original-reviewer-rereview
   reject_if_hits:
     - pending-original-reviewer-rereview
   parent_resolution:

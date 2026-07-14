@@ -359,10 +359,10 @@ post_implementation_review:
   review_scope: whole-source
   owner_requested_scope: all-source
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
-  implementation_snapshot_ref: pending-round-8-source-snapshot
-  last_mutation_ref: working-tree:round-8-review-remediation
+  implementation_snapshot_ref: git:06067bd1f52243c18aa0e6d2791152de08b09685
+  last_mutation_ref: git:06067bd1f52243c18aa0e6d2791152de08b09685
   review_after_last_mutation: false
-  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..working-tree
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..06067bd1f52243c18aa0e6d2791152de08b09685
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
   returned_agent_count: 0
@@ -443,7 +443,7 @@ post_implementation_review:
     - continuation-safe Capacity/429 pass-through strips encrypted_content on pass and retry exhaustion
     - lifecycle regression records actual upstream chunk send timestamps on both sides of the deadline
     - full baseline diff has no trailing-whitespace violations
-  completion_status: review-fix-batch-8-full-local-verification-passed-awaiting-source-snapshot
+  completion_status: review-fix-batch-8-full-local-verification-passed-awaiting-original-reviewer-rereview
   parent_resolution:
     status: blocked
     reason: round-8-fixes-verified-awaiting-stable-source-snapshot-and-original-reviewer-rereview
@@ -488,6 +488,7 @@ implementation_commit_refs:
   - git:248d001
   - git:f789066c685e565fe57cc4292ce346f2d898f9a4
   - git:c1cb042be9ba7938bef9b7983f71b0e5108eadcb
+  - git:06067bd1f52243c18aa0e6d2791152de08b09685
 ```
 
 ## Stop Gates
@@ -589,7 +590,7 @@ review_fix_batch_8_green_evidence:
   - Capacity pass-through and retry-exhaustion bodies are redacted in continuation safety mode
   - lifecycle evidence contains actual upstream chunk send times before and after the first-progress deadline
   - gateway E2E stability replay 3/3, three lifecycle E2E suites, syntax, AST, diff and process audit all pass
-full_verification_status: review-fix-batch-8-full-local-verification-passed-awaiting-source-snapshot
+full_verification_status: review-fix-batch-8-full-local-verification-passed-awaiting-original-reviewer-rereview
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
