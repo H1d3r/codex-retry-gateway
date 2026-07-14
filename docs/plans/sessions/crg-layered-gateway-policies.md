@@ -211,8 +211,8 @@ superpowers_method_discipline:
 tdd:
   skill: superpowers:test-driven-development
   red_required: true
-  red_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs failed at 管理页缺少三种 reasoning 规则模式; node scripts/test-install-restore.mjs failed at missing capacity_error_action default; Task2 node scripts/test-gateway-e2e.mjs failed with none firstChunkAtMs equal completedAtMs; Task3 node scripts/test-gateway-e2e.mjs failed because capacity pass_through still retried under legacy boolean logic; Task4 node scripts/test-gateway-e2e.mjs failed for missing first-progress enforcement, policy counters, non-stream client timing, and 429 Retry-After first-progress timer isolation
-  green_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs => PASS codex-retry-gateway e2e; node scripts/test-install-restore.mjs => PASS install-restore flow; Task2 node scripts/test-gateway-e2e.mjs => PASS with direct-stream timing, encrypted content preservation and first-progress telemetry; Task3 node scripts/test-gateway-e2e.mjs => PASS with Capacity/429 four-action matrices, Retry-After and shared budget; Task4 node scripts/test-gateway-e2e.mjs => PASS with first-progress/total deadlines, after-forward disconnect, schema v3 metrics and JSON/CSV telemetry, plus install-restore PASS; node syntax and git diff checks passed
+  red_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs failed at 管理页缺少三种 reasoning 规则模式; node scripts/test-install-restore.mjs failed at missing capacity_error_action default; Task2 node scripts/test-gateway-e2e.mjs failed with none firstChunkAtMs equal completedAtMs; Task3 node scripts/test-gateway-e2e.mjs failed because capacity pass_through still retried under legacy boolean logic; Task4 node scripts/test-gateway-e2e.mjs failed for missing first-progress enforcement, policy counters, non-stream client timing, and 429 Retry-After first-progress timer isolation; Task5 node scripts/test-install-restore.mjs、test-launch-ui.mjs、test-launch-ui-unix.mjs 分别因首装缺少 capacity_error_action 而按预期失败; reviewer-fix 2026-07-14 gateway E2E failed with Retry-After deadline client timeout/no response and pre-progress buffer hard-limit injected 502
+  green_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs => PASS codex-retry-gateway e2e; node scripts/test-install-restore.mjs => PASS install-restore flow; Task2 node scripts/test-gateway-e2e.mjs => PASS with direct-stream timing, encrypted content preservation and first-progress telemetry; Task3 node scripts/test-gateway-e2e.mjs => PASS with Capacity/429 four-action matrices, Retry-After and shared budget; Task4 node scripts/test-gateway-e2e.mjs => PASS with first-progress/total deadlines, after-forward disconnect, schema v3 metrics and JSON/CSV telemetry, plus install-restore PASS; Task5 node scripts/test-install-restore.mjs、test-launch-ui.mjs、test-launch-ui-unix.mjs => PASS，合法 none/动作/latency 配置保持字节、mtime、PID 不变，PowerShell AST 与 Node syntax 通过; reviewer-fix 2026-07-14 bundled Node gateway E2E => PASS with deadline wait single-sample 502 and strict pre-progress buffer limit
   production_edit_before_red: forbidden
   test_files:
     - scripts/test-gateway-e2e.mjs
@@ -231,11 +231,15 @@ agent_lifecycle:
   open_agent_count_before_dispatch: 0
   reclaim_before_spawn: required
   completion_status:
-    completed: []
+    completed:
+      - 019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => REQUEST_CHANGES
+      - 019f6040-69fe-72b0-89c9-d24b9e12b6bc => REQUEST_CHANGES
     idle: []
     timeout: []
     failed: []
-  closed_agent_refs: []
+  closed_agent_refs:
+    - 019f6040-55cb-7dc0-a70d-d8a5c7a03d99
+    - 019f6040-69fe-72b0-89c9-d24b9e12b6bc
   review_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏既有高风险行为？
   closeout_rule: 两名 reviewer 正常返回最终 verdict，Critical/Important 清零并完成复审。
 ```
@@ -274,52 +278,52 @@ source_edit_admission: approved-by-owner-with-project-native-plan
 ```yaml
 protected_feature_replay:
   required: true
-  status: planned
-  completion_status: planned
+  status: passed-after-review-fixes
+  completion_status: passed
   baseline_ref: git:b4cac27
   known_good_features:
     - feature: reasoning-tokens-formula-and-manual-matching
       baseline_evidence_ref: git:b4cac27:scripts/test-gateway-e2e.mjs
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
-      post_change_replay_ref: pending-after-source-mutation
+      post_change_replay_ref: 2026-07-14 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: 518*n-2、manual values 与拦截次数保持通过
-      owner_visible_status: pending
-      regression_status: pending
+      owner_visible_status: passed
+      regression_status: passed
     - feature: final-answer-only-high-xhigh-and-zero-exclusion
       baseline_evidence_ref: git:b4cac27:scripts/test-gateway-e2e.mjs
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
-      post_change_replay_ref: pending-after-source-mutation
+      post_change_replay_ref: 2026-07-14 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: high/xhigh、普通 0 放行与 null/非 0 语义保持通过
-      owner_visible_status: pending
-      regression_status: pending
+      owner_visible_status: passed
+      regression_status: passed
     - feature: context-compaction-zero-exemption
       baseline_evidence_ref: git:b4cac27:scripts/test-gateway-e2e.mjs
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
-      post_change_replay_ref: pending-after-source-mutation
+      post_change_replay_ref: 2026-07-14 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: 只有 context_compaction reasoning_tokens=0 豁免
-      owner_visible_status: pending
-      regression_status: pending
+      owner_visible_status: passed
+      regression_status: passed
     - feature: continuation-recovery-folding-and-exhaustion
       baseline_evidence_ref: git:b4cac27:scripts/test-gateway-e2e.mjs
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
-      post_change_replay_ref: pending-after-source-mutation
+      post_change_replay_ref: 2026-07-14 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: 命中轮丢弃、最终轮折叠、共享次数与耗尽 502 保持通过
-      owner_visible_status: pending
-      regression_status: pending
+      owner_visible_status: passed
+      regression_status: passed
     - feature: capacity-legacy-retry-then-pass-through
       baseline_evidence_ref: git:b4cac27:scripts/test-gateway-e2e.mjs
       post_change_replay_plan_ref: node .\scripts\test-gateway-e2e.mjs
-      post_change_replay_ref: pending-after-source-mutation
+      post_change_replay_ref: 2026-07-14 Codex bundled Node node .\scripts\test-gateway-e2e.mjs => PASS codex-retry-gateway e2e
       expected_result: 旧 true 配置重试耗尽后仍透传原始 Capacity 响应
-      owner_visible_status: pending
-      regression_status: pending
+      owner_visible_status: passed
+      regression_status: passed
     - feature: windows-and-unix-idempotent-config-recovery
       baseline_evidence_ref: git:b4cac27:scripts/test-install-restore.mjs+scripts/test-launch-ui.mjs+scripts/test-launch-ui-unix.mjs
       post_change_replay_plan_ref: node .\scripts\test-install-restore.mjs; node .\scripts\test-launch-ui.mjs; node .\scripts\test-launch-ui-unix.mjs
-      post_change_replay_ref: pending-after-source-mutation
+      post_change_replay_ref: 2026-07-14 Codex bundled Node install-restore、Windows launch、Unix launch 三组 E2E 全部 PASS
       expected_result: 合法配置复用零误写、PID 身份和恢复闭环保持通过
-      owner_visible_status: pending
-      regression_status: pending
+      owner_visible_status: passed
+      regression_status: passed
   forbidden_ops_until_replay:
     - pr
     - merge
@@ -338,7 +342,9 @@ post_implementation_review:
   review_scope: whole-source
   required_agent_count: 2
   same_question_ref: session-plan:crg-layered-gateway-policies#agent-lifecycle
-  reviewer_output_refs: []
+  reviewer_output_refs:
+    - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => REQUEST_CHANGES
+    - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => REQUEST_CHANGES
   reject_if_hits:
     - retry-or-502-after-downstream-forwarding
     - total-deadline-reset-across-attempts
@@ -348,7 +354,7 @@ post_implementation_review:
     - config-migration-rewrites-valid-settings
     - incomplete-attempt-telemetry
     - protected-feature-regression
-  completion_status: planned
+  completion_status: fixes-implemented-awaiting-rereview
 post_implementation_review_policy:
   review_phase: post-implementation
   freshness_rule: review-after-last-mutation
@@ -366,6 +372,12 @@ baseline_tests:
   - node .\scripts\test-launch-ui-unix.mjs => PASS unix launch-ui flow
   - node .\scripts\test-install-restore.mjs => PASS install-restore flow
 design_commit_ref: git:82d5907
+implementation_commit_refs:
+  - git:b1609ad
+  - git:d7573f0
+  - git:2644884
+  - git:150241b
+  - git:4480e21
 ```
 
 ## Stop Gates
@@ -381,10 +393,21 @@ design_commit_ref: git:82d5907
 ## Closeout
 
 ```yaml
-verification_results: []
-review_refs: []
+verification_results:
+  - 2026-07-14 Codex bundled Node gateway E2E => PASS codex-retry-gateway e2e
+  - 2026-07-14 Codex bundled Node install-restore E2E => PASS install-restore flow
+  - 2026-07-14 Codex bundled Node Windows launch E2E => PASS launch-ui flow
+  - 2026-07-14 Codex bundled Node Unix launch E2E => PASS unix launch-ui flow
+  - 2026-07-14 gateway/admin/four test scripts Node syntax => PASS
+  - 2026-07-14 common/install/launch PowerShell AST => PASS
+  - 2026-07-14 temporary gateway process audit => 0 leftovers
+  - 2026-07-14 git diff --check => PASS with line-ending warnings only
+full_verification_status: passed-after-review-fixes
+review_refs:
+  - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
+  - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
 pr_ref: pending
 merge_ref: pending
 rollout_ref: pending
-sibling_regression_guard: pending
+sibling_regression_guard: passed
 ```

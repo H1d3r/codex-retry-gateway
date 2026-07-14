@@ -199,7 +199,11 @@ if (-not $canReuseExistingInstall) {
         $reusableGatewayConfig.request_body_limit_bytes = 104857600
       }
     }
-    if ((-not [bool]$reusableGatewayConfig.intercept_streaming) -and (-not [bool]$reusableGatewayConfig.intercept_non_streaming)) {
+    if (
+      [string]$reusableGatewayConfig.intercept_rule_mode -ne "none" -and
+      (-not [bool]$reusableGatewayConfig.intercept_streaming) -and
+      (-not [bool]$reusableGatewayConfig.intercept_non_streaming)
+    ) {
       $reusableGatewayConfig.intercept_streaming = $true
       $reusableGatewayConfig.intercept_non_streaming = $true
     }

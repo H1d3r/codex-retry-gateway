@@ -75,6 +75,14 @@ function createJsonResponse(res, statusCode, body, extraHeaders = {}) {
   res.end(JSON.stringify(body));
 }
 
+function createTextResponse(res, statusCode, body, contentType, extraHeaders = {}) {
+  res.writeHead(statusCode, {
+    "content-type": contentType,
+    ...extraHeaders,
+  });
+  res.end(`${body}`);
+}
+
 function createSseResponse(res, chunks, intervalMs = 20) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -434,6 +442,19 @@ function buildResponsesStreamChunks(parsed, reasoning, sequenceCount = 0) {
     );
   }
 
+  if (Number.isInteger(parsed.test_stream_pre_progress_metadata_bytes)) {
+    chunks.push(
+      `data: ${JSON.stringify({
+        type: "response.in_progress",
+        response: {
+          id: finalResponseId,
+          model: finalModel,
+          test_padding: "x".repeat(parsed.test_stream_pre_progress_metadata_bytes),
+        },
+      })}\n\n`,
+    );
+  }
+
   if (
     selectStreamFlag(parsed, "test_include_stream_reasoning_item", sequenceCount) ||
     (Array.isArray(parsed.include) && parsed.include.includes("reasoning.encrypted_content"))
@@ -509,15 +530,29 @@ function buildResponsesStreamChunks(parsed, reasoning, sequenceCount = 0) {
       `event: encrypted_content=${parsed.test_stream_metadata_secret ?? "metadata-line-encrypted-secret"}\ndata: {"type":"response.output_text.delta","delta":"metadata-clean"}\n\n`,
     );
   }
+  if (parsed.test_include_empty_commentary_event) {
+    chunks.push(
+      `data: ${JSON.stringify({
+        type: "response.commentary.delta",
+        delta: "",
+      })}\n\n`,
+    );
+  }
 
   const outputText = selectStreamOutputText(parsed, sequenceCount);
   if (outputText) {
-    chunks.push(
-      `data: ${JSON.stringify({
-        type: "response.output_text.delta",
-        delta: outputText,
-      })}\n\n`,
-    );
+    const outputDeltaPayload = {
+      type: "response.output_text.delta",
+      delta: outputText,
+    };
+    if (parsed.test_stream_reasoning_in_output_chunk) {
+      outputDeltaPayload.usage = {
+        output_tokens_details: {
+          reasoning_tokens: reasoning,
+        },
+      };
+    }
+    chunks.push(`data: ${JSON.stringify(outputDeltaPayload)}\n\n`);
   }
 
   if (selectStreamFlag(parsed, "test_include_stream_message_item", sequenceCount)) {
@@ -2949,15 +2984,24 @@ function startFakeUpstream(port) {
         res.socket?.destroy();
         return;
       }
-      createJsonResponse(
-        res,
-        200,
-        {
-          object: "list",
-          data: [{ id: "fake-model" }],
-        },
-        { "x-upstream-test": "models-ok" },
-      );
+      const sendModelsResponse = () => {
+        createJsonResponse(
+          res,
+          200,
+          {
+            object: "list",
+            data: [{ id: "fake-model" }],
+          },
+          { "x-upstream-test": "models-ok" },
+        );
+      };
+      const modelsUrl = new URL(req.url, "http://127.0.0.1");
+      const delayMs = Number.parseInt(modelsUrl.searchParams.get("test_delay_ms") || "0", 10);
+      if (Number.isInteger(delayMs) && delayMs > 0) {
+        setTimeout(sendModelsResponse, delayMs);
+      } else {
+        sendModelsResponse();
+      }
       return;
     }
 
@@ -3036,19 +3080,30 @@ function startFakeUpstream(port) {
             if (parsed.test_retry_after !== undefined) {
               capacityHeaders["retry-after"] = `${parsed.test_retry_after}`;
             }
-            createJsonResponse(
-              res,
-              parsed.test_capacity_error_status ?? 429,
-              parsed.test_capacity_error_payload ?? {
-                error: {
-                  type: "rate_limit_error",
-                  code: "model_at_capacity",
-                  message:
-                    "Selected model is at capacity. Please try a different model.",
+            if (parsed.test_capacity_error_content_type) {
+              createTextResponse(
+                res,
+                parsed.test_capacity_error_status ?? 429,
+                parsed.test_capacity_error_raw_body ??
+                  "Selected model is at capacity. Please try a different model.",
+                parsed.test_capacity_error_content_type,
+                capacityHeaders,
+              );
+            } else {
+              createJsonResponse(
+                res,
+                parsed.test_capacity_error_status ?? 429,
+                parsed.test_capacity_error_payload ?? {
+                  error: {
+                    type: "rate_limit_error",
+                    code: "model_at_capacity",
+                    message:
+                      "Selected model is at capacity. Please try a different model.",
+                  },
                 },
-              },
-              capacityHeaders,
-            );
+                capacityHeaders,
+              );
+            }
             return;
           }
         }
@@ -3343,18 +3398,28 @@ function startFakeUpstream(port) {
             if (parsed.test_retry_after !== undefined) {
               rateLimitHeaders["retry-after"] = `${parsed.test_retry_after}`;
             }
-            createJsonResponse(
-              res,
-              429,
-              parsed.test_http_429_payload ?? {
-                error: {
-                  type: "rate_limit_error",
-                  code: "rate_limit_exceeded",
-                  message: "Too Many Requests",
+            if (parsed.test_http_429_content_type) {
+              createTextResponse(
+                res,
+                429,
+                parsed.test_http_429_raw_body ?? "Too Many Requests",
+                parsed.test_http_429_content_type,
+                rateLimitHeaders,
+              );
+            } else {
+              createJsonResponse(
+                res,
+                429,
+                parsed.test_http_429_payload ?? {
+                  error: {
+                    type: "rate_limit_error",
+                    code: "rate_limit_exceeded",
+                    message: "Too Many Requests",
+                  },
                 },
-              },
-              rateLimitHeaders,
-            );
+                rateLimitHeaders,
+              );
+            }
             return;
           }
         }
@@ -3380,6 +3445,12 @@ function startFakeUpstream(port) {
             { "x-upstream-test": `responses-${reasoning}` },
           );
         };
+        if (parsed.test_force_terminate_before_progress) {
+          createTerminatedSseResponse(res, [
+            'data: {"type":"response.created","response":{"id":"resp_terminated","model":"gpt-5.4"}}\n\n',
+          ]);
+          return;
+        }
         if (parsed.test_force_terminate) {
           createTerminatedSseResponse(res, [
             'data: {"type":"response.output_text.delta","delta":"hello"}\n\n',
@@ -3428,6 +3499,14 @@ function startFakeUpstream(port) {
               streamChunks,
               parsed.test_stream_pause_before_output_ms,
               parsed.test_stream_chunk_delay_ms ?? 20,
+            );
+          } else if (parsed.test_stream_pause_after_empty_commentary_ms) {
+            createSseResponseWithPauseAfterOutput(
+              res,
+              streamChunks,
+              parsed.test_stream_pause_after_empty_commentary_ms,
+              parsed.test_stream_chunk_delay_ms ?? 20,
+              '"type":"response.commentary.delta"',
             );
           } else if (parsed.test_stream_pause_after_function_call_ms) {
             createSseResponseWithPauseAfterOutput(
@@ -3717,10 +3796,11 @@ async function waitForStatusCondition(url, predicate, timeoutMs = 5000) {
   );
 }
 
-function startGateway(configPath, logPath) {
+function startGateway(configPath, logPath, options = {}) {
+  const nodeArgs = Array.isArray(options.nodeArgs) ? options.nodeArgs : [];
   const child = spawn(
     process.execPath,
-    [gatewayEntry, "--config", configPath, "--log", logPath],
+    [...nodeArgs, gatewayEntry, "--config", configPath, "--log", logPath],
     {
       cwd: gatewayRoot,
       stdio: ["ignore", "pipe", "pipe"],
@@ -6222,7 +6302,13 @@ async function run() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ test_sequence_key: key, ...requestBody }),
       });
-      const responseBody = await response.json();
+      const responseText = await response.text();
+      let responseBody = null;
+      try {
+        responseBody = JSON.parse(responseText);
+      } catch {
+        responseBody = null;
+      }
       assert(response.status === expectedStatus, `${key} 状态错误: ${response.status}`);
       assert(
         upstream.responseRequests.filter((entry) => entry.body?.test_sequence_key === key).length ===
@@ -6230,9 +6316,15 @@ async function run() {
         `${key} 上游请求次数错误`,
       );
       if (expectedCode) {
-        assert(responseBody?.error?.code === expectedCode, `${key} 502 code 错误: ${JSON.stringify(responseBody)}`);
+        assert(
+          responseBody?.error?.code === expectedCode,
+          `${key} 502 code 错误: ${responseText}`,
+        );
       } else {
-        assert(responseBody?.error?.message, `${key} 应原样透传上游错误体`);
+        assert(
+          responseBody?.error?.message || responseText.trim(),
+          `${key} 应原样透传上游错误体`,
+        );
       }
       assert(
         response.headers.get("x-codex-retry-gateway-reason") === expectedReason,
@@ -6330,6 +6422,37 @@ async function run() {
       });
     }
 
+    await runUpstreamPolicyCase({
+      key: "stream-capacity-text-plain-return-502",
+      capacityAction: "return_502",
+      http429Action: "pass_through",
+      requestBody: {
+        stream: true,
+        test_capacity_error_attempts: 1,
+        test_capacity_error_status: 503,
+        test_capacity_error_content_type: "text/plain; charset=utf-8",
+      },
+      expectedStatus: 502,
+      expectedRequests: 1,
+      expectedCode: "upstream_capacity_policy_triggered",
+      expectedReason: "upstream-capacity",
+    });
+
+    await runUpstreamPolicyCase({
+      key: "stream-http-429-text-plain-return-502",
+      capacityAction: "pass_through",
+      http429Action: "return_502",
+      requestBody: {
+        stream: true,
+        test_http_429_attempts: 1,
+        test_http_429_content_type: "text/plain; charset=utf-8",
+      },
+      expectedStatus: 502,
+      expectedRequests: 1,
+      expectedCode: "upstream_rate_limit_policy_triggered",
+      expectedReason: "upstream-rate-limited",
+    });
+
     const retryAfterDateKey = "http-429-retry-after-date";
     const retryAfterDateConfig = await fetch(
       `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
@@ -6420,6 +6543,59 @@ async function run() {
       "HTTP 429 与 reasoning 未共用 guard_retry_attempts",
     );
 
+    const disconnectHeadersSentConfig = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          reasoning_match_mode: "formula_518n_minus_2",
+          intercept_streaming: true,
+          guard_retry_attempts: 2,
+          stream_action: "disconnect",
+          latency_guard: {
+            enabled: false,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 0,
+          },
+        }),
+      },
+    );
+    assert(disconnectHeadersSentConfig.status === 200, "disconnect 已写头场景配置失败");
+    const disconnectHeadersSentKey = "disconnect-headers-sent-no-retry";
+    let disconnectHeadersSentResponse = null;
+    try {
+      disconnectHeadersSentResponse = await readSseUntilClose(
+        `http://127.0.0.1:${gatewayPort}/responses`,
+        {
+          stream: true,
+          test_sequence_key: disconnectHeadersSentKey,
+          test_reasoning_tokens: 516,
+          test_stream_reasoning_in_output_chunk: true,
+        },
+      );
+    } catch {
+      // 头尚未刷到客户端前直接断开时，fetch 可以在创建 Response 前失败。
+    }
+    assert(
+      (disconnectHeadersSentResponse === null || disconnectHeadersSentResponse.closedByError) &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === disconnectHeadersSentKey,
+        ).length === 1,
+      "客户端响应头已发送后，reasoning 命中只能断连且不得内部重试或改写 502",
+    );
+    const restoreStrictStreamActionResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ stream_action: "strict_502" }),
+      },
+    );
+    assert(restoreStrictStreamActionResponse.status === 200, "disconnect 场景后恢复 strict_502 失败");
+
     const configureLatencyGuard = async ({
       interceptRuleMode = "none",
       guardRetryAttempts = 0,
@@ -6449,6 +6625,49 @@ async function run() {
       );
       assert(response.status === 200, `latency_guard 配置失败: ${response.status}`);
     };
+
+    const bypassLatencyConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          endpoints: ["/responses"],
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 50,
+          },
+        }),
+      },
+    );
+    assert(bypassLatencyConfigResponse.status === 200, "旁路 latency 配置失败");
+    const bypassLatencyResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/v1/models?test_delay_ms=120`,
+    );
+    assert(
+      bypassLatencyResponse.status === 200 &&
+        bypassLatencyResponse.headers.get("x-upstream-test") === "models-ok",
+      "未列入 endpoints 的路径应完全旁路 latency guard",
+    );
+    const restoreManagedEndpointsResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          endpoints: [
+            "/responses",
+            "/chat/completions",
+            "/v1/responses",
+            "/v1/chat/completions",
+          ],
+        }),
+      },
+    );
+    assert(restoreManagedEndpointsResponse.status === 200, "恢复 gateway 管理 endpoints 失败");
 
     await configureLatencyGuard({ firstProgressTimeoutMs: 60 });
     const firstProgressTimeoutKey = "latency-first-progress-return-502";
@@ -6488,6 +6707,39 @@ async function run() {
     assert(
       lifecycleTimeoutResponse.status === 502,
       "仅收到 response.created/in_progress 不应结束首 progress 计时",
+    );
+
+    await configureLatencyGuard({ firstProgressTimeoutMs: 500, totalTimeoutMs: 1000 });
+    const preProgressTerminationKey = "latency-pre-progress-upstream-termination";
+    const preProgressTerminationResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: preProgressTerminationKey,
+        test_force_terminate_before_progress: true,
+      },
+    );
+    assert(
+      preProgressTerminationResponse.status === 200 &&
+        preProgressTerminationResponse.headers.get("x-upstream-test") === "sse-terminated" &&
+        preProgressTerminationResponse.text.includes("response.created"),
+      "none + latency_guard 在首 progress 前上游断流时应透传已缓冲前导块和上游响应头",
+    );
+
+    await configureLatencyGuard({ firstProgressTimeoutMs: 60 });
+    const emptyCommentaryTimeoutKey = "latency-empty-commentary-is-not-progress";
+    const emptyCommentaryTimeoutResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: emptyCommentaryTimeoutKey,
+        test_include_empty_commentary_event: true,
+        test_stream_pause_after_empty_commentary_ms: 200,
+      },
+    );
+    assert(
+      emptyCommentaryTimeoutResponse.status === 502,
+      "空 commentary 结构事件不应结束首 progress 计时",
     );
 
     const toolProgressKey = "latency-tool-call-is-progress";
@@ -6580,6 +6832,192 @@ async function run() {
       "已完整收到 429 后，首 progress timer 不应中断 Retry-After 等待",
     );
 
+    const policyDeadlineGatewayPort = await getFreePort();
+    const policyDeadlineConfigPath = path.join(tempRoot, "policy-deadline-config.json");
+    const policyDeadlineLogPath = path.join(tempRoot, "policy-deadline-gateway.log");
+    const policyDeadlineTimerFaultPath = path.join(tempRoot, "policy-deadline-timer-fault.cjs");
+    await writeFile(
+      policyDeadlineTimerFaultPath,
+      [
+        "const originalSetTimeout = global.setTimeout;",
+        "let acceleratedTotalDeadline = false;",
+        "global.setTimeout = function patchedSetTimeout(callback, delay, ...args) {",
+        "  const numericDelay = Number(delay);",
+        "  if (!acceleratedTotalDeadline && numericDelay >= 600 && numericDelay <= 731) {",
+        "    acceleratedTotalDeadline = true;",
+        "    return originalSetTimeout(callback, 100, ...args);",
+        "  }",
+        "  return originalSetTimeout(callback, delay, ...args);",
+        "};",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await writeFile(
+      policyDeadlineConfigPath,
+      JSON.stringify(
+        {
+          ...config,
+          listen_port: policyDeadlineGatewayPort,
+          intercept_rule_mode: "none",
+          guard_retry_attempts: 1,
+          http_429_action: "retry_then_502",
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 731,
+          },
+          active_probe: { enabled: false },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    let policyDeadlineGateway = null;
+    try {
+      policyDeadlineGateway = startGateway(
+        policyDeadlineConfigPath,
+        policyDeadlineLogPath,
+        { nodeArgs: ["--require", policyDeadlineTimerFaultPath] },
+      );
+      await waitForHealth(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}${config.health_path}`,
+        { gateway: policyDeadlineGateway, logPath: policyDeadlineLogPath },
+      );
+      const policyDeadlineKey = "latency-total-deadline-during-retry-after";
+      let policyDeadlineResponse = null;
+      let policyDeadlineBody = null;
+      let policyDeadlineError = null;
+      try {
+        policyDeadlineResponse = await fetch(
+          `http://127.0.0.1:${policyDeadlineGatewayPort}/responses`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              test_sequence_key: policyDeadlineKey,
+              test_http_429_attempts: 10,
+              test_retry_after: "0.25",
+            }),
+            signal: AbortSignal.timeout(1500),
+          },
+        );
+        policyDeadlineBody = await policyDeadlineResponse.json();
+      } catch (error) {
+        policyDeadlineError = error;
+      }
+      assert(
+        policyDeadlineResponse?.status === 502 &&
+          policyDeadlineResponse.headers.get("x-codex-retry-gateway-reason") ===
+            "upstream-total-timeout" &&
+          policyDeadlineBody?.error?.code === "upstream_total_timeout",
+        `Retry-After 等待被总 deadline 中断后必须返回 502: status=${policyDeadlineResponse?.status ?? "none"} body=${JSON.stringify(policyDeadlineBody)} error=${policyDeadlineError?.message || "none"}`,
+      );
+      const policyDeadlineAnalytics = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      const policyDeadlineSamples = (policyDeadlineAnalytics.recent_samples || []).filter((sample) =>
+        `${sample.request_payload_excerpt || ""}`.includes(policyDeadlineKey),
+      );
+      assert(
+        policyDeadlineSamples.length === 1 &&
+          policyDeadlineSamples[0]?.final_action === "total_timeout_returned_502" &&
+          policyDeadlineSamples[0]?.retry_after_ms === 250 &&
+          upstream.responseRequests.filter(
+            (entry) => entry.body?.test_sequence_key === policyDeadlineKey,
+          ).length === 1,
+        `Retry-After deadline 收口必须复用同一 attempt 样本且不得创建新 attempt: ${JSON.stringify(policyDeadlineSamples)}`,
+      );
+    } finally {
+      await stopGateway(policyDeadlineGateway);
+    }
+
+    const bufferLimitGatewayPort = await getFreePort();
+    const bufferLimitConfigPath = path.join(tempRoot, "buffer-limit-config.json");
+    const bufferLimitLogPath = path.join(tempRoot, "buffer-limit-gateway.log");
+    const bufferLimitFaultPath = path.join(tempRoot, "buffer-limit-fault.cjs");
+    await writeFile(
+      bufferLimitFaultPath,
+      [
+        "const originalPush = Array.prototype.push;",
+        "Array.prototype.push = function guardedPush(...items) {",
+        "  if (this.length > 0 && this.every((item) => Buffer.isBuffer(item)) && items.every((item) => Buffer.isBuffer(item))) {",
+        "    const bufferedBytes = this.reduce((sum, item) => sum + item.length, 0);",
+        "    const incomingBytes = items.reduce((sum, item) => sum + item.length, 0);",
+        "    if (bufferedBytes + incomingBytes > 1024 * 1024) {",
+        "      throw new Error('pre-progress buffer exceeded hard limit before flush');",
+        "    }",
+        "  }",
+        "  return Reflect.apply(originalPush, this, items);",
+        "};",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await writeFile(
+      bufferLimitConfigPath,
+      JSON.stringify(
+        {
+          ...config,
+          listen_port: bufferLimitGatewayPort,
+          intercept_rule_mode: "none",
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 5000,
+            first_progress_action: "return_502",
+            total_timeout_ms: 0,
+          },
+          active_probe: { enabled: false },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    let bufferLimitGateway = null;
+    try {
+      bufferLimitGateway = startGateway(
+        bufferLimitConfigPath,
+        bufferLimitLogPath,
+        { nodeArgs: ["--require", bufferLimitFaultPath] },
+      );
+      await waitForHealth(
+        `http://127.0.0.1:${bufferLimitGatewayPort}${config.health_path}`,
+        { gateway: bufferLimitGateway, logPath: bufferLimitLogPath },
+      );
+      const bufferLimitKey = "latency-pre-progress-buffer-hard-limit";
+      const bufferLimitResponse = await readSseUntilClose(
+        `http://127.0.0.1:${bufferLimitGatewayPort}/responses`,
+        {
+          stream: true,
+          test_sequence_key: bufferLimitKey,
+          test_include_stream_lifecycle: true,
+          test_stream_pre_progress_metadata_bytes: 1024 * 1024 + 64 * 1024,
+          test_stream_text: "buffer-limit-ok",
+        },
+      );
+      assert(
+        bufferLimitResponse.status === 200 &&
+          bufferLimitResponse.text.includes("buffer-limit-ok"),
+        `首 progress 前导缓冲不得瞬时越过 1 MiB 硬上限: status=${bufferLimitResponse.status} body=${bufferLimitResponse.text.slice(0, 200)}`,
+      );
+      const bufferLimitAnalytics = await fetch(
+        `http://127.0.0.1:${bufferLimitGatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      const bufferLimitSample = (bufferLimitAnalytics.recent_samples || []).find((sample) =>
+        `${sample.request_payload_excerpt || ""}`.includes(bufferLimitKey),
+      );
+      assert(
+        bufferLimitSample?.timeout_response_control_lost === true &&
+          bufferLimitSample?.response_forwarding_started === true,
+        `触及前导缓冲上限后应记录响应控制权已交给客户端: ${JSON.stringify(bufferLimitSample)}`,
+      );
+    } finally {
+      await stopGateway(bufferLimitGateway);
+    }
+
     await configureLatencyGuard({ totalTimeoutMs: 80 });
     const nonStreamBodyTimeoutKey = "latency-non-stream-body-stall";
     const nonStreamBodyTimeoutResponse = await fetch(
@@ -6662,6 +7100,73 @@ async function run() {
         forwardedTimeoutSample?.timeout_phase === "total" &&
         forwardedTimeoutSample?.response_forwarding_started === true,
       `已透传后的超时样本未明确记录断连事实: ${JSON.stringify(forwardedTimeoutSample)}`,
+    );
+
+    const clientDisconnectConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          latency_guard: {
+            enabled: false,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 0,
+          },
+        }),
+      },
+    );
+    assert(clientDisconnectConfigResponse.status === 200, "客户端断连场景配置失败");
+    const clientDisconnectKey = "client-disconnect-after-first-output";
+    const clientDisconnectController = new AbortController();
+    const clientDisconnectResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          stream: true,
+          test_sequence_key: clientDisconnectKey,
+          test_stream_text: "client-will-disconnect",
+          test_stream_pause_after_output_ms: 350,
+        }),
+        signal: clientDisconnectController.signal,
+      },
+    );
+    const clientDisconnectReader = clientDisconnectResponse.body.getReader();
+    const clientDisconnectFirstRead = await clientDisconnectReader.read();
+    assert(
+      !clientDisconnectFirstRead.done && clientDisconnectFirstRead.value?.length > 0,
+      "客户端断连测试未先收到首个输出",
+    );
+    clientDisconnectController.abort();
+    try {
+      await clientDisconnectReader.read();
+    } catch {
+      // AbortController 主动取消后 reader 抛 AbortError 属于预期。
+    }
+    let clientDisconnectSample = null;
+    const clientDisconnectSampleDeadline = Date.now() + 3000;
+    while (!clientDisconnectSample && Date.now() < clientDisconnectSampleDeadline) {
+      const payload = await fetch(
+        `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      clientDisconnectSample = (payload.recent_samples || []).find((sample) =>
+        `${sample.request_payload_excerpt || ""}`.includes(clientDisconnectKey),
+      );
+      if (!clientDisconnectSample) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    assert(
+      clientDisconnectSample?.final_action === "client_disconnected" &&
+        clientDisconnectSample?.response_forwarding_started === true &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === clientDisconnectKey,
+        ).length === 1,
+      `客户端主动断连未被独立收口: ${JSON.stringify(clientDisconnectSample)}`,
     );
     const layeredPolicyMetrics = await fetch(
       `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,

@@ -141,7 +141,7 @@ retry_then_502
 - `enabled=false` 时不创建超时计时器。
 - `0` 表示单独关闭该阈值。
 - `enabled=true` 时至少一个阈值必须大于 0。
-- 正数必须是安全整数。
+- 正数必须是不超过 Node timer 上限 `2147483647` 的整数。
 - `first_progress_action` 只允许 `return_502` 或 `retry_then_502`。
 - `total_timeout_ms` 是整个客户端请求跨内部重试的硬截止线；触发时已经没有剩余时间，因此始终直接进入 502 或已透传后的断连分支，不再开始新 attempt。
 - 默认关闭，升级后不改变现有请求生命周期。
@@ -186,6 +186,8 @@ timeout > capacity > generic HTTP 429 > reasoning rule > pass through
 4. `Retry-After` 单次等待上限固定为 60 秒，不增加新的管理页配置。
 5. `Retry-After` 超过 60 秒或超过请求剩余总 deadline 时，不提前轰击上游，直接执行当前动作的耗尽分支。
 6. 所有等待必须可被客户端断开、总超时或 gateway 关闭中止。
+7. 已开始等待后若总 deadline 先到，timeout 优先；当前 attempt 直接返回 `upstream-total-timeout` 502，不先记录为策略重试，也不重复创建样本。
+8. 等待中客户端断开时，当前 attempt 记录 `client_disconnected`，不得继续重试或伪造客户端状态。
 
 ## 8. 流式响应约束
 
@@ -201,7 +203,7 @@ timeout > capacity > generic HTTP 429 > reasoning rule > pass through
 
 - 首个有效输出到达时，先写上游响应头，再按原顺序刷出前导块和当前 chunk，随后进入直接透传。
 - 首个有效输出超时发生时，丢弃未透传前导块，可以安全重试或返回 502。
-- 前导块使用 1 MiB（1,048,576 bytes）固定内存上限；超过上限时必须开始透传并记录 `timeout_response_control_lost=true`，后续超时只能断开连接。
+- 前导块使用 1 MiB（1,048,576 bytes）固定内存硬上限；每个 chunk 在放入数组前先检查，若将越界则先刷已有前导块、当前 chunk 直接透传，并记录 `timeout_response_control_lost=true`，后续超时只能断开连接。
 - 前导缓冲不改变用户可见首字时间，因为其中不包含有效文字或工具调用。
 
 ### 8.3 已透传后的限制
@@ -212,6 +214,10 @@ timeout > capacity > generic HTTP 429 > reasoning rule > pass through
 - 不能在同一响应中重新派发并拼接新一轮输出。
 - 超时只能取消上游 reader、终止下游连接并写入明确样本。
 - `final_action` 必须区分 `timeout_disconnected_after_forward`，不能伪装成返回 502。
+
+### 8.4 策略管理路径
+
+`endpoints` 是 reasoning、Capacity、HTTP 429 与 latency guard 的共同管理边界。列表外路径完整旁路四类策略，只做原始代理与旁路样本采集，不允许出现 latency 生效而 Capacity/429 不生效的半旁路。
 
 ## 9. 502 契约
 

@@ -353,6 +353,8 @@ async function run() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           intercept_rule_mode: "none",
+          intercept_streaming: false,
+          intercept_non_streaming: false,
           capacity_error_action: "retry_then_502",
           http_429_action: "retry_then_pass_through",
           latency_guard: {
@@ -378,6 +380,11 @@ async function run() {
     const firstGatewayConfigRaw = await readFile(gatewayConfigPath, "utf8");
     const firstGatewayConfig = JSON.parse(firstGatewayConfigRaw);
     assert(firstGatewayConfig.intercept_rule_mode === "none", "Unix policy setup did not persist none mode");
+    assert(
+      firstGatewayConfig.intercept_streaming === false &&
+        firstGatewayConfig.intercept_non_streaming === false,
+      "Unix policy setup did not persist none mode disabled intercept targets",
+    );
     assert(
       firstGatewayConfig.capacity_error_action === "retry_then_502" &&
         firstGatewayConfig.http_429_action === "retry_then_pass_through",

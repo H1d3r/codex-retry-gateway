@@ -28,6 +28,7 @@ export const DEFAULT_CONTINUATION_MARKER_TEXT = "Continue thinking...";
 export const CONTINUATION_RECOVERY_STREAM_ACTION = "continuation_recovery";
 export const DEFAULT_STREAM_ACTION = CONTINUATION_RECOVERY_STREAM_ACTION;
 export const DEFAULT_GUARD_RETRY_ATTEMPTS = 5;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const UPSTREAM_ERROR_ACTIONS = new Set([
   "pass_through",
   "return_502",
@@ -81,7 +82,9 @@ function normalizeLatencyGuardInteger(value, fallback) {
     return fallback;
   }
   const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+  return Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= MAX_TIMER_DELAY_MS
+    ? parsed
+    : fallback;
 }
 
 function normalizeLatencyGuardConfig(value) {
@@ -991,7 +994,11 @@ export async function launchUi({
       reusableGatewayConfig.request_body_limit_bytes = normalizeRequestBodyLimitBytes(
         reusableGatewayConfig.request_body_limit_bytes,
       );
-      if (!reusableGatewayConfig.intercept_streaming && !reusableGatewayConfig.intercept_non_streaming) {
+      if (
+        reusableGatewayConfig.intercept_rule_mode !== NONE_INTERCEPT_RULE_MODE &&
+        !reusableGatewayConfig.intercept_streaming &&
+        !reusableGatewayConfig.intercept_non_streaming
+      ) {
         reusableGatewayConfig.intercept_streaming = true;
         reusableGatewayConfig.intercept_non_streaming = true;
       }

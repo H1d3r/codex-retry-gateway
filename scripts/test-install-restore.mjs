@@ -358,6 +358,8 @@ async function run() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           intercept_rule_mode: "none",
+          intercept_streaming: false,
+          intercept_non_streaming: false,
           capacity_error_action: "retry_then_502",
           http_429_action: "retry_then_pass_through",
           latency_guard: {
@@ -389,6 +391,11 @@ async function run() {
     assert(
       reloadedReusablePolicyConfig.intercept_rule_mode === "none",
       "Repeated manual install did not preserve intercept_rule_mode=none",
+    );
+    assert(
+      reloadedReusablePolicyConfig.intercept_streaming === false &&
+        reloadedReusablePolicyConfig.intercept_non_streaming === false,
+      "Repeated manual install did not preserve none mode disabled intercept targets",
     );
     assert(
       reloadedReusablePolicyConfig.capacity_error_action === "retry_then_502" &&
@@ -424,6 +431,8 @@ async function run() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           intercept_rule_mode: "reasoning_tokens",
+          intercept_streaming: true,
+          intercept_non_streaming: true,
           capacity_error_action: "retry_then_pass_through",
           http_429_action: "pass_through",
           latency_guard: {
@@ -1021,6 +1030,39 @@ async function run() {
     assert(
       invalidLatencyGuardResponse.status === 400,
       `启用 latency_guard 但阈值全为 0 应失败: ${invalidLatencyGuardResponse.status}`,
+    );
+
+    const overflowingLatencyGuardResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 2147483648,
+            first_progress_action: "return_502",
+            total_timeout_ms: 9000,
+          },
+        }),
+      },
+    );
+    assert(
+      overflowingLatencyGuardResponse.status === 400,
+      `超过 Node timer 上限的 latency_guard 应失败: ${overflowingLatencyGuardResponse.status}`,
+    );
+
+    const arrayLatencyGuardResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ latency_guard: [] }),
+      },
+    );
+    assert(
+      arrayLatencyGuardResponse.status === 400,
+      `非对象 latency_guard 应失败: ${arrayLatencyGuardResponse.status}`,
     );
 
     const invalidInterceptResponse = await fetch(`http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`, {

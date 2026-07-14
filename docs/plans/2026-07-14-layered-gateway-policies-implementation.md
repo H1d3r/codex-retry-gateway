@@ -94,12 +94,14 @@ node --check .\gateway.mjs
 git diff --check
 ```
 
-- [ ] **Step 6：提交 Task 1**
+- [x] **Step 6：提交 Task 1**
 
 ```powershell
 git add gateway.mjs config.example.json scripts/test-gateway-e2e.mjs scripts/test-install-restore.mjs
 git commit -m "feat: add layered gateway policy config"
 ```
+
+提交：`b1609ad`
 
 ### Task 2：真正直接流式透传与时序采集
 
@@ -150,12 +152,14 @@ node .\scripts\test-gateway-e2e.mjs
 node --check .\gateway.mjs
 ```
 
-- [ ] **Step 6：提交 Task 2**
+- [x] **Step 6：提交 Task 2**
 
 ```powershell
 git add gateway.mjs scripts/test-gateway-e2e.mjs
 git commit -m "feat: stream directly when reasoning rules are disabled"
 ```
+
+提交：`d7573f0`
 
 ### Task 3：Capacity 与通用 HTTP 429 策略
 
@@ -207,12 +211,14 @@ node .\scripts\test-gateway-e2e.mjs
 node --check .\gateway.mjs
 ```
 
-- [ ] **Step 6：提交 Task 3**
+- [x] **Step 6：提交 Task 3**
 
 ```powershell
 git add gateway.mjs scripts/test-gateway-e2e.mjs
 git commit -m "feat: add capacity and rate-limit policies"
 ```
+
+提交：`2644884`
 
 ### Task 4：首输出超时与总 deadline
 
@@ -267,12 +273,14 @@ node .\scripts\test-gateway-e2e.mjs
 node --check .\gateway.mjs
 ```
 
-- [ ] **Step 7：提交 Task 4**
+- [x] **Step 7：提交 Task 4**
 
 ```powershell
 git add gateway.mjs scripts/test-gateway-e2e.mjs
 git commit -m "feat: enforce first-output and total response deadlines"
 ```
+
+提交：`150241b`
 
 ### Task 5：Windows/Unix 配置迁移
 
@@ -282,6 +290,7 @@ git commit -m "feat: enforce first-output and total response deadlines"
 - 修改：`scripts/test-launch-ui.mjs`
 - 修改：`scripts/test-launch-ui-unix.mjs`
 - 修改：`scripts/admin-lib.mjs`
+- 修改：`scripts/common.ps1`
 - 修改：`scripts/install-for-current-provider.ps1`
 - 修改：`scripts/launch-ui.ps1`
 
@@ -290,11 +299,11 @@ git commit -m "feat: enforce first-output and total response deadlines"
 - Windows 与 Unix 必须使用相同默认动作和 latency guard 约束。
 - 已存在的 `none`、动作枚举和 latency guard 必须在 reuse 启动后逐字段保持。
 
-- [ ] **Step 1：写迁移 RED 测试**
+- [x] **Step 1：写迁移 RED 测试**
 
 四组场景：首次安装、旧 Capacity 布尔迁移、none 配置复用、嵌套 latency guard 复用。Windows/Unix 均断言配置内容和是否发生无意义重启。
 
-- [ ] **Step 2：运行 RED**
+- [x] **Step 2：运行 RED**
 
 ```powershell
 node .\scripts\test-install-restore.mjs
@@ -304,11 +313,11 @@ node .\scripts\test-launch-ui-unix.mjs
 
 预期：现有 PowerShell/Node normalizer 把 none 改回 reasoning_tokens 或缺少新字段。
 
-- [ ] **Step 3：实现最小迁移**
+- [x] **Step 3：实现最小迁移**
 
 `admin-lib.mjs` 和两个 PowerShell 控制面都只补缺失/非法字段；合法 none 与 latency guard 不重写。旧 Capacity 布尔按设计映射，正确配置二次启动保持零配置写入、零重启。
 
-- [ ] **Step 4：运行 GREEN 与 PowerShell AST**
+- [x] **Step 4：运行 GREEN 与 PowerShell AST**
 
 ```powershell
 node .\scripts\test-install-restore.mjs
@@ -319,12 +328,14 @@ node --check .\scripts\admin-lib.mjs
 
 再对 `install-for-current-provider.ps1` 与 `launch-ui.ps1` 执行 PowerShell Parser AST 检查。
 
-- [ ] **Step 5：提交 Task 5**
+- [x] **Step 5：提交 Task 5**
 
 ```powershell
-git add scripts/admin-lib.mjs scripts/install-for-current-provider.ps1 scripts/launch-ui.ps1 scripts/test-install-restore.mjs scripts/test-launch-ui.mjs scripts/test-launch-ui-unix.mjs
+git add scripts/admin-lib.mjs scripts/common.ps1 scripts/install-for-current-provider.ps1 scripts/launch-ui.ps1 scripts/test-install-restore.mjs scripts/test-launch-ui.mjs scripts/test-launch-ui-unix.mjs
 git commit -m "feat: migrate layered policy configuration"
 ```
+
+提交：`4480e21`
 
 ### Task 6：文档、完整验证、双 reviewer 与 GitHub 交付
 
@@ -336,11 +347,15 @@ git commit -m "feat: migrate layered policy configuration"
 - 修改：`docs/plans/sessions/crg-layered-gateway-policies.md`
 - 修改：`.ai-growth-os/runtime-workflows/crg-layered-gateway-policies.yml`
 
-- [ ] **Step 1：更新用户与排错文档**
+- [x] **Step 1：更新用户与排错文档**
 
 README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retry-After`。`build.md` 增加策略验收口径。`err.md` 记录 strict 全流缓冲造成首字接近完成时间的根因、修复边界和防回归命令。
 
-- [ ] **Step 2：执行完整本地验证**
+- [x] **Reviewer 修复：补齐状态机边界与对应 E2E**
+
+已按 RED/GREEN 补齐：Retry-After 等待中的总 deadline 502、客户端断连独立收口、已写响应禁止重试/502、非 JSON 流式 Capacity/429、首 progress 前断流保留前导块与响应头、空 commentary 不算 progress、endpoints 完整旁路、Node timer 最大值、非对象 latency 配置拒绝，以及严格 1 MiB 前导缓冲上限。当前状态为“修复完成、待 fresh 全量验证和原 reviewer 复审”。
+
+- [x] **Step 2：执行完整本地验证**
 
 ```powershell
 node .\scripts\test-gateway-e2e.mjs

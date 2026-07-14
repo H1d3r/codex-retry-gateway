@@ -81,6 +81,7 @@ const FIRST_PROGRESS_ACTIONS = new Set([
   UPSTREAM_ERROR_ACTION_RETRY_THEN_502,
 ]);
 const MAX_RETRY_AFTER_MS = 60 * 1000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const PRE_PROGRESS_BUFFER_LIMIT_BYTES = 1024 * 1024;
 const REASONING_ANALYSIS_CORE_FIELDS = [
   "reasoning_tokens",
@@ -872,8 +873,8 @@ function normalizeLatencyGuardInteger(value, fallback, fieldName) {
     return fallback;
   }
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new Error(`${fieldName} 必须是大于等于 0 的安全整数`);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > MAX_TIMER_DELAY_MS) {
+    throw new Error(`${fieldName} 必须是 0-${MAX_TIMER_DELAY_MS} 的整数`);
   }
   return parsed;
 }
@@ -1559,10 +1560,16 @@ function payloadHasVisibleContent(payload) {
 function payloadHasMeaningfulProgress(payload) {
   const structure = createStructureAccumulator();
   applyStructureSignalsFromPayload(payload, structure, { fromStream: true });
+  const hasNonEmptyCommentaryText = [
+    payload?.delta,
+    payload?.text,
+    payload?.content,
+    payload?.output_text,
+  ].some((value) => typeof value === "string" && value.trim());
   return Boolean(
     structure.has_output_text ||
     structure.has_final_answer ||
-    structure.has_commentary ||
+    (structure.has_commentary && hasNonEmptyCommentaryText) ||
     structure.has_tool_call
   );
 }
@@ -1813,6 +1820,7 @@ function handleAttemptLatencyTimeout({
   res,
   latencyGuard,
   upstreamStatus = null,
+  errorPayload = null,
 }) {
   const phase = latencyGuard.timeoutPhase;
   const limitMs = latencyGuard.timeoutLimitMs;
@@ -1838,7 +1846,7 @@ function handleAttemptLatencyTimeout({
   reasoningSample.retry_budget_remaining = requestTracking?.guardRetryRemaining ?? 0;
   reasoningSample.upstream_http_status = upstreamStatus;
   setRequestTrackingOutcome(requestTracking, "inspected");
-  finalizeModelInsights(monitor, pathname, modelContext);
+  finalizeModelInsights(monitor, pathname, modelContext, errorPayload);
   recordBlockedResponse(monitor, reasoningSample.is_streaming ? "stream" : "non-stream");
 
   const failureSummary = buildFailureSummary(
@@ -6065,6 +6073,16 @@ function buildEditableConfig(currentConfig, payload) {
     payload.http_429_action,
     currentConfig.http_429_action || DEFAULT_CONFIG.http_429_action,
   );
+  if (
+    payload.latency_guard !== undefined &&
+    (
+      payload.latency_guard === null ||
+      typeof payload.latency_guard !== "object" ||
+      Array.isArray(payload.latency_guard)
+    )
+  ) {
+    throw new Error("latency_guard 必须是对象");
+  }
   const nextLatencyGuard = normalizeLatencyGuardConfig(
     payload.latency_guard === undefined
       ? currentConfig.latency_guard
@@ -10949,35 +10967,20 @@ async function handleNonStreaming({
     reasoningSample.retry_after_raw = retryDelay.retryAfterRaw;
     reasoningSample.retry_after_ms = retryDelay.retryAfterMs;
     reasoningSample.retry_budget_remaining = requestTracking?.guardRetryRemaining ?? 0;
-    if (config.log_match) {
-      const action = canGuardRetry
-        ? `internal_retry remaining=${requestTracking.guardRetryRemaining}`
-        : actionExhaustsTo502(upstreamPolicy.action)
-          ? "return_status_502"
-          : "pass_through";
+    if (config.log_match && !canGuardRetry) {
+      const action = actionExhaustsTo502(upstreamPolicy.action)
+        ? "return_status_502"
+        : "pass_through";
       const logPrefix = upstreamPolicy.trigger === "capacity" ? "upstream-capacity" : "upstream-429";
       logger(
         `[${logPrefix}] non-stream path=${pathname} status=${upstreamResponse.status} action=${action}`,
       );
     }
     if (canGuardRetry) {
-      recordUpstreamPolicyOutcome(monitor, upstreamPolicy.trigger, "retry");
-      recordBlockedResponse(monitor, "non-stream");
-      finalizeModelInsights(monitor, pathname, modelContext, parsed);
-      completeReasoningBehaviorSample({
-        runtime,
-        sample: reasoningSample,
-        structure: structureAccumulator,
-        modelContext,
-        finalAction: `${upstreamPolicy.trigger}_internal_retry`,
-        clientHttpStatus: null,
-        matchedCurrentRule: false,
-        blockedByGateway: true,
-        failureSummary: buildFailureSummary(null, parsed),
-      });
       return {
         policyRetry: true,
-        retryReason: upstreamPolicy.trigger,
+        upstreamPolicy,
+        errorPayload: parsed,
         retryDelayMs: retryDelay.retryDelayMs,
       };
     }
@@ -11215,6 +11218,20 @@ async function handleStreaming({
     try {
       readResult = await reader.read();
     } catch (error) {
+      if (requestTracking?.client_disconnect_signal?.aborted) {
+        if (!inspectedRecorded) {
+          recordInspectedResponse(monitor, observedReasoning, false, "stream");
+          inspectedRecorded = true;
+        }
+        setRequestTrackingOutcome(requestTracking, "inspected");
+        finalizeModelInsights(monitor, pathname, modelContext);
+        finishReasoningSample({
+          finalAction: "client_disconnected",
+          clientHttpStatus: null,
+          failureSummary: buildFailureSummary(error),
+        });
+        return;
+      }
       if (latencyGuard?.timeoutPhase) {
         throw error;
       }
@@ -11239,6 +11256,11 @@ async function handleStreaming({
             failureSummary: buildFailureSummary(error),
           });
         } else {
+          if (bufferedChunks.length > 0) {
+            flushBufferedChunksToClient();
+          } else {
+            ensureClientHeaders();
+          }
           res.end();
           reasoningSample.upstream_stream_terminated = true;
           finishReasoningSample({
@@ -11424,7 +11446,7 @@ async function handleStreaming({
       }
       setRequestTrackingOutcome(requestTracking, "inspected");
       const shouldIntercept = config.intercept_streaming !== false;
-      const canReturnBlockedStatus = strict502Mode || !wroteAnyChunk;
+      const canReturnBlockedStatus = !res.headersSent && !wroteAnyChunk;
       const canContinuationRecover =
         streamAction === STREAM_ACTION_CONTINUATION_RECOVERY &&
         shouldIntercept &&
@@ -11527,13 +11549,22 @@ async function handleStreaming({
       bufferedChunks.push(chunkBuffer);
       bufferedBytes += chunkBuffer.length;
     } else if (deferClientForwarding && !reasoningSample.response_forwarding_started) {
-      bufferedChunks.push(chunkBuffer);
-      bufferedBytes += chunkBuffer.length;
-      if (chunkHasMeaningfulProgress || bufferedBytes > PRE_PROGRESS_BUFFER_LIMIT_BYTES) {
-        if (bufferedBytes > PRE_PROGRESS_BUFFER_LIMIT_BYTES && !chunkHasMeaningfulProgress) {
+      const exceedsBufferLimit =
+        bufferedBytes + chunkBuffer.length > PRE_PROGRESS_BUFFER_LIMIT_BYTES;
+      if (exceedsBufferLimit) {
+        if (!chunkHasMeaningfulProgress) {
           reasoningSample.timeout_response_control_lost = true;
         }
-        flushBufferedChunksToClient(nowMs);
+        if (bufferedChunks.length > 0) {
+          flushBufferedChunksToClient(nowMs);
+        }
+        writeClientChunk(chunkBuffer, nowMs);
+      } else {
+        bufferedChunks.push(chunkBuffer);
+        bufferedBytes += chunkBuffer.length;
+        if (chunkHasMeaningfulProgress) {
+          flushBufferedChunksToClient(nowMs);
+        }
       }
     } else {
       writeClientChunk(chunkBuffer, nowMs);
@@ -11644,7 +11675,7 @@ async function proxyRequest(runtime, req, res) {
     preparedContinuationRequest.autoAddedEncryptedReasoning === true ||
     shouldStripEncryptedContentFromContinuationResponse(config, pathname, shouldInspect, requestJson);
   requestTracking.total_deadline_at_ms =
-    config.latency_guard?.enabled && config.latency_guard.total_timeout_ms > 0
+    shouldInspect && config.latency_guard?.enabled && config.latency_guard.total_timeout_ms > 0
       ? Date.now() + config.latency_guard.total_timeout_ms
       : null;
   let guardRetryAttemptsUsed = 0;
@@ -11659,6 +11690,9 @@ async function proxyRequest(runtime, req, res) {
       abortAttemptForClientDisconnect,
       { once: true },
     );
+    if (requestTracking.client_disconnect_signal?.aborted) {
+      abortController.abort();
+    }
     const modelContext = createRequestModelContext(localConfigModel, requestJson?.model ?? null);
     const reasoningSample = buildReasoningBehaviorAttemptSample(
       runtime,
@@ -11679,7 +11713,7 @@ async function proxyRequest(runtime, req, res) {
       reasoningSample.upstream_fetch_started_at_ms,
     );
     const latencyGuard = createAttemptLatencyGuard(
-      config,
+      shouldInspect ? config : { latency_guard: DEFAULT_CONFIG.latency_guard },
       requestTracking,
       abortController,
     );
@@ -11699,8 +11733,11 @@ async function proxyRequest(runtime, req, res) {
 
       const upstreamContentType = upstreamResponse.headers.get("content-type");
       const responseIsStream =
-        isSseContentType(upstreamContentType) ||
-        (requestIsStream && !isJsonContentType(upstreamContentType));
+        upstreamResponse.status < 400 &&
+        (
+          isSseContentType(upstreamContentType) ||
+          (requestIsStream && !isJsonContentType(upstreamContentType))
+        );
 
       if (!shouldInspect) {
         const body = Buffer.from(await upstreamResponse.arrayBuffer());
@@ -11787,8 +11824,69 @@ async function proxyRequest(runtime, req, res) {
           abortController.signal,
         );
         if (!delayCompleted) {
-          return;
+          if (requestTracking.client_disconnect_signal?.aborted) {
+            runtime.monitor.failed_proxy_request_count += 1;
+            setRequestTrackingOutcome(requestTracking, "client_disconnected");
+            reasoningSample.retry_trigger = null;
+            applyModelContextToReasoningSample(reasoningSample, modelContext);
+            finalizeReasoningBehaviorSample(reasoningSample, structureAccumulator, {
+              final_action: "client_disconnected",
+              client_http_status: null,
+              failure_summary: buildFailureSummary(
+                new Error("client disconnected during retry wait"),
+              ),
+              latest_log_seq: runtime.monitor.next_log_seq - 1,
+            });
+            recordReasoningBehaviorSample(runtime, reasoningSample);
+            return;
+          }
+          if (latencyGuard.timeoutPhase) {
+            handleAttemptLatencyTimeout({
+              runtime,
+              config,
+              monitor: runtime.monitor,
+              pathname,
+              requestTracking,
+              modelContext,
+              reasoningSample,
+              structureAccumulator,
+              res,
+              latencyGuard,
+              upstreamStatus: reasoningSample.upstream_http_status,
+              errorPayload: handlerResult.errorPayload,
+            });
+            return;
+          }
+          throw new Error("upstream policy retry wait aborted");
         }
+        const upstreamPolicy = handlerResult.upstreamPolicy;
+        if (config.log_match) {
+          const logPrefix = upstreamPolicy.trigger === "capacity"
+            ? "upstream-capacity"
+            : "upstream-429";
+          logger(
+            `[${logPrefix}] non-stream path=${pathname} status=${reasoningSample.upstream_http_status} action=internal_retry remaining=${requestTracking.guardRetryRemaining}`,
+          );
+        }
+        recordUpstreamPolicyOutcome(runtime.monitor, upstreamPolicy.trigger, "retry");
+        recordBlockedResponse(runtime.monitor, "non-stream");
+        finalizeModelInsights(
+          runtime.monitor,
+          pathname,
+          modelContext,
+          handlerResult.errorPayload,
+        );
+        completeReasoningBehaviorSample({
+          runtime,
+          sample: reasoningSample,
+          structure: structureAccumulator,
+          modelContext,
+          finalAction: `${upstreamPolicy.trigger}_internal_retry`,
+          clientHttpStatus: null,
+          matchedCurrentRule: false,
+          blockedByGateway: true,
+          failureSummary: buildFailureSummary(null, handlerResult.errorPayload),
+        });
         guardRetryAttemptsUsed += 1;
         continue;
       }
@@ -11812,6 +11910,19 @@ async function proxyRequest(runtime, req, res) {
       }
       return;
     } catch (error) {
+      if (requestTracking.client_disconnect_signal?.aborted) {
+        runtime.monitor.failed_proxy_request_count += 1;
+        setRequestTrackingOutcome(requestTracking, "client_disconnected");
+        applyModelContextToReasoningSample(reasoningSample, modelContext);
+        finalizeReasoningBehaviorSample(reasoningSample, structureAccumulator, {
+          final_action: "client_disconnected",
+          client_http_status: null,
+          failure_summary: buildFailureSummary(error),
+          latest_log_seq: runtime.monitor.next_log_seq - 1,
+        });
+        recordReasoningBehaviorSample(runtime, reasoningSample);
+        return;
+      }
       if (latencyGuard.timeoutPhase) {
         const timeoutResult = handleAttemptLatencyTimeout({
           runtime,

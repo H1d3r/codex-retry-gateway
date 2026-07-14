@@ -169,7 +169,7 @@ function Normalize-LatencyGuardInteger {
     $null -ne $Value -and
     [long]::TryParse(([string]$Value).Trim(), [ref]$parsed) -and
     $parsed -ge 0 -and
-    $parsed -le 9007199254740991
+    $parsed -le 2147483647
   ) {
     return $parsed
   }

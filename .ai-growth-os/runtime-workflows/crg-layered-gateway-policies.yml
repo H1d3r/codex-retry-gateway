@@ -41,6 +41,7 @@ claimed_files:
   - gateway.mjs
   - config.example.json
   - scripts/admin-lib.mjs
+  - scripts/common.ps1
   - scripts/install-for-current-provider.ps1
   - scripts/launch-ui.ps1
   - scripts/test-gateway-e2e.mjs
@@ -103,7 +104,7 @@ verification_gates:
   - git diff --check
 protected_feature_replay:
   baseline_ref: git:b4cac27
-  completion_status: pending
+  completion_status: passed-after-review-fixes
   replay_plan:
     - reasoning 518*n-2 and manual values
     - final answer only high/xhigh and zero exclusion
@@ -115,8 +116,13 @@ post_implementation_review:
   required: true
   required_agent_count: 2
   same_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏 516、final-only、压缩豁免、续写与真实路由语义
-  reviewer_refs: []
-  parent_review_status: pending
+  reviewer_refs:
+    - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => REQUEST_CHANGES
+    - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => REQUEST_CHANGES
+  parent_review_status: fixes-implemented-awaiting-rereview
+  review_fix_evidence:
+    - Retry-After deadline and 1MiB hard-limit RED reproduced
+    - bundled Node gateway E2E PASS after latest source mutation
 git_progress_checkpoints:
   - startup-baseline
   - after-config-ui-batch

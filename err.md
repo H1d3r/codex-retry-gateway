@@ -1391,6 +1391,51 @@
    - 验证：
      - 报告返回 `TEST_MATRIX_STATUS=ready`、`SIBLING_REGRESSION_GUARD_STATUS=passed` 和 `TEST_GOVERNANCE_MATRIX_OK`。
 
+38. 严格 reasoning 全流缓冲会把客户端首字时间拖到接近响应完成，直接透传与超时改写必须按是否已写客户端分流
+   - 现象：
+     - 上游已经持续产生 SSE，但客户端长时间看不到首个有效输出，观测上首字时间接近整轮完成时间。
+     - 如果为降低延迟直接提前写响应头，后续命中规则、Capacity、429 或 timeout 时已无法安全改写为 `502`。
+   - 根因：
+     - 既有 strict reasoning 路径必须在完整解析后才能判断 token/结构命中，因此会缓存整轮 SSE。
+     - 上游首 chunk、首 content 与客户端首写是三个不同时间点；旧采集没有完整区分。
+     - HTTP 响应一旦开始透传，状态码和已写字节不可撤回，不能在同一响应里重新派发并拼接第二轮结果。
+   - 处理：
+     - `intercept_rule_mode=none` 禁用 reasoning 命中、续写和专用剥离，未启用 latency guard 时直接边读边透传。
+     - none + latency guard 只缓存首个有效输出前的 lifecycle/metadata，固定上限 `1MiB`；文字、commentary、final、tool/function call 才算 progress。
+     - 总 deadline 从第一次上游派发开始并跨内部 attempt 保持不变；首 progress 重试与 reasoning、续写、Capacity、429 共用 `guard_retry_attempts`。
+     - 未透传时 timeout 可返回稳定 `502`；已透传后只取消上游并断开连接，记录 `timeout_disconnected_after_forward`，不得伪装为 502。
+     - analytics schema 升级为 `3`，补充 `policy_*`、`retry_*`、客户端首写、timeout 和 forwarding 字段；旧样本缺字段统一保持 `null`。
+     - Windows/Unix 启动控制面保留合法 `none`、动作枚举和嵌套 `latency_guard`；旧 Capacity 布尔仅在新动作缺失时参与迁移，正确配置二次启动保持配置字节、mtime 和 PID 不变。
+   - 验证：
+     - `node .\scripts\test-gateway-e2e.mjs`
+     - `node .\scripts\test-install-restore.mjs`
+     - `node .\scripts\test-launch-ui.mjs`
+     - `node .\scripts\test-launch-ui-unix.mjs`
+     - `node --check .\gateway.mjs`
+     - `node --check .\scripts\admin-lib.mjs`
+     - PowerShell Parser AST 检查 `common.ps1`、`install-for-current-provider.ps1`、`launch-ui.ps1`
+     - `git diff --check`
+
+39. Retry-After 等待、客户端断连和前导缓冲必须在同一 attempt 内按最终事实收口
+   - 现象：
+     - 已完整收到 429 并进入 Retry-After 等待后，总 deadline 到期会从外层直接 `return`，客户端既收不到 502，也没有结束响应。
+     - 该 attempt 在等待前已被落成 `http_429_internal_retry`，再次走 timeout 会产生重复或矛盾样本。
+     - none + latency guard 会先把越界 chunk 压入前导数组，再发现已超过 `1MiB` 并刷新，因此固定值不是严格内存上限。
+     - 客户端主动断开与上游断流共用 AbortError，若不先检查客户端信号会误记为 upstream terminated。
+   - 根因：
+     - 策略 handler 过早完成 retry 计数、模型统计和 attempt 样本，等待结果不再拥有可收口的原始 sample。
+     - 外层只把 `waitForRetryDelay=false` 当作停止信号，没有区分 total timeout 与 client disconnect。
+     - 前导缓冲在 push 后才比较累计字节数，单个网络 chunk 可以让数组瞬时越界。
+   - 处理：
+     - 策略 handler 只返回 retry 意图；等待真正完成后才记录策略 retry、扣共享预算并创建下一 attempt。
+     - 等待被总 deadline 中断时，用同一未完成 sample 调用 timeout 收口并返回 `upstream-total-timeout` 502；客户端断开则记录 `client_disconnected`。
+     - 前导 chunk 在 push 前计算累计值；将越界时先刷已有块，当前 chunk 直接写给客户端。
+     - `endpoints` 作为 reasoning、Capacity、429、latency 的统一管理边界；timer 阈值限制为 `0..2_147_483_647`。
+   - 防回归：
+     - `node .\scripts\test-gateway-e2e.mjs` 使用两个独立临时网关做确定性故障注入，分别覆盖 deadline 中断等待和前导数组硬上限。
+     - deadline 用例要求 HTTP 502、`upstream_total_timeout`、只发一次上游请求且只落一个 `total_timeout_returned_502` sample。
+     - 缓冲用例要求大于 `1MiB` 的无 progress 元数据仍返回 200，并记录 `timeout_response_control_lost=true` 与 `response_forwarding_started=true`。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E
