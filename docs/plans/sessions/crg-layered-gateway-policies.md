@@ -359,16 +359,15 @@ post_implementation_review:
   review_scope: whole-source
   owner_requested_scope: all-source
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
-  implementation_snapshot_ref: git:f789066c685e565fe57cc4292ce346f2d898f9a4
-  last_mutation_ref: git:f789066c685e565fe57cc4292ce346f2d898f9a4
+  implementation_snapshot_ref: git:c1cb042be9ba7938bef9b7983f71b0e5108eadcb
+  last_mutation_ref: git:c1cb042be9ba7938bef9b7983f71b0e5108eadcb
   review_after_last_mutation: true
-  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..f789066c685e565fe57cc4292ce346f2d898f9a4
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..c1cb042be9ba7938bef9b7983f71b0e5108eadcb
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
-  returned_agent_count: 2
+  returned_agent_count: 0
   reviewer_output_refs:
-    - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=1
-    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=2, Minor=2
+    - none
   historical_reviewer_output_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
@@ -378,6 +377,8 @@ post_implementation_review:
     - agent:019f620a-81e7-7783-a8c2-1a002493178d => round-5 REQUEST_CHANGES, Critical=0, Important=4, Minor=1
     - agent:019f622a-eb8e-7012-a0d8-363d91794436 => round-6 REQUEST_CHANGES, Critical=0, Important=1, Minor=2
     - agent:019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
+    - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=1
+    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=2, Minor=2
   latest_rereview_findings:
     - policy retry sample closeout can delay the next real upstream dispatch beyond total deadline
     - mislabeled SSE data prefix split across chunks can be misclassified as plain-text progress
@@ -406,12 +407,7 @@ post_implementation_review:
     - incomplete-attempt-telemetry
     - protected-feature-regression
   reject_if_hits:
-    - retry-dispatch-final-deadline-gap
-    - synchronous-processing-crosses-deadline-before-client-write
-    - non-stream-observe-only-sample-recorded-before-forwarding
-    - interrupted-policy-wait-misses-trigger-counter
-    - PowerShell-canonical-scalar-array-corruption
-    - lifecycle-wall-clock-regression-crosses-before-first-chunk
+    - pending-original-reviewer-rereview
   resolved_findings_pending_rereview:
     - upload disconnect is client_disconnected with actual bytes, not request_rejected 413
     - unfinished SSE event and pre-progress buffers are bounded at 1MiB
@@ -494,6 +490,7 @@ implementation_commit_refs:
   - git:92c189d
   - git:248d001
   - git:f789066c685e565fe57cc4292ce346f2d898f9a4
+  - git:c1cb042be9ba7938bef9b7983f71b0e5108eadcb
 ```
 
 ## Stop Gates
