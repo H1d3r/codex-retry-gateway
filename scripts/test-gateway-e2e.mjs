@@ -99,6 +99,39 @@ function createSseResponse(res, chunks, intervalMs = 20) {
   });
 }
 
+function createSseResponseWithPauseAfterOutput(res, chunks, pauseMs, intervalMs = 20) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+    "x-upstream-test": "sse-paused-after-output",
+  });
+
+  let index = 0;
+  let timer = null;
+  let paused = false;
+  const writeNext = () => {
+    if (index >= chunks.length) {
+      res.end();
+      return;
+    }
+    const chunk = chunks[index];
+    index += 1;
+    res.write(chunk);
+    const shouldPause = !paused && chunk.includes('\"type\":\"response.output_text.delta\"');
+    if (shouldPause) {
+      paused = true;
+    }
+    timer = setTimeout(writeNext, shouldPause ? pauseMs : intervalMs);
+  };
+  timer = setTimeout(writeNext, intervalMs);
+  res.on("close", () => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
+}
+
 function createTerminatedSseResponse(res, chunks, destroyDelayMs = 20) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -3280,11 +3313,21 @@ function startFakeUpstream(port) {
             finishJsonResponse();
             return;
           }
-          createSseResponse(
-            res,
-            buildResponsesStreamChunks(parsed, reasoning, sequenceCount),
-            parsed.test_stream_chunk_delay_ms ?? 20,
-          );
+          const streamChunks = buildResponsesStreamChunks(parsed, reasoning, sequenceCount);
+          if (parsed.test_stream_pause_after_output_ms) {
+            createSseResponseWithPauseAfterOutput(
+              res,
+              streamChunks,
+              parsed.test_stream_pause_after_output_ms,
+              parsed.test_stream_chunk_delay_ms ?? 20,
+            );
+          } else {
+            createSseResponse(
+              res,
+              streamChunks,
+              parsed.test_stream_chunk_delay_ms ?? 20,
+            );
+          }
           return;
         }
         if (parsed.test_response_delay_ms) {
@@ -3642,6 +3685,7 @@ async function stopGateway(gateway) {
 }
 
 async function readSseUntilClose(url, requestBody, options = {}) {
+  const startedAtMs = Date.now();
   const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", ...(options.headers || {}) },
@@ -3652,12 +3696,16 @@ async function readSseUntilClose(url, requestBody, options = {}) {
   const decoder = new TextDecoder("utf8");
   let text = "";
   let closedByError = false;
+  let firstChunkAtMs = null;
 
   while (true) {
     try {
       const { done, value } = await reader.read();
       if (done) {
         break;
+      }
+      if (firstChunkAtMs === null) {
+        firstChunkAtMs = Date.now();
       }
       text += decoder.decode(value, { stream: true });
     } catch (error) {
@@ -3668,11 +3716,15 @@ async function readSseUntilClose(url, requestBody, options = {}) {
   }
 
   text += decoder.decode();
+  const completedAtMs = Date.now();
   return {
     status: response.status,
     headers: response.headers,
     text,
     closedByError,
+    startedAtMs,
+    firstChunkAtMs,
+    completedAtMs,
   };
 }
 
@@ -5210,6 +5262,102 @@ async function run() {
           sample.anomaly_type === "single_request_rebuild_suspected",
       ),
       "仅非流式模式下正常观察流式 516 不应生成 single_request_rebuild_suspected 可疑样本",
+    );
+
+    const noneModeKey = "none-direct-stream-516";
+    const noneModeSecret = "none-mode-encrypted-reasoning";
+    const noneModeMetricsBefore = statusAfterObservedOnlyStream.metrics;
+    const noneModeConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          stream_action: "continuation_recovery",
+          guard_retry_attempts: 3,
+        }),
+      },
+    );
+    assert(
+      noneModeConfigResponse.status === 200,
+      `切换不使用 reasoning 规则失败: ${noneModeConfigResponse.status}`,
+    );
+    const noneModeStream = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        model: "gpt-5.6-sol",
+        stream: true,
+        include: ["reasoning.encrypted_content"],
+        input: "none mode direct stream",
+        test_sequence_key: noneModeKey,
+        test_reasoning_tokens: 516,
+        test_stream_reasoning_encrypted_content: noneModeSecret,
+        test_stream_text: "none-mode-visible-output",
+        test_stream_chunk_delay_ms: 10,
+        test_stream_pause_after_output_ms: 600,
+      },
+    );
+    assert(noneModeStream.status === 200, `none 流式透传失败: ${noneModeStream.status}`);
+    assert(
+      Number.isFinite(noneModeStream.firstChunkAtMs) &&
+        noneModeStream.completedAtMs - noneModeStream.firstChunkAtMs >= 400,
+      `none 模式仍在等待完整 SSE 后才向客户端写入: ${JSON.stringify({
+        firstChunkAtMs: noneModeStream.firstChunkAtMs,
+        completedAtMs: noneModeStream.completedAtMs,
+      })}`,
+    );
+    assert(
+      noneModeStream.text.includes("none-mode-visible-output") &&
+        noneModeStream.text.includes("encrypted_content") &&
+        noneModeStream.text.includes(noneModeSecret),
+      `none 模式应原样保留可见输出与 encrypted reasoning: ${noneModeStream.text}`,
+    );
+    const noneModeRequests = upstream.responseRequests.filter(
+      (entry) => entry.body?.test_sequence_key === noneModeKey,
+    );
+    assert(
+      noneModeRequests.length === 1 &&
+        noneModeRequests[0].body?.include?.includes("reasoning.encrypted_content"),
+      `none 模式不应触发续写或改写 include: ${JSON.stringify(noneModeRequests)}`,
+    );
+    const noneModeStatus = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
+    ).then((response) => response.json());
+    assert(
+      noneModeStatus.metrics.matched_response_count === noneModeMetricsBefore.matched_response_count &&
+        noneModeStatus.metrics.continuation_recovery_count ===
+          noneModeMetricsBefore.continuation_recovery_count,
+      "none 模式不应增加 reasoning 命中或续写次数",
+    );
+    const noneModeAnalytics = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+    ).then((response) => response.json());
+    const noneModeSample = (noneModeAnalytics.recent_samples || []).find((sample) =>
+      `${sample.request_payload_excerpt || ""}`.includes(noneModeKey),
+    );
+    assert(
+      noneModeSample?.final_action === "passed" &&
+        noneModeSample?.matched_current_rule === false &&
+        noneModeSample?.blocked_by_gateway === false &&
+        Number.isFinite(noneModeSample?.time_to_first_progress_ms) &&
+        noneModeSample?.response_forwarding_started === true &&
+        Number.isFinite(noneModeSample?.client_first_write_at_ms),
+      `none 模式未完整采集直接透传与首个有效输出时序: ${JSON.stringify(noneModeSample)}`,
+    );
+    const restoreStreamActionAfterNoneResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          stream_action: statusAfterObservedOnlyStream.config?.stream_action,
+        }),
+      },
+    );
+    assert(
+      restoreStreamActionAfterNoneResponse.status === 200,
+      `none 用例后恢复 stream_action 失败: ${restoreStreamActionAfterNoneResponse.status}`,
     );
 
     const finalOnlyModeConfigResponse = await fetch(

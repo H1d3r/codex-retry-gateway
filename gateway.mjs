@@ -1512,6 +1512,34 @@ function markReasoningSampleFirstContent(sample, timestampMs = Date.now()) {
   sample.first_content_at = toIsoStringOrNull(timestampMs);
 }
 
+function markReasoningSampleFirstProgress(sample, timestampMs = Date.now()) {
+  if (!sample || Number.isFinite(sample.first_progress_at_ms)) {
+    return;
+  }
+  sample.first_progress_at_ms = timestampMs;
+  sample.first_progress_at = toIsoStringOrNull(timestampMs);
+}
+
+function markReasoningSampleClientHeadersSent(sample, timestampMs = Date.now()) {
+  if (!sample || Number.isFinite(sample.client_headers_sent_at_ms)) {
+    return;
+  }
+  sample.client_headers_sent_at_ms = timestampMs;
+  sample.client_headers_sent_at = toIsoStringOrNull(timestampMs);
+}
+
+function markReasoningSampleClientWrite(sample, timestampMs = Date.now()) {
+  if (!sample) {
+    return;
+  }
+  sample.response_forwarding_started = true;
+  if (Number.isFinite(sample.client_first_write_at_ms)) {
+    return;
+  }
+  sample.client_first_write_at_ms = timestampMs;
+  sample.client_first_write_at = toIsoStringOrNull(timestampMs);
+}
+
 function markReasoningSampleFinalChunk(sample, timestampMs = Date.now()) {
   if (!sample) {
     return;
@@ -1524,6 +1552,17 @@ function payloadHasVisibleContent(payload) {
   const structure = createStructureAccumulator();
   applyStructureSignalsFromPayload(payload, structure, { fromStream: true });
   return Boolean(structure.has_output_text || structure.has_final_answer);
+}
+
+function payloadHasMeaningfulProgress(payload) {
+  const structure = createStructureAccumulator();
+  applyStructureSignalsFromPayload(payload, structure, { fromStream: true });
+  return Boolean(
+    structure.has_output_text ||
+    structure.has_final_answer ||
+    structure.has_commentary ||
+    structure.has_tool_call
+  );
 }
 
 function completeReasoningBehaviorSample({
@@ -1587,6 +1626,8 @@ function buildReasoningBehaviorAttemptSample(runtime, requestTracking, attemptIn
     first_stream_chunk_at_ms: null,
     first_content_at: null,
     first_content_at_ms: null,
+    first_progress_at: null,
+    first_progress_at_ms: null,
     final_chunk_at: null,
     final_chunk_at_ms: null,
     request_finished_at: null,
@@ -1595,7 +1636,13 @@ function buildReasoningBehaviorAttemptSample(runtime, requestTracking, attemptIn
     upstream_wait_ms: null,
     time_to_first_chunk_ms: null,
     time_to_first_content_ms: null,
+    time_to_first_progress_ms: null,
     stream_duration_ms: null,
+    client_headers_sent_at: null,
+    client_headers_sent_at_ms: null,
+    client_first_write_at: null,
+    client_first_write_at_ms: null,
+    response_forwarding_started: false,
     input_tokens: null,
     reasoning_tokens: null,
     output_tokens: null,
@@ -1702,6 +1749,15 @@ function finalizeReasoningBehaviorSample(sample, structure, overrides = {}) {
     sample.time_to_first_content_ms = Math.max(
       0,
       sample.first_content_at_ms - sample.upstream_fetch_started_at_ms,
+    );
+  }
+  if (
+    Number.isFinite(sample.upstream_fetch_started_at_ms) &&
+    Number.isFinite(sample.first_progress_at_ms)
+  ) {
+    sample.time_to_first_progress_ms = Math.max(
+      0,
+      sample.first_progress_at_ms - sample.upstream_fetch_started_at_ms,
     );
   }
   if (
@@ -9944,6 +10000,14 @@ function shouldInterceptFinalAnswerOnlyReasoning(reasoning) {
 
 function buildInterceptRuleMatch(config, reasoning, reasoningSample, structure) {
   const mode = normalizeInterceptRuleMode(config?.intercept_rule_mode);
+  if (mode === INTERCEPT_RULE_MODE_NONE) {
+    return {
+      mode,
+      matched: false,
+      reasonForLog: "reasoning_rule=disabled",
+      blockedReasoning: reasoning,
+    };
+  }
   if (
     reasoningSample?.request_kind === REQUEST_KIND_CONTEXT_COMPACTION &&
     isContextCompactionExemptReasoning(reasoning)
@@ -10302,7 +10366,8 @@ function maybePrepareContinuationRecoveryRequestBody(
 
 function shouldStripEncryptedContentFromContinuationResponse(config, pathname, shouldInspect, requestJson) {
   return Boolean(
-    shouldInspect &&
+    normalizeInterceptRuleMode(config?.intercept_rule_mode) !== INTERCEPT_RULE_MODE_NONE &&
+      shouldInspect &&
       isResponsesPath(pathname) &&
       requestJson?.stream &&
       normalizeStreamAction(config.stream_action) === STREAM_ACTION_CONTINUATION_RECOVERY,
@@ -10521,7 +10586,10 @@ async function handleStreaming({
   abortController,
 }) {
   const streamAction = normalizeStreamAction(config.stream_action);
-  const strict502Mode = streamAction !== STREAM_ACTION_DISCONNECT;
+  const reasoningRulesDisabled =
+    normalizeInterceptRuleMode(config.intercept_rule_mode) === INTERCEPT_RULE_MODE_NONE;
+  const strict502Mode =
+    !reasoningRulesDisabled && streamAction !== STREAM_ACTION_DISCONNECT;
   const reader = upstreamResponse.body.getReader();
   const sseState = {
     decoder: new TextDecoder("utf8"),
@@ -10557,6 +10625,7 @@ async function handleStreaming({
   if (!strict502Mode) {
     copyHeadersToClient(upstreamResponse.headers, res);
     res.writeHead(upstreamResponse.status);
+    markReasoningSampleClientHeadersSent(reasoningSample);
   }
 
   while (true) {
@@ -10696,6 +10765,7 @@ async function handleStreaming({
       if (strict502Mode) {
         copyHeadersToClient(upstreamResponse.headers, res);
         res.writeHead(upstreamResponse.status);
+        markReasoningSampleClientHeadersSent(reasoningSample);
         const rawFinalBody = buildContinuationRecoveryFoldedBody(
           requestTracking,
           Buffer.concat(bufferedChunks),
@@ -10703,6 +10773,9 @@ async function handleStreaming({
         const finalBody = requestTracking?.strip_encrypted_reasoning_response
           ? stripEncryptedContentFromSseBody(rawFinalBody)
           : rawFinalBody;
+        if (finalBody.length > 0) {
+          markReasoningSampleClientWrite(reasoningSample);
+        }
         res.end(finalBody);
       } else {
         res.end();
@@ -10733,6 +10806,9 @@ async function handleStreaming({
       applyStructureSignalsFromPayload(payload, structureAccumulator, { fromStream: true });
       if (payloadHasVisibleContent(payload)) {
         markReasoningSampleFirstContent(reasoningSample, nowMs);
+      }
+      if (payloadHasMeaningfulProgress(payload)) {
+        markReasoningSampleFirstProgress(reasoningSample, nowMs);
       }
     }
     if (Number.isInteger(reasoning)) {
@@ -10783,6 +10859,7 @@ async function handleStreaming({
           bufferedChunks.push(chunkBuffer);
         } else {
           wroteAnyChunk = true;
+          markReasoningSampleClientWrite(reasoningSample, nowMs);
           res.write(chunkBuffer);
         }
         continue;
@@ -10852,6 +10929,7 @@ async function handleStreaming({
       bufferedChunks.push(chunkBuffer);
     } else {
       wroteAnyChunk = true;
+      markReasoningSampleClientWrite(reasoningSample, nowMs);
       res.write(chunkBuffer);
     }
   }

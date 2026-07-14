@@ -115,7 +115,7 @@ git commit -m "feat: add layered gateway policy config"
 - `markReasoningSampleFirstProgress()` 只写第一次有效输出时间。
 - `shouldStripEncryptedContentFromContinuationResponse()` 在 `none` 下必须返回 false。
 
-- [ ] **Step 1：写直接透传 RED 测试**
+- [x] **Step 1：写直接透传 RED 测试**
 
 扩展 mock SSE，使其可在首个有效 chunk 后延迟 completed。发起 `intercept_rule_mode=none` 请求，使用流式 reader 断言：
 
@@ -127,7 +127,7 @@ assert(sample.time_to_first_progress_ms !== null, "none 模式未采集首个有
 
 同时断言 none 模式不触发续写、不删除 encrypted content、不产生 reasoning match。
 
-- [ ] **Step 2：运行 RED**
+- [x] **Step 2：运行 RED**
 
 ```powershell
 node .\scripts\test-gateway-e2e.mjs
@@ -135,15 +135,15 @@ node .\scripts\test-gateway-e2e.mjs
 
 预期：客户端首个 chunk 仍在完整流结束后才到达，或 none 被归一化回旧模式。
 
-- [ ] **Step 3：实现 side-band 观察式透传**
+- [x] **Step 3：实现 side-band 观察式透传**
 
 `handleStreaming()` 根据 `intercept_rule_mode=none` 关闭 strict 全量缓冲，但继续解析 SSE、模型、usage、结构和时序。所有写头统一经过单次 helper，并把 `client_headers_sent_at_ms`、`client_first_write_at_ms`、`response_forwarding_started` 写入样本。
 
-- [ ] **Step 4：实现首个有效输出语义**
+- [x] **Step 4：实现首个有效输出语义**
 
 生命周期、心跳、元数据和 encrypted reasoning 不调用 `markReasoningSampleFirstProgress()`；非空 text/commentary/final 与 tool/function call 调用。保留现有 `first_content`，新增字段不能替换旧字段。
 
-- [ ] **Step 5：运行 GREEN**
+- [x] **Step 5：运行 GREEN**
 
 ```powershell
 node .\scripts\test-gateway-e2e.mjs
