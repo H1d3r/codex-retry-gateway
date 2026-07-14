@@ -227,11 +227,11 @@ git commit -m "feat: add capacity and rate-limit policies"
 - `PRE_PROGRESS_BUFFER_LIMIT_BYTES = 1024 * 1024`。
 - handler timeout 结果只描述事实；`proxyRequest()` 决定重试、502 或已透传后断连。
 
-- [ ] **Step 1：写首 progress RED 测试**
+- [x] **Step 1：写首 progress RED 测试**
 
 mock SSE 支持延迟首 chunk、先 lifecycle 后 text、先 tool call 后 text。断言 lifecycle 不结束计时，tool call 与非空 text 会结束计时；超时可直接 502 或按共享预算重试恢复。
 
-- [ ] **Step 2：写总 deadline 与已透传 RED 测试**
+- [x] **Step 2：写总 deadline 与已透传 RED 测试**
 
 断言：
 
@@ -242,7 +242,7 @@ mock SSE 支持延迟首 chunk、先 lifecycle 后 text、先 tool call 后 text
 - 非流式 body stall 可被总 deadline 取消。
 - 请求结束后没有未清理 timer 或临时 gateway 进程。
 
-- [ ] **Step 3：运行 RED**
+- [x] **Step 3：运行 RED**
 
 ```powershell
 node .\scripts\test-gateway-e2e.mjs
@@ -250,17 +250,17 @@ node .\scripts\test-gateway-e2e.mjs
 
 预期：慢响应继续无限等待，或 AbortError 被误记成普通 stream terminated。
 
-- [ ] **Step 4：实现 attempt latency guard**
+- [x] **Step 4：实现 attempt latency guard**
 
 timer 回调必须先设置明确 `timeoutPhase`，再 `abortController.abort()`。`handleStreaming()` 遇到 AbortError 时先检查 timeout state，不能把策略超时收口成普通上游断流。
 
 none 模式在启用 latency guard 时只缓存首 progress 前导块；到达 1 MiB 后开始透传并写 `timeout_response_control_lost=true`。首 progress 后清理对应 timer；所有分支在 `finally` 清理剩余 timer、reader 和监听器。
 
-- [ ] **Step 5：补详细落盘与实时计数**
+- [x] **Step 5：补详细落盘与实时计数**
 
 按设计第 10 节补 attempt 字段、`final_action`、JSON/CSV 字段和运行期 Capacity/429/timeout 计数。旧样本缺字段时返回 null。
 
-- [ ] **Step 6：运行 GREEN**
+- [x] **Step 6：运行 GREEN**
 
 ```powershell
 node .\scripts\test-gateway-e2e.mjs
