@@ -1,0 +1,145 @@
+schema_version: agos.runtime-workflow.v1
+task_id: crg-layered-gateway-policies
+workflow_lookup_mode: dynamic-generated
+tracking_issue_ref: https://github.com/nonononull/codex-retry-gateway/issues/26
+session_plan_ref: docs/plans/sessions/crg-layered-gateway-policies.md
+approved_decision_ref: session-plan:crg-layered-gateway-policies#decision
+scope_hash: crg-none-capacity-429-latency-policy-v1
+selected_business_path: external-project-node-gateway-development
+mutation_intent: source
+executor_enforcement: tdd-shared-retry-budget-no-live-gateway-apply
+task_registration_status: owner-approved-external-project-warning-mode
+owner_scope_ref: user:2026-07-14-approved-layered-policy-design-and-full-delivery
+main_thread_confirmation: approved
+registration_exception_reason: GitHub issue #26 and project-native controls are the task truth; do not mutate the AI Growth OS central registry for this external repository.
+workflow_nodes:
+  - startup
+  - knowledge-prep
+  - approved-design
+  - implementation-plan
+  - red-tests
+  - config-ui
+  - passthrough-streaming
+  - upstream-error-policies
+  - latency-guard
+  - migration
+  - verify
+  - review
+  - pr
+  - merge
+  - distill
+allowed_operations:
+  - read
+  - edit
+  - test
+  - local-review
+  - commit
+  - push
+  - pr
+  - merge
+claimed_files:
+  - gateway.mjs
+  - config.example.json
+  - scripts/admin-lib.mjs
+  - scripts/install-for-current-provider.ps1
+  - scripts/launch-ui.ps1
+  - scripts/test-gateway-e2e.mjs
+  - scripts/test-install-restore.mjs
+  - scripts/test-launch-ui.mjs
+  - scripts/test-launch-ui-unix.mjs
+  - README.md
+  - build.md
+  - err.md
+  - docs/plans/2026-07-14-layered-gateway-policies-design.md
+  - docs/plans/2026-07-14-layered-gateway-policies-implementation.md
+  - docs/plans/sessions/crg-layered-gateway-policies.md
+  - .ai-growth-os/runtime-workflows/crg-layered-gateway-policies.yml
+skill_tree_nodes:
+  - superpowers:brainstorming
+  - superpowers:using-git-worktrees
+  - superpowers:writing-plans
+  - superpowers:test-driven-development
+  - karpathy-guidelines
+  - superpowers:requesting-code-review
+  - superpowers:verification-before-completion
+  - superpowers:finishing-a-development-branch
+subagent_roles:
+  - proxy-timeout-reviewer
+  - config-migration-reviewer
+code_authoring_rules:
+  - D:\Android_source\ai-growth-os\components\rules\rules\domain\agent-generated-code.md
+  - D:\Android_source\ai-growth-os\components\rules\rules\quality\comments.md
+  - D:\Android_source\ai-growth-os\components\rules\rules\quality\complexity-file-size.md
+  - D:\Android_source\ai-growth-os\components\rules\rules\quality\testing.md
+errmd_correction_watchlist:
+  - upstream-stream-termination-and-strict-502-buffering
+  - full-request-attempt-sample-coverage
+  - streaming-vs-non-streaming-interception-accounting
+  - headers-sent-before-final-policy-decision
+model_drift_guards:
+  - preserve-518n-minus-2-model-independent-rule
+  - preserve-final-only-high-xhigh-contract
+  - preserve-context-compaction-zero-exemption
+  - preserve-continuation-recovery-folding
+  - preserve-user-gateway-settings
+  - no-live-gateway-restart
+stop_gates:
+  - stop if production behavior is edited before a corresponding expected RED
+  - stop if none mode still buffers the complete SSE
+  - stop if a retry or 502 occurs after downstream forwarding starts
+  - stop if total deadline resets across internal attempts
+  - stop if generic 5xx responses become retryable
+  - stop if Windows or Unix migration rewrites a valid none or latency config
+  - stop if any test targets the real 127.0.0.1:4610 gateway
+verification_gates:
+  - node .\scripts\test-gateway-e2e.mjs
+  - node .\scripts\test-install-restore.mjs
+  - node .\scripts\test-launch-ui.mjs
+  - node .\scripts\test-launch-ui-unix.mjs
+  - node --check .\gateway.mjs
+  - node --check .\scripts\admin-lib.mjs
+  - PowerShell AST parse changed scripts
+  - temporary gateway process audit
+  - git diff --check
+protected_feature_replay:
+  baseline_ref: git:b4cac27
+  completion_status: pending
+  replay_plan:
+    - reasoning 518*n-2 and manual values
+    - final answer only high/xhigh and zero exclusion
+    - context compaction zero exemption
+    - continuation recovery and retry exhaustion
+    - exact Capacity legacy behavior
+    - Windows and Unix idempotent launch/recovery
+post_implementation_review:
+  required: true
+  required_agent_count: 2
+  same_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏 516、final-only、压缩豁免、续写与真实路由语义
+  reviewer_refs: []
+  parent_review_status: pending
+git_progress_checkpoints:
+  - startup-baseline
+  - after-config-ui-batch
+  - after-proxy-policy-batch
+  - after-migration-batch
+  - pre-verification
+  - pre-pr
+rollout_draft:
+  source_task: crg-layered-gateway-policies
+  business_path: external-project-node-gateway-development
+  workflow_nodes:
+    - approved-design
+    - red-tests
+    - bounded-source-batches
+    - full-local-verification
+    - two-reviewer-whole-branch-review
+    - pr-merge
+  verification_gates:
+    - four-local-e2e-scripts
+    - two-node-syntax-checks
+    - PowerShell-AST
+    - temporary-process-audit
+    - git-diff-check
+  closeout_ref: docs/plans/sessions/crg-layered-gateway-policies.md#closeout
+  validation_attribution: current-task-local-tests-and-two-reviewers
+  follow_up_required: no-live-apply-without-owner-confirmation
