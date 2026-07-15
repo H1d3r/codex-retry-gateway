@@ -267,6 +267,14 @@ git_progress_checkpoints:
   - review-fix-batch-11-startup
   - review-fix-batch-11-pre-snapshot
   - pre-pr
+  - post-main-sync-pre-push
+delivery_evidence:
+  pr_ref: https://github.com/nonononull/codex-retry-gateway/pull/27
+  ci_ref: local:2026-07-15-post-main-sync-four-e2e-six-js-syntax-three-powershell-ast-diff-process-audit
+  github_checks_status: disabled-no-checks-reported
+  merge_ref: https://github.com/nonononull/codex-retry-gateway/pull/27
+  merge_status_source: GitHub PR state and Issue 26 state are the post-merge truth.
+  live_gateway_applied: false
 rollout_draft:
   source_task: crg-layered-gateway-policies
   business_path: external-project-node-gateway-development

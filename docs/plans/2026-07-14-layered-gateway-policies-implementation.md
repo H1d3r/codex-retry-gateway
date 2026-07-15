@@ -406,10 +406,12 @@ git add README.md build.md err.md docs/plans/sessions/crg-layered-gateway-polici
 git commit -m "docs: document layered gateway policies"
 ```
 
-- [ ] **Step 5：先收口依赖 PR #25**
+- [x] **Step 5：先收口依赖 PR #25**
 
 确认 #25 仍指向已审查 commit，检查合并状态后合并。同步 `main` 后确认本分支相对 `main` 只包含 issue #26 改动。
 
-- [ ] **Step 6：推送、创建并合并新 PR**
+- [x] **Step 6：推送、创建并核验新 PR**
 
 PR 必须 `Closes #26`，列出双 reviewer、完整本地验证和“未应用真实 gateway”。确认 PR diff、base/head 和 issue 关联后再合并；合并后读取 merge commit 并确认 issue 已关闭。
+
+交付 PR：`https://github.com/nonononull/codex-retry-gateway/pull/27`。PR 已核验为 `main <- codex/passthrough-retry-timeout-policies`、`MERGEABLE/CLEAN`、17 个变更文件，并由 GitHub 正确识别 `Closes #26`。仓库 GitHub Actions 已禁用，PR 显示 `no checks reported`；本次以同步 `origin/main` 后 fresh 串行通过的四套本地 E2E、六个 JS syntax、三份 PowerShell AST、diff check 和临时进程审计作为 CI 证据。最终合并状态、merge commit 与 Issue 关闭状态以 PR #27 和 Issue #26 的 GitHub 状态为真源，避免为了在同一个 PR 内回填其尚未产生的 merge commit 形成自引用。

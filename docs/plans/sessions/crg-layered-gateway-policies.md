@@ -668,7 +668,7 @@ review_fix_batch_11_green_evidence:
   - delayed lifecycle fault window uses 500ms, 60 lifecycle events and delayed 300..500ms timers to prove chunks on both sides without bucket collisions
   - gateway E2E initial GREEN and stability replay 3/3 GREEN
   - install-restore, Windows launch, Unix launch, six JS syntax, three PowerShell AST, full diff check and temporary process audit PASS
-full_verification_status: review-fix-batch-11-two-reviewer-pass-pr-gate-open
+full_verification_status: post-main-sync-fresh-local-verification-pass-pr-27-clean
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
@@ -678,8 +678,10 @@ review_refs:
   - agent:019f6266-bbcd-7870-9e23-2838fd017498
   - agent:019f6470-4c72-7de2-ac27-5d27a7fdf93b
   - agent:019f6470-6074-7822-991e-734f4aa5bbfd
-pr_ref: pending
-merge_ref: pending
+pr_ref: https://github.com/nonononull/codex-retry-gateway/pull/27
+ci_ref: local:2026-07-15-post-main-sync-four-e2e-six-js-syntax-three-powershell-ast-diff-process-audit
+ci_note: GitHub Actions disabled; PR reports no checks, so fresh local verification is the delivery CI evidence.
+merge_ref: https://github.com/nonononull/codex-retry-gateway/pull/27
 rollout_ref: pending
 sibling_regression_guard: passed
 ```
