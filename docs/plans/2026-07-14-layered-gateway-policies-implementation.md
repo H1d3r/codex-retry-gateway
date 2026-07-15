@@ -373,6 +373,8 @@ README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retr
 
 第十轮原 reviewer 的 1 个 Important 已按 RED/GREEN 关闭：流式 reader 被识别为预期终止后，先完成模型归档、日志、错误体与可撤回 header 准备，再在不可撤回写出前按 `total -> first-progress` 复核。严格模式错误体构造跨 total 的旧实现会返回普通 `gateway_error` termination 502；`none + latency_guard` 模型归档跨 first-progress 的旧实现会把 lifecycle 以 200 正常结束，两条 RED 同时缺少 timeout outcome。修复后分别返回稳定 total/first-progress 502，样本保留 `upstream_stream_terminated=true` 并落正确 `timeout_phase/final_action`；既有 500ms 内正常前导断流仍透传 200。同步把会与 45ms 剩余 timer 碰撞的 lifecycle fixture 移到独立 150ms bucket，并用 24 个 lifecycle 事件证明 deadline 两侧均有真实 chunk。gateway E2E 首轮通过、连续 3 轮稳定复跑通过，最终遥测断言补强后再次通过；三套生命周期、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程审计通过，等待新源码快照后的双 reviewer 复审。
 
+第十一轮两名 reviewer 均以 `Critical=0 / Important=0 / Minor=1 / PASS` 独立确认：缓冲 flush 在 header copy 前捕获时间，再把旧时间写入 `client_first_write_at_ms`，同步 header copy 较慢时会形成“客户端首写早于发头”的不可能采集。确定性 RED 让 termination header copy 阻塞 100ms，实际复现首写比发头早 100ms；GREEN 将客户端首写时间改到 `ensureClientHeaders()` 返回后紧邻 `res.write()` 现取，原有上游 chunk 到达字段不变。为消除 Windows/Undici 调度对 lifecycle 证据的剩余干扰，延迟 timer 窗口最终扩大为 500ms、60 个 lifecycle，并将 `300..500ms` timer 统一延迟到 800ms；修复后 gateway E2E 首轮通过、连续 3 轮稳定复跑通过，三套生命周期、六个 JS syntax、三份 PowerShell AST、完整 diff check 和临时进程审计全部通过。
+
 - [x] **Step 2：执行完整本地验证**
 
 ```powershell

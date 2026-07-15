@@ -217,6 +217,8 @@ tdd:
   reviewer_round_2_green_evidence_ref: 2026-07-15 Codex bundled Node four sequential E2E suites PASS with HTTP-status-based Retry-After, wall-clock deadline recheck, byte-bounded mixed-newline SSE framing, content sniffing, dedicated oversized-event 502 and preserved observe-only timeout match
   reviewer_round_10_red_evidence_ref: 2026-07-15 gateway E2E returned ordinary gateway_error termination 502 after terminal body construction crossed total; with the first assertion temporarily removed, none + latency_guard flushed lifecycle as 200 after model finalization crossed first-progress
   reviewer_round_10_green_evidence_ref: 2026-07-15 bundled Node gateway E2E initial PASS, stability replay 3/3 PASS, and one final PASS after timeout telemetry assertions; both samples preserve upstream_stream_terminated and record the correct timeout phase/action
+  reviewer_round_11_red_evidence_ref: 2026-07-15 termination header copy stalled 100ms and persisted client_first_write_at_ms exactly 100ms earlier than client_headers_sent_at_ms
+  reviewer_round_11_green_evidence_ref: 2026-07-15 bundled Node gateway E2E initial PASS and stability replay 3/3 PASS with client headers sent no later than client first write
   production_edit_before_red: forbidden
   test_files:
     - scripts/test-gateway-e2e.mjs
@@ -245,9 +247,12 @@ agent_lifecycle:
       - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-8 REQUEST_CHANGES, Critical=0, Important=4, Minor=0
       - 019f6266-bbcd-7870-9e23-2838fd017498 => round-8 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
       - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-9 REQUEST_CHANGES, Critical=0, Important=1, Minor=0
+      - 019f6266-bbcd-7870-9e23-2838fd017498 => round-10 PASS, Critical=0, Important=0, Minor=1
+      - 019f6444-66b8-7360-b308-64eb84d1f3be => round-10 PASS, Critical=0, Important=0, Minor=1
     idle: []
     timeout:
       - 019f6266-bbcd-7870-9e23-2838fd017498 => round-9 shutdown without verdict after wait and explicit final-verdict request
+      - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-10 shutdown without verdict after wait and explicit final-verdict request
     failed: []
   closed_agent_refs:
     - 019f6040-55cb-7dc0-a70d-d8a5c7a03d99
@@ -256,6 +261,7 @@ agent_lifecycle:
     - 019f622a-ffce-7980-92b3-ef6b51ca9b73
     - 019f6266-a7c6-7571-8982-73d9a90d2393
     - 019f6266-bbcd-7870-9e23-2838fd017498
+    - 019f6444-66b8-7360-b308-64eb84d1f3be
   review_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏既有高风险行为？
   closeout_rule: 两名 reviewer 正常返回最终 verdict，Critical/Important 清零并完成复审。
 ```
@@ -365,16 +371,15 @@ post_implementation_review:
   review_scope: whole-source
   owner_requested_scope: all-source
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
-  implementation_snapshot_ref: git:c100c31d73f4ccf20ff387ce71a5008a73ee136d
-  last_mutation_ref: git:c100c31d73f4ccf20ff387ce71a5008a73ee136d
+  implementation_snapshot_ref: git:35756dfe5cc423d8e668890d3bb24eb6c602759c
+  last_mutation_ref: git:35756dfe5cc423d8e668890d3bb24eb6c602759c
   review_after_last_mutation: false
-  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..c100c31d73f4ccf20ff387ce71a5008a73ee136d
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..35756dfe5cc423d8e668890d3bb24eb6c602759c
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
-  returned_agent_count: 1
+  returned_agent_count: 0
   reviewer_output_refs:
-    - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-9 REQUEST_CHANGES, Critical=0, Important=1, Minor=0
-    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-9 shutdown-without-verdict
+    - none
   historical_reviewer_output_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
@@ -388,7 +393,10 @@ post_implementation_review:
     - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=2
     - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-8 REQUEST_CHANGES, Critical=0, Important=4, Minor=0
     - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-8 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
+    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-10 PASS, Critical=0, Important=0, Minor=1
+    - agent:019f6444-66b8-7360-b308-64eb84d1f3be => round-10 PASS, Critical=0, Important=0, Minor=1
   latest_rereview_findings:
+    - buffered client writes can reuse a timestamp captured before reversible header copy and persist client_first_write_at_ms earlier than client_headers_sent_at_ms
     - expected stream termination can cross total or first-progress deadline during synchronous terminal preparation and still write an ordinary termination 502 or flush a 200 response
     - initial total deadline starts before the first real fetch and can persist an undispatched inspected sample
     - current first-progress deadline starts before the real fetch and can expire in the remaining pre-dispatch window
@@ -460,11 +468,11 @@ post_implementation_review:
     - model insights are idempotent per attempt model context
     - lifecycle evidence proves gateway processing before the deadline with first_stream_chunk_at_ms
     - expected stream termination preserves its fact but rechecks total then first-progress after synchronous terminal preparation and before irreversible forwarding
-    - the lifecycle delayed-timer regression uses a disjoint 150ms bucket based on actual remaining timer values
-  completion_status: review-fix-batch-10-source-snapshot-ready-awaiting-two-reviewers
+    - the lifecycle delayed-timer regression uses a 500ms deadline, 60 events and delayed 300..500ms timers
+  completion_status: review-fix-batch-11-source-snapshot-35756df-ready-awaiting-two-reviewers
   parent_resolution:
     status: blocked
-    reason: round-10-source-snapshot-c100c31-ready-awaiting-two-fresh-reviewer-verdicts
+    reason: round-11-source-snapshot-35756df-ready-awaiting-two-fresh-reviewer-verdicts
   implementation_freeze_status: active
   allowed_ops:
     - local-review
@@ -642,7 +650,17 @@ review_fix_batch_10_green_evidence:
   - delayed lifecycle fixture uses a disjoint 120..150ms timer range and 24 events to prove chunks on both sides of the 150ms deadline
   - gateway E2E initial GREEN, stability replay 3/3 GREEN, and final telemetry-assertion replay GREEN
   - install-restore, Windows launch, Unix launch, six JS syntax, three PowerShell AST, full diff check and temporary process audit PASS
-full_verification_status: review-fix-batch-10-source-snapshot-c100c31-ready-awaiting-two-reviewers
+review_fix_batch_11_red_evidence:
+  - a 100ms synchronous termination header copy produced client_first_write_at_ms exactly 100ms before client_headers_sent_at_ms
+  - response behavior remained 200, proving the defect was isolated to persisted client timing telemetry
+review_fix_batch_11_green_evidence:
+  - client write timestamps are sampled after ensureClientHeaders and immediately before res.write
+  - upstream chunk arrival and final chunk timing remain on their existing dedicated fields
+  - deterministic termination header-copy stall returns 200 and persists client_headers_sent_at_ms no later than client_first_write_at_ms
+  - delayed lifecycle fault window uses 500ms, 60 lifecycle events and delayed 300..500ms timers to prove chunks on both sides without bucket collisions
+  - gateway E2E initial GREEN and stability replay 3/3 GREEN
+  - install-restore, Windows launch, Unix launch, six JS syntax, three PowerShell AST, full diff check and temporary process audit PASS
+full_verification_status: review-fix-batch-11-source-snapshot-35756df-ready-awaiting-two-reviewers
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc

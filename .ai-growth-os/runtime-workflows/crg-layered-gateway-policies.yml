@@ -119,17 +119,16 @@ post_implementation_review:
   review_scope: whole-source
   owner_requested_scope: all-source
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
-  implementation_snapshot_ref: git:c100c31d73f4ccf20ff387ce71a5008a73ee136d
-  last_mutation_ref: git:c100c31d73f4ccf20ff387ce71a5008a73ee136d
+  implementation_snapshot_ref: git:35756dfe5cc423d8e668890d3bb24eb6c602759c
+  last_mutation_ref: git:35756dfe5cc423d8e668890d3bb24eb6c602759c
   review_after_last_mutation: false
-  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..c100c31d73f4ccf20ff387ce71a5008a73ee136d
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..35756dfe5cc423d8e668890d3bb24eb6c602759c
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
-  returned_agent_count: 1
+  returned_agent_count: 0
   same_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏 516、final-only、压缩豁免、续写与真实路由语义
   reviewer_output_refs:
-    - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-9 REQUEST_CHANGES, Critical=0, Important=1, Minor=0
-    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-9 shutdown-without-verdict
+    - none
   historical_reviewer_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
@@ -143,7 +142,10 @@ post_implementation_review:
     - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=2
     - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-8 REQUEST_CHANGES, Critical=0, Important=4, Minor=0
     - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-8 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
+    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-10 PASS, Critical=0, Important=0, Minor=1
+    - agent:019f6444-66b8-7360-b308-64eb84d1f3be => round-10 PASS, Critical=0, Important=0, Minor=1
   latest_rereview_findings:
+    - buffered client writes can reuse a timestamp captured before reversible header copy and persist client_first_write_at_ms earlier than client_headers_sent_at_ms
     - expected stream termination can cross total or first-progress deadline during synchronous terminal preparation and still write an ordinary termination 502 or flush a 200 response
     - initial total deadline starts before the first real fetch and can persist an undispatched inspected sample
     - current first-progress deadline starts before the real fetch and can expire in the remaining pre-dispatch window
@@ -151,12 +153,12 @@ post_implementation_review:
     - streaming ensureClientHeaders checks total before header copy instead of immediately before writeHead
     - timeout after an earlier finalizeModelInsights call can submit the same attempt insights twice
     - lifecycle evidence records upstream send timing but not gateway processing before the deadline
-  parent_review_status: review-fix-batch-10-source-snapshot-c100c31-ready-awaiting-two-reviewers
+  parent_review_status: review-fix-batch-11-source-snapshot-35756df-ready-awaiting-two-reviewers
   reject_if_hits:
     - unresolved-round-8-review-findings
   parent_resolution:
     status: blocked
-    reason: round-10-source-snapshot-c100c31-ready-awaiting-two-fresh-reviewer-verdicts
+    reason: round-11-source-snapshot-35756df-ready-awaiting-two-fresh-reviewer-verdicts
   implementation_freeze_status: active
   allowed_ops:
     - local-review
@@ -232,10 +234,15 @@ post_implementation_review:
     - none + latency_guard expected termination rechecks first-progress after model finalization and reversible header copy
     - timeout samples preserve upstream_stream_terminated and use the timeout phase/action as final truth
     - normal lifecycle-only termination inside the configured window still forwards 200
-    - delayed lifecycle regression uses a disjoint 120..150ms remaining-timer bucket and 24 events
+    - delayed lifecycle regression uses a 500ms deadline, 60 events and delayed 300..500ms timers
     - 2026-07-15 round-10 gateway E2E initial GREEN, stability replay 3/3 PASS and final telemetry replay PASS
     - 2026-07-15 round-10 three lifecycle E2E suites PASS
     - 2026-07-15 round-10 six JS syntax, three PowerShell AST, full diff check and temporary process audit PASS
+    - client write timestamps are sampled after ensureClientHeaders and immediately before res.write
+    - deterministic termination header-copy stall preserves HTTP 200 and client_headers_sent_at_ms no later than client_first_write_at_ms
+    - 2026-07-15 round-11 gateway E2E initial GREEN and stability replay 3/3 PASS
+    - 2026-07-15 round-11 three lifecycle E2E suites PASS
+    - 2026-07-15 round-11 six JS syntax, three PowerShell AST, full diff check and temporary process audit PASS
 git_progress_checkpoints:
   - startup-baseline
   - after-config-ui-batch
@@ -253,6 +260,8 @@ git_progress_checkpoints:
   - review-fix-batch-9-pre-snapshot
   - review-fix-batch-10-startup
   - review-fix-batch-10-pre-snapshot
+  - review-fix-batch-11-startup
+  - review-fix-batch-11-pre-snapshot
   - pre-pr
 rollout_draft:
   source_task: crg-layered-gateway-policies

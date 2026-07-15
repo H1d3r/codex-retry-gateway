@@ -1656,11 +1656,25 @@
    - 处理：
      - reader 终止事实先写入 `upstream_stream_terminated`；模型归档、日志和错误体保持可撤回，strict 写头前按 `total -> first-progress` 最终复核。
      - 非 strict 只在 expected-termination flush 路径启用 first-progress 最终 gate；可撤回 header copy 后、`writeHead` 前复核，避免影响普通流式首写。
-     - lifecycle 故障注入改用独立 `120..150ms` 剩余 timer bucket、150ms 阈值和 24 个 lifecycle 事件，避开既有 45/47/70/200ms 区间。
+     - lifecycle 故障注入最终改用 500ms 阈值和 60 个 lifecycle 事件，并将 `300..500ms` timer 统一延迟到 800ms，避开一次性 bucket 被同值 timer 提前消费。
    - 防回归：
      - 错误体构造阻塞 100ms 必须把 strict termination 收成 `upstream_total_timeout` 502；指定模型归档阻塞 100ms 必须把 lifecycle-only termination 收成 `upstream_first_progress_timeout` 502。
      - 两条 timeout 样本必须保留 `upstream_stream_terminated=true`，并分别落 `total_timeout_returned_502` 与 `first_progress_timeout_returned_502`；500ms 内正常前导断流仍为 200。
-     - 2026-07-15 Codex bundled Node gateway E2E 首轮 GREEN、连续 3/3 稳定复跑 GREEN，最终遥测断言补强后再次 GREEN；install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留均通过。
+     - 2026-07-15 Codex bundled Node gateway E2E 首轮 GREEN、连续 3/3 稳定复跑 GREEN，最终遥测断言补强后再次 GREEN；round-11 扩大到 500ms 后再次首轮 GREEN 与 3/3 稳定复跑 GREEN。install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留均通过。
+
+51. 客户端首写采集必须取真实写入时刻，不能复用 header copy 前的缓冲时间
+   - 现象：
+     - `flushBufferedChunksToClient(Date.now())` 在 `ensureClientHeaders()` 前捕获时间；同步 header copy 较慢时，`markReasoningSampleClientWrite()` 会把这个旧值写成 `client_first_write_at_ms`。
+     - 两名独立 reviewer 均确认该路径可产生 `client_first_write_at_ms < client_headers_sent_at_ms`，虽不改变 HTTP 行为，却会低估首写耗时并污染后续时序分析。
+   - 根因：
+     - 同一个 timestamp 参数同时承担“上游 chunk 处理时刻”和“客户端真实写入时刻”；前者应保存在 `first_stream_chunk_at_ms/final_chunk_at_ms`，后者必须由客户端写边界单独采样。
+   - 处理：
+     - `writeClientChunk()` 在 `ensureClientHeaders()` 返回后调用无显式时间参数的 `markReasoningSampleClientWrite()`，由它紧邻 `res.write()` 现取 `Date.now()`。
+     - `flushBufferedChunksToClient()` 不再接收或传播旧 timestamp；普通直写、首 progress flush、缓冲上限 flush 和 expected-termination flush 共用同一真实写边界。
+   - 防回归：
+     - fake upstream 为 termination 响应附加专用测试 header；fault preload 在 `copyHeadersToClient()` 阻塞 100ms，并断言响应仍为 200、阻塞真实发生、`client_headers_sent_at_ms <= client_first_write_at_ms`。
+     - RED 精确复现 header 在 `1784095029696ms` 发送、首写却记录为 `1784095029596ms`；GREEN 后完整 gateway E2E 首轮通过并连续 3/3 稳定复跑。
+     - 2026-07-15 install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留全部通过。
 
 ### 2026-06-26 实测证据
 

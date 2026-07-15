@@ -117,6 +117,7 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - 两个 latency 阈值只接受 `0..2_147_483_647` 的整数；Retry-After 等待中命中总 deadline 必须复用当前 attempt 返回 timeout 502，不能静默结束或重复落盘。
 - timer 回调不是 deadline 的唯一真源；非流式 JSON/脱敏、流式 SSE/结构解析、每个 chunk、EOF、reader 异常、retry 派发与客户端写入前都必须按绝对时间复核。流式 chunk 必须先收口检查上限，再按 total、first-progress 顺序复核；测试要让前几个 lifecycle 在 deadline 前到达、后续 lifecycle 首次跨线，不能只测首 chunk 已过期。
 - reader 发生预期终止时，模型归档、日志、错误体和可撤回 header copy 完成后，必须在 `writeHead` 或前导缓冲 flush 前再次按 `total -> first-progress` 复核；跨线后只能落 timeout 结果，不能返回普通 termination 502 或 lifecycle 200。
+- `client_first_write_at_ms` 表示真实客户端写入时刻，必须在 header copy 与 `writeHead` 完成后、紧邻 `res.write()` 记录；不得复用上游 chunk 到达或缓冲 flush 开始时间，也不得早于 `client_headers_sent_at_ms`。
 - Capacity/429、reasoning、续写和首 progress retry 共用统一 pending 派发闸门；header/request 等同步准备必须在最终 deadline 复核和 current 首 progress 计时之前完成，真实 fetch 启动后才增加共享预算、代理总数和 active。旧 attempt 的结束时间/日志范围在 retry 决策时捕获，下一 fetch 启动并让出两个有界事件循环轮次后立即落盘，不得等待下一响应头。过期分支不得保留新 attempt 样本。
 - Capacity/429 的 trigger 在分类时计数，retry/pass-through/502 在动作确定时分别计数；Retry-After 等待被客户端断连或 total deadline 中断时，trigger 仍必须保留且 retry 不得增加。
 - Windows canonical 配置比较必须保留字符串、数字、布尔数组的值和顺序，同时只忽略对象键顺序。
