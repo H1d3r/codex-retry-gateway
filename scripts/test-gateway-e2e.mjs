@@ -718,6 +718,9 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "logMatchInput",
     "probeTargetFamily54Input",
     "probeTargetFamily55Input",
+    "probeTargetFamily56SolInput",
+    "probeTargetFamily56TerraInput",
+    "probeTargetFamily56LunaInput",
     "probeAutoEnabledInput",
     "probeIntervalMinutesInput",
     "saveButton",
@@ -854,7 +857,13 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
       active_probe: {
         enabled: true,
         interval_ms: 10 * 60 * 1000,
-        target_families: ["gpt-5.4", "gpt-5.5"],
+        target_families: [
+          "gpt-5.4",
+          "gpt-5.5",
+          "gpt-5.6-sol",
+          "gpt-5.6-terra",
+          "gpt-5.6-luna",
+        ],
       },
     },
     state: {
@@ -1676,6 +1685,13 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     elements.probeTargetFamily55Input.checked === true,
     "主动探针未回填 gpt-5.5 复选框",
   );
+  for (const [elementId, model] of [
+    ["probeTargetFamily56SolInput", "gpt-5.6-sol"],
+    ["probeTargetFamily56TerraInput", "gpt-5.6-terra"],
+    ["probeTargetFamily56LunaInput", "gpt-5.6-luna"],
+  ]) {
+    assert(elements[elementId].checked === true, `主动探针未回填 ${model} 复选框`);
+  }
   assert(
     elements.probeAutoEnabledInput.checked === true,
     "主动探针未回填自动探测开关",
@@ -2222,6 +2238,9 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   );
   elements.probeTargetFamily54Input.checked = false;
   elements.probeTargetFamily55Input.checked = false;
+  elements.probeTargetFamily56SolInput.checked = false;
+  elements.probeTargetFamily56TerraInput.checked = false;
+  elements.probeTargetFamily56LunaInput.checked = false;
   elements.probeAutoEnabledInput.checked = true;
   elements.probeAutoEnabledInput.emit("change", {
     target: elements.probeAutoEnabledInput,
@@ -2241,6 +2260,9 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   );
   elements.probeTargetFamily54Input.checked = true;
   elements.probeTargetFamily55Input.checked = false;
+  elements.probeTargetFamily56SolInput.checked = true;
+  elements.probeTargetFamily56TerraInput.checked = false;
+  elements.probeTargetFamily56LunaInput.checked = true;
   elements.probeAutoEnabledInput.checked = false;
   elements.probeIntervalMinutesInput.value = "7";
   const probeConfigPayload = sandbox.collectActiveProbeFormPayload();
@@ -2254,7 +2276,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   );
   assert(
     JSON.stringify(probeConfigPayload.target_families) ===
-      JSON.stringify(["gpt-5.4"]),
+      JSON.stringify(["gpt-5.4", "gpt-5.6-sol", "gpt-5.6-luna"]),
     "主动探针表单未正确收集 target_families",
   );
   const configSaveCountBeforeInvalidIntercept = fetchBodies.filter((entry) =>
@@ -2320,7 +2342,7 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   );
   assert(
     JSON.stringify(savedPayload.active_probe.target_families) ===
-      JSON.stringify(["gpt-5.4"]),
+      JSON.stringify(["gpt-5.4", "gpt-5.6-sol", "gpt-5.6-luna"]),
     "saveConfig 未提交 active_probe.target_families",
   );
   elements.interceptRuleModeFinalOnlyInput.checked = false;
@@ -2437,6 +2459,9 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   );
   elements.probeTargetFamily54Input.checked = false;
   elements.probeTargetFamily55Input.checked = false;
+  elements.probeTargetFamily56SolInput.checked = false;
+  elements.probeTargetFamily56TerraInput.checked = false;
+  elements.probeTargetFamily56LunaInput.checked = false;
   elements.probeAutoEnabledInput.checked = true;
   await sandbox.persistActiveProbeConfigFromControls().then(
     () => {
@@ -3983,6 +4008,13 @@ async function run() {
       uiHtml.includes('id="probeTargetFamily55Input"'),
       "管理页缺少 gpt-5.5 主动探针复选框",
     );
+    for (const [controlId, model] of [
+      ["probeTargetFamily56SolInput", "gpt-5.6-sol"],
+      ["probeTargetFamily56TerraInput", "gpt-5.6-terra"],
+      ["probeTargetFamily56LunaInput", "gpt-5.6-luna"],
+    ]) {
+      assert(uiHtml.includes(`id="${controlId}"`), `管理页缺少 ${model} 主动探针复选框`);
+    }
     assert(
       uiHtml.includes('id="probeAutoEnabledInput"'),
       "管理页缺少自动探测开关",
@@ -5214,6 +5246,33 @@ async function run() {
       finalOnlyHighPositiveResponse.status === 502,
       `high final answer only reasoning_tokens=85 仍应被拦截: ${finalOnlyHighPositiveResponse.status}`,
     );
+    for (const effort of ["max", "ultra"]) {
+      const response = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: effort === "max" ? "gpt-5.6-sol" : "gpt-5.6-terra",
+          reasoning: { effort },
+          test_reasoning_tokens: 85,
+          test_include_final_answer_only: true,
+        }),
+      });
+      assert(
+        response.status === 200,
+        `${effort} 不属于 final_answer_only_high_xhigh，不能被实验规则拦截: ${response.status}`,
+      );
+    }
+    const maxUltraFinalOnlyAnalytics = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+    ).then((response) => response.json());
+    for (const effort of ["max", "ultra"]) {
+      assert(
+        maxUltraFinalOnlyAnalytics.recent_samples?.some(
+          (sample) => sample.request_reasoning_effort === effort && sample.final_action === "passed",
+        ),
+        `${effort} final answer only 放行样本未完整落入 analytics`,
+      );
+    }
     const compactionFinalOnlyZeroResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
       {
@@ -5548,6 +5607,24 @@ async function run() {
       formulaModeResponse.status === 502,
       `518*n-2 规则模式应命中 2070，而不是只命中默认三值: ${formulaModeResponse.status}`,
     );
+    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      for (const reasoningTokens of [516, 1034]) {
+        const response = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model,
+            reasoning: { effort: "ultra" },
+            test_response_model: model,
+            test_reasoning_tokens: reasoningTokens,
+          }),
+        });
+        assert(
+          response.status === 502,
+          `${model} 的 ${reasoningTokens} 未沿用模型无关公式规则: ${response.status}`,
+        );
+      }
+    }
     const manualModeRestoreResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
       {
@@ -7362,6 +7439,152 @@ async function run() {
       `gpt-5.5 一致声明请求失败: ${familyMatched55Response.status}`,
     );
 
+    const gpt56Models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+    const observedReasoningEfforts = [
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra",
+    ];
+    const gpt56Cases = gpt56Models.flatMap((model) =>
+      observedReasoningEfforts.map((effort) => ({ model, effort })),
+    );
+    for (const testCase of gpt56Cases) {
+      const response = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: testCase.model,
+          reasoning: { effort: testCase.effort },
+          test_response_model: testCase.model,
+          test_reasoning_tokens: 128,
+        }),
+      });
+      assert(response.status === 200, `${testCase.model}/${testCase.effort} 请求失败: ${response.status}`);
+    }
+
+    for (const testCase of [
+      {
+        model: "gpt-5.6-sol-2026-07-13",
+        expectedFamily: "gpt-5.6-sol",
+      },
+      {
+        model: "gpt-5.6-solar",
+        expectedFamily: "other",
+      },
+      {
+        model: "gpt-5.6-terrain",
+        expectedFamily: "other",
+      },
+      {
+        model: "gpt-5.6-lunatic",
+        expectedFamily: "other",
+      },
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: testCase.model,
+          reasoning: { effort: "medium" },
+          test_response_model: testCase.model,
+          test_reasoning_tokens: 128,
+        }),
+      });
+      assert(response.status === 200, `${testCase.model} 模型边界请求失败: ${response.status}`);
+    }
+
+    const gpt56Analytics = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+    ).then((response) => response.json());
+    for (const testCase of gpt56Cases) {
+      assert(
+        gpt56Analytics.by_model_family?.some((entry) => entry.model_family === testCase.model),
+        `reasoning analytics 未区分 ${testCase.model}`,
+      );
+      assert(
+        gpt56Analytics.by_model_family_and_effort?.some(
+          (entry) => entry.group_key === `${testCase.model}|${testCase.effort}`,
+        ),
+        `reasoning analytics 未保留 ${testCase.model}/${testCase.effort} 分桶`,
+      );
+    }
+    assert(
+      gpt56Analytics.by_reasoning_effort?.some((entry) => entry.reasoning_effort === "max") &&
+        gpt56Analytics.by_reasoning_effort?.some((entry) => entry.reasoning_effort === "ultra"),
+      "reasoning analytics 未区分 max/ultra 思考等级",
+    );
+    const gpt56MismatchResponse = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        reasoning: { effort: "max" },
+        test_response_model: "gpt-5.6-terra",
+        test_reasoning_tokens: 128,
+      }),
+    });
+    assert(gpt56MismatchResponse.status === 200, `GPT-5.6 跨变体 mismatch 请求失败: ${gpt56MismatchResponse.status}`);
+
+    const gpt56ExportJson = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning/export?format=json`,
+    ).then((response) => response.json());
+    for (const testCase of gpt56Cases) {
+      assert(
+        gpt56ExportJson.samples?.some(
+          (sample) =>
+            sample.request_model === testCase.model &&
+            sample.request_reasoning_effort === testCase.effort,
+        ),
+        `reasoning JSON 导出缺少 ${testCase.model}/${testCase.effort}`,
+      );
+    }
+    for (const [model, expectedFamily] of [
+      ["gpt-5.6-sol-2026-07-13", "gpt-5.6-sol"],
+      ["gpt-5.6-solar", "other"],
+      ["gpt-5.6-terrain", "other"],
+      ["gpt-5.6-lunatic", "other"],
+    ]) {
+      assert(
+        gpt56ExportJson.samples?.some(
+          (sample) =>
+            sample.request_model === model &&
+            sample.request_model_family === expectedFamily,
+        ),
+        `reasoning JSON 导出的模型边界归类错误: ${model} -> ${expectedFamily}`,
+      );
+    }
+    const gpt56ExportCsv = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning/export?format=csv`,
+    ).then((response) => response.text());
+    for (const value of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "max", "ultra"]) {
+      assert(gpt56ExportCsv.includes(value), `reasoning CSV 导出缺少 ${value}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const gpt56DayFiles = (await readdir(path.join(tempRoot, "analytics"))).filter(
+      (name) => name.startsWith("reasoning-behavior-") && name.endsWith(".json"),
+    );
+    const persistedGpt56Samples = (
+      await Promise.all(
+        gpt56DayFiles.map(async (name) =>
+          JSON.parse(await readFile(path.join(tempRoot, "analytics", name), "utf8")),
+        ),
+      )
+    ).flatMap((payload) => payload.samples || []);
+    for (const testCase of gpt56Cases) {
+      assert(
+        persistedGpt56Samples.some(
+          (sample) =>
+            sample.request_model === testCase.model &&
+            sample.request_reasoning_effort === testCase.effort,
+        ),
+        `reasoning 日文件缺少 ${testCase.model}/${testCase.effort}`,
+      );
+    }
+
     const familyMismatchResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
       {
@@ -7573,6 +7796,16 @@ async function run() {
     const familyBreakdown =
       statusWithModelInsights.model_insights.family_breakdown;
     assert(familyBreakdown, "status 缺少 family_breakdown");
+    for (const testCase of gpt56Cases) {
+      assert(
+        familyBreakdown[testCase.model]?.consistency?.matched >= 1,
+        `模型一致性统计未记录 ${testCase.model}: ${JSON.stringify(familyBreakdown[testCase.model])}`,
+      );
+    }
+    assert(
+      familyBreakdown["gpt-5.6-sol"]?.consistency?.mismatched >= 1,
+      "模型一致性未把 gpt-5.6-sol -> gpt-5.6-terra 记为跨变体 mismatch",
+    );
     assert(
       familyBreakdown["gpt-5.4"]?.consistency?.total_checked === 20,
       `gpt-5.4 家族 total_checked 统计不正确: ${familyBreakdown["gpt-5.4"]?.consistency?.total_checked}`,
@@ -7853,9 +8086,9 @@ async function run() {
           "x-stainless-lang": "js",
         },
         body: JSON.stringify({
-          model: "gpt-5.5",
+          model: "gpt-5.6-terra",
           reasoning: {
-            effort: "high",
+            effort: "ultra",
           },
           test_reasoning_tokens: 128,
         }),
@@ -7875,7 +8108,13 @@ async function run() {
           active_probe: {
             enabled: false,
             interval_ms: 5 * 60 * 1000,
-            target_families: ["gpt-5.4", "gpt-5.5"],
+            target_families: [
+              "gpt-5.4",
+              "gpt-5.5",
+              "gpt-5.6-sol",
+              "gpt-5.6-terra",
+              "gpt-5.6-luna",
+            ],
           },
         }),
       },
@@ -7896,7 +8135,7 @@ async function run() {
         Number(payload?.active_probe?.total_runs) >= 2 &&
         payload?.active_probe?.running === false &&
         Array.isArray(payload?.active_probe?.recent_samples) &&
-        payload.active_probe.recent_samples.length >= 4,
+        payload.active_probe.recent_samples.length >= 10,
       5000,
     );
     assert(
@@ -7905,11 +8144,11 @@ async function run() {
     );
     const dualProbeSamples = dualProbeStatus.active_probe.recent_samples.slice(
       0,
-      4,
+      10,
     );
     assert(
-      dualProbeSamples.length === 4,
-      `双模型手动探针最近样本应为 4 条，实际 ${dualProbeSamples.length}`,
+      dualProbeSamples.length === 10,
+      `五模型手动探针最近样本应为 10 条，实际 ${dualProbeSamples.length}`,
     );
     assert(
       dualProbeSamples.filter(
@@ -7943,6 +8182,16 @@ async function run() {
       ).length === 1,
       "双模型手动探针缺少 gpt-5.5 image_input 样本",
     );
+    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      for (const probeType of ["long_context", "image_input"]) {
+        assert(
+          dualProbeSamples.filter(
+            (sample) => sample.target_model === model && sample.probe_type === probeType,
+          ).length === 1,
+          `五模型手动探针缺少 ${model} ${probeType} 样本`,
+        );
+      }
+    }
     assert(
       dualProbeSamples.every((sample) => sample.http_status === 400),
       `双模型手动探针状态码应为 400 违约，实际 ${JSON.stringify(dualProbeSamples.map((sample) => sample.http_status))}`,
@@ -7955,8 +8204,8 @@ async function run() {
       probeRequestCountBeforeManualDualRun,
     );
     assert(
-      inheritedProbeRequests.length >= 8,
-      `双模型手动探针请求数过少: ${inheritedProbeRequests.length}`,
+      inheritedProbeRequests.length >= 20,
+      `五模型手动探针请求数过少: ${inheritedProbeRequests.length}`,
     );
     assert(
       inheritedProbeRequests.every(
@@ -7964,11 +8213,24 @@ async function run() {
       ),
       `主动探针未继承最近真实请求的 User-Agent: ${JSON.stringify(inheritedProbeRequests.map((entry) => entry.headers.userAgent))}`,
     );
+    const expectedProbeEffortByModel = {
+      "gpt-5.4": "xhigh",
+      "gpt-5.5": "xhigh",
+      "gpt-5.6-sol": "ultra",
+      "gpt-5.6-terra": "ultra",
+      "gpt-5.6-luna": "max",
+    };
     assert(
       inheritedProbeRequests.every(
-        (entry) => entry.body?.reasoning?.effort === "high",
+        (entry) =>
+          entry.body?.reasoning?.effort === expectedProbeEffortByModel[entry.body?.model],
       ),
-      `主动探针未继承最近真实请求的 reasoning.effort: ${JSON.stringify(inheritedProbeRequests.map((entry) => entry.body?.reasoning?.effort ?? null))}`,
+      `主动探针未按目标模型能力约束继承的 reasoning.effort: ${JSON.stringify(
+        inheritedProbeRequests.map((entry) => ({
+          model: entry.body?.model ?? null,
+          effort: entry.body?.reasoning?.effort ?? null,
+        })),
+      )}`,
     );
     const inheritedBudgetProbeRequests = inheritedProbeRequests.filter(
       (entry) =>
@@ -7976,14 +8238,63 @@ async function run() {
         `${entry.phase || ""}`.startsWith("budget"),
     );
     assert(
-      inheritedBudgetProbeRequests.length >= 2,
-      "双模型手动探针缺少长上下文预算请求",
+      inheritedBudgetProbeRequests.length >= 5,
+      "五模型手动探针缺少长上下文预算请求",
     );
     assert(
       inheritedBudgetProbeRequests.every(
         (entry) => Number(entry.units) >= 400000,
       ),
       `双模型手动探针预算请求 unit_count 过小: ${JSON.stringify(inheritedBudgetProbeRequests.map((entry) => entry.units))}`,
+    );
+
+    const minimalPrimingResponse = await fetch(
+      `http://127.0.0.1:${probeGatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent": primedProbeUserAgent,
+        },
+        body: JSON.stringify({
+          model: "gpt-5.6-terra",
+          reasoning: { effort: "minimal" },
+          test_reasoning_tokens: 128,
+        }),
+      },
+    );
+    assert(minimalPrimingResponse.status === 200, "主动探针 minimal 画像预热请求失败");
+    const probeRequestCountBeforeMinimalRun = upstream.probeRequests.length;
+    const minimalProbeResponse = await fetch(
+      `http://127.0.0.1:${probeGatewayPort}/__codex_retry_gateway/api/probe/run`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          active_probe: {
+            enabled: false,
+            interval_ms: 5 * 60 * 1000,
+            target_families: Object.keys(expectedProbeEffortByModel),
+          },
+        }),
+      },
+    );
+    assert(minimalProbeResponse.status === 202, "主动探针 minimal 下限裁剪运行未启动");
+    await waitForStatusCondition(
+      `http://127.0.0.1:${probeGatewayPort}/__codex_retry_gateway/api/status`,
+      (payload) => Number(payload?.active_probe?.total_runs) >= 3 && payload?.active_probe?.running === false,
+      5000,
+    );
+    const minimalProbeRequests = upstream.probeRequests.slice(probeRequestCountBeforeMinimalRun);
+    assert(minimalProbeRequests.length >= 20, "主动探针 minimal 下限裁剪请求数不足");
+    assert(
+      minimalProbeRequests.every((entry) => entry.body?.reasoning?.effort === "low"),
+      `主动探针未把 minimal 按目标模型下限裁剪为 low: ${JSON.stringify(
+        minimalProbeRequests.map((entry) => ({
+          model: entry.body?.model ?? null,
+          effort: entry.body?.reasoning?.effort ?? null,
+        })),
+      )}`,
     );
 
     await mkdir(warningProbeConfigDir, { recursive: true });

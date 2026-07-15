@@ -27,6 +27,22 @@ if (-not $pidRaw) {
 
 $gatewayPid = [int]$pidRaw
 if (Test-ProcessAlive -ProcessId $gatewayPid) {
+  $gatewayConfig = Read-JsonFile -Path $paths.ConfigPath
+  if ($null -eq $gatewayConfig) {
+    $state = Read-JsonFile -Path $paths.StatePath
+    $gatewayBaseUrlProperty = if ($state) { $state.PSObject.Properties["gateway_base_url"] } else { $null }
+    if (
+      $null -ne $gatewayBaseUrlProperty -and
+      -not [string]::IsNullOrWhiteSpace([string]$gatewayBaseUrlProperty.Value)
+    ) {
+      $gatewayConfig = Get-GatewayRuntimeConfig `
+        -GatewayBaseUrl ([string]$gatewayBaseUrlProperty.Value) `
+        -ProcessId $gatewayPid
+    }
+  }
+  if ($null -eq $gatewayConfig -or -not (Test-GatewayProcessIdentity -ProcessId $gatewayPid -GatewayConfig $gatewayConfig)) {
+    throw "Gateway PID could not be verified and was not stopped: $gatewayPid"
+  }
   Stop-Process -Id $gatewayPid -Force
 }
 

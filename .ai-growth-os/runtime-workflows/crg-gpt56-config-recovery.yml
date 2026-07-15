@@ -1,0 +1,112 @@
+schema_version: agos.runtime-workflow.v1
+task_id: crg-gpt56-config-recovery
+tracking_issue_ref: https://github.com/nonononull/codex-retry-gateway/issues/24
+session_plan_ref: docs/plans/sessions/crg-gpt56-config-recovery.md
+approved_decision_ref: session-plan:crg-gpt56-config-recovery#decision
+scope_hash: crg-gpt56-model-effort-idempotent-recovery-v1
+selected_business_path: external-project-node-gateway-development
+mutation_intent: source
+executor_enforcement: tdd-local-verification-no-live-gateway-restart
+workflow_nodes:
+  - startup
+  - knowledge-prep
+  - plan
+  - red-tests
+  - implementation
+  - review
+  - verify
+  - distill
+allowed_operations:
+  - read
+  - edit
+  - test
+  - local-review
+  - commit
+  - push
+  - pr
+claimed_files:
+  - gateway.mjs
+  - scripts/admin-lib.mjs
+  - scripts/launch-ui.ps1
+  - scripts/test-gateway-e2e.mjs
+  - scripts/test-launch-ui.mjs
+  - scripts/test-launch-ui-unix.mjs
+  - scripts/test-install-restore.mjs
+  - README.md
+  - build.md
+  - err.md
+model_drift_guards:
+  - preserve-516-model-independent-rule
+  - preserve-final-only-high-xhigh-contract
+  - preserve-user-gateway-settings
+  - no-live-gateway-restart
+stop_gates:
+  - stop if a test requires the real 127.0.0.1:4610 gateway
+  - stop if original upstream cannot be determined without guessing
+  - stop if an adjacent interception or continuation behavior changes
+protected_feature_replay:
+  completion_status: passed
+  baseline_ref: git:827c918
+  replay_plan:
+    - node .\scripts\test-gateway-e2e.mjs
+    - node .\scripts\test-launch-ui.mjs
+    - node .\scripts\test-launch-ui-unix.mjs
+    - node .\scripts\test-install-restore.mjs
+sibling_regression_guard: passed
+post_implementation_review:
+  completion_status: passed
+  same_question: GPT-5.6 观测与幂等恢复是否完整且未改变既有高风险行为
+  timeout_agent_count: 4
+  returned_agent_count: 2
+  reviewer_refs:
+    - agent:019f5b25-b934-7d60-8473-7b6d12f31efa:ready-to-merge-yes
+    - agent:019f5b25-cd52-7b13-8028-c4b53539d99c:ready-to-merge-yes
+  parent_review_status: completed-all-findings-fixed
+  next_action: commit-push-pr
+verification_gates:
+  - node .\scripts\test-gateway-e2e.mjs
+  - node .\scripts\test-launch-ui.mjs
+  - node .\scripts\test-launch-ui-unix.mjs
+  - node .\scripts\test-install-restore.mjs
+  - node --check .\gateway.mjs
+  - node --check .\scripts\admin-lib.mjs
+  - git diff --check
+runtime_evidence_refs:
+  - docs/plans/sessions/crg-gpt56-config-recovery.md
+  - docs/plans/2026-07-13-gpt56-config-recovery-implementation.md
+  - local-config:gpt-5.6-terra/xhigh
+  - official-manual-fetch:http-403-bounded-uncertainty
+  - protected-feature-replay:ready-passed-5-of-5
+  - test-governance-matrix:ready
+  - post-implementation-review:ready-two-completed-reviewers
+closeout_verification:
+  fresh_pass:
+    - node .\scripts\test-gateway-e2e.mjs
+    - node .\scripts\test-launch-ui.mjs
+    - node .\scripts\test-launch-ui-unix.mjs
+    - node --check .\gateway.mjs
+    - node --check .\scripts\admin-lib.mjs
+    - PowerShell AST parse common/install/launch/restore/start/stop (6 files)
+    - git diff --check
+    - temporary gateway process audit
+  prior_pass_not_fresh_at_final_revision:
+    - node .\scripts\test-install-restore.mjs
+  final_rerun_blocker: 权限审批服务返回 GitHub 上游 503 并明确禁止绕过；后续 start 相关变更由最终 Windows/Unix launch E2E 覆盖。
+rollout_draft:
+  recorder_status: workflow-rollout-repair-required-missing-formal-source-task
+  recorder_note: external-project warning-mode 未登记 AI Growth OS 正式 source task；dry-run 未修改 registry。
+  source_task: crg-gpt56-config-recovery
+  business_path: external-project-node-gateway-development
+  workflow_nodes:
+    - startup
+    - knowledge-prep
+    - plan
+    - red-tests
+    - implementation
+    - review
+    - verify
+    - distill
+  verification_gates:
+    - four-local-e2e-scripts
+    - two-node-syntax-checks
+    - git-diff-check

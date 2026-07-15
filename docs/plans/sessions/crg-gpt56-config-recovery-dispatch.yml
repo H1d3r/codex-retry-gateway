@@ -1,0 +1,18 @@
+schema_version: agos.agent-dispatch.v1
+task_id: crg-gpt56-config-recovery
+reclaim_before_spawn: checked
+open_agent_count_before_dispatch: 0
+max_total_agents: 2
+assignments:
+  - role: model-contract-reviewer
+    mode: read-only
+    question: 核对 GPT-5.6 模型家族、reasoning effort、统计/主动探针/UI 默认筛选的完整影响面与最小测试矩阵。
+    write_scope: none
+  - role: recovery-idempotency-reviewer
+    mode: read-only
+    question: 核对 Windows/Unix 启动、安装、恢复链的幂等根因、最小修复和必须保留的备份/迁移语义。
+    write_scope: none
+ownership:
+  shared_file_writes: forbidden
+  parent_executor_owns_all_mutations: true
+completion_rule: both reviewers return findings and are closed before closeout

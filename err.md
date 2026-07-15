@@ -1319,6 +1319,78 @@
      - `node --check .\gateway.mjs`
      - `git diff --check`
 
+35. state 声称已安装不等于 provider 正在接管，配置迁移失败也不能把原健康 gateway 留在停止状态
+   - 现象：
+     - 电脑断电或外部 provider 工具改写后，`state.json` 仍存在，但 Codex `base_url` 可能已经绕过 gateway。
+     - 重复运行启动入口会无条件重写配置或重启健康 gateway。
+     - PID 文件指向存活进程时，如果该进程不是健康 gateway，旧逻辑仍可能误判为已运行。
+     - PID 复用或陈旧 PID 指向无关存活进程时，旧重启逻辑会直接终止该进程。
+     - `latest_backup_path` 为空时重新接管，后续“恢复原配置”没有可用恢复点。
+     - 切换到新的真实 provider 时，旧逻辑会复用上一 provider 的有效备份，导致恢复到错误 provider。
+     - `latest_backup_path` 指向目录时，旧恢复逻辑会先停止 gateway，再在复制阶段失败。
+     - state 仍在但 gateway `config.json` 丢失时，退回安装分支会把已经指向 gateway 的 Codex 配置误存成恢复点。
+     - `config.json` 丢失且旧 gateway 仍健康时，失败迁移会遗留新配置或丢失健康实例的 PID 管理状态。
+     - 直接调用 install 时仍走独立旧逻辑，无法复用 launch 的运行时配置恢复和回滚事务。
+     - start 未指定 restart 时只要 PID 存活就直接返回，陈旧 PID 会阻止真正启动。
+     - stop/restore 在 `config.json` 丢失时无法验证进程，却会删除 PID/state 并留下占端口的孤立 gateway。
+     - 新进程健康等待只看 HTTP 200，可能接受另一进程返回的 health。
+     - 新 child 保持存活但 health 超时/身份不匹配时，start 抛错却不终止自己创建的 child；上层 stop 又因无法验证而拒绝终止，形成孤立进程。
+     - PID 文件写入位于清理边界外时，写盘失败会在 health 验证前直接逃逸，同样留下无 PID 的 child。
+     - 当前 provider 与 state 记录的 provider 不一致时，旧逻辑仍可能借用另一 provider 的 `original_base_url`。
+     - 迁移 listen 地址后若新端口启动失败，旧健康 gateway 已被停止，文件虽然回滚但服务没有恢复。
+   - 根因：
+     - 安装身份、provider 当前接管状态、gateway 配置迁移需求与进程健康状态被混成一个布尔判断。
+     - 回滚按整个 `catch` 粗粒度重写所有文件并停止进程，没有记录本次实际发生的写入和生命周期动作。
+     - 备份逻辑只覆盖首次安装，没有区分“provider 指向真实上游”与“provider 已指向已管理 gateway”。
+     - 退回安装分支时没有再次校验 state 的 provider 身份，Node 还只检查备份路径存在，没有确认它是普通文件。
+   - 处理：
+     - 安装身份按 `provider_name + codex_config_path + state/config` 判断；provider 漂移只恢复 `base_url`，不替换既有 upstream。
+     - gateway 运行状态同时检查 PID 与 health；健康且配置无变化时保持文件字节、mtime、PID 和备份目录不变。
+     - health 返回当前 `process_id`；只有它与 PID 文件一致时才允许停止进程，无法证明身份时只移除陈旧 PID。
+     - 手工 install 作为 launch 的无 UI 包装，首次安装写入函数只由 launch 判定后内部调用，不再维护第二套恢复控制面。
+     - start 无论是否要求 restart 都先校验 PID 与 health 身份；身份不匹配时只移除 PID 并继续启动。
+     - stop/restore 在磁盘配置缺失时使用 state 的 gateway 地址读取 status，并再次绑定 PID；无法验证时抛错且保留 PID/state。
+     - 启动后的 health 等待接收新 child PID，只有响应 `process_id` 匹配才返回成功。
+     - start 从 PID 文件写入开始包进本地事务；写入、child 存活检查或 health 等待失败时直接终止自己创建的 child并等待退出。
+     - 只有复查确认 child 已退出且 PID 文件仍等于该 child PID 时才删除；强制终止后仍存活则保留 PID，再重新抛出原始启动错误。
+     - provider 指向真实上游且备份缺失/不可用时，接管前创建一次真实配置快照并写回 state；切换 provider 时强制创建当前 provider 的独立恢复点；provider 已指向 requested/state/config 中任一已管理 gateway 时不创建伪备份。
+     - state 存在但 gateway 配置丢失时可以按已知 `original_base_url` 重建配置；旧 gateway 仍健康时优先从绑定 PID 的状态接口取回运行时配置并进入 reuse 事务；只有 provider 身份与配置路径匹配时才允许借用该 upstream。
+     - 备份路径必须是普通文件；目录或失效路径在停止 gateway 前直接拒绝。
+     - 配置迁移使用动作级回滚，只恢复本次实际写过的文件；启动失败时清理失败实例，恢复旧配置，并在旧实例原本健康时重新拉起。
+   - 验证：
+     - `node .\scripts\test-launch-ui.mjs`
+       - 覆盖重复启动零写入、provider 漂移、直接 start/launch 的陈旧存活 PID 防误杀、错误 PID health 200 拒绝、PID 写失败与启动验证失败的 child/PID 清理、跨 provider 备份隔离、目录恢复点拒绝、缺失配置失败迁移和旧健康实例恢复。
+     - `node .\scripts\test-launch-ui-unix.mjs`
+       - 对 Unix/Node 管理核心执行同构场景。
+     - `node .\scripts\test-install-restore.mjs`
+       - 验证首次备份、手工 install 复用 launch 控制面、配置丢失重建、provider 身份与备份隔离、缺失配置 restore 进程收口、目录恢复点和恢复闭环未回归。
+
+36. 主动探针不能把一个模型的 reasoning effort 画像无条件套给所有目标模型
+   - 现象：
+     - 最近真实请求为 `gpt-5.6-terra / ultra` 后，五模型主动探针会给 5.4、5.5 和 `gpt-5.6-luna` 也发送 `ultra`。
+     - 上游可能因 effort 超出目标模型能力返回 `400`，探针再把该错误误当成模型契约违约证据。
+   - 根因：
+     - `activeProbeRequestProfile` 只有一个全局 effort，`applyActiveProbePayloadProfile()` 没有结合 payload 的目标模型做能力约束。
+     - 被动采集支持完整 effort 集合与主动探针合法出站参数被混成同一集合。
+   - 处理：
+     - 被动采集继续完整接受 `minimal / low / medium / high / xhigh / max / ultra`。
+     - 主动探针出站按目标家族约束 effort：5.4/5.5 为 `low..xhigh`，5.6 sol/terra 为 `low..ultra`，5.6 luna 为 `low..max`。
+     - 长上下文探针日志记录最终实际发送的 effort，不再记录裁剪前画像。
+   - 验证：
+     - `node .\scripts\test-gateway-e2e.mjs`
+       - 覆盖 5.6 三变体 × `minimal..ultra` 全采集矩阵、相似模型前缀隔离和公式模式跨模型 516/1034。
+       - 先证明五模型请求全部错误继承 `ultra`，再验证各目标模型收到自己的合法上限值，并验证 `minimal` 统一按探针下限裁剪为 `low`。
+
+37. AGOS 测试治理矩阵的 Root 应指向 rules component，不是产品仓根
+   - 现象：
+     - `generate-test-governance-matrix.ps1 -Root D:\Android_source\ai-growth-os` 报 `test governance profiles missing`。
+   - 根因：
+     - 该脚本把 `-Root` 解释为 rules root，并固定读取 `<Root>\registry\test-governance-profiles.yml`。
+   - 处理：
+     - 使用 `-Root D:\Android_source\ai-growth-os\components\rules`。
+   - 验证：
+     - 报告返回 `TEST_MATRIX_STATUS=ready`、`SIBLING_REGRESSION_GUARD_STATUS=passed` 和 `TEST_GOVERNANCE_MATRIX_OK`。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E
