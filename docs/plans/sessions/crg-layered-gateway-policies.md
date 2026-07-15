@@ -249,6 +249,8 @@ agent_lifecycle:
       - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-9 REQUEST_CHANGES, Critical=0, Important=1, Minor=0
       - 019f6266-bbcd-7870-9e23-2838fd017498 => round-10 PASS, Critical=0, Important=0, Minor=1
       - 019f6444-66b8-7360-b308-64eb84d1f3be => round-10 PASS, Critical=0, Important=0, Minor=1
+      - 019f6470-4c72-7de2-ac27-5d27a7fdf93b => round-11 PASS, Critical=0, Important=0, Minor=1
+      - 019f6470-6074-7822-991e-734f4aa5bbfd => round-11 PASS, Critical=0, Important=0, Minor=1
     idle: []
     timeout:
       - 019f6266-bbcd-7870-9e23-2838fd017498 => round-9 shutdown without verdict after wait and explicit final-verdict request
@@ -262,6 +264,8 @@ agent_lifecycle:
     - 019f6266-a7c6-7571-8982-73d9a90d2393
     - 019f6266-bbcd-7870-9e23-2838fd017498
     - 019f6444-66b8-7360-b308-64eb84d1f3be
+    - 019f6470-4c72-7de2-ac27-5d27a7fdf93b
+    - 019f6470-6074-7822-991e-734f4aa5bbfd
   review_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏既有高风险行为？
   closeout_rule: 两名 reviewer 正常返回最终 verdict，Critical/Important 清零并完成复审。
 ```
@@ -373,13 +377,14 @@ post_implementation_review:
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
   implementation_snapshot_ref: git:35756dfe5cc423d8e668890d3bb24eb6c602759c
   last_mutation_ref: git:35756dfe5cc423d8e668890d3bb24eb6c602759c
-  review_after_last_mutation: false
+  review_after_last_mutation: true
   changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..35756dfe5cc423d8e668890d3bb24eb6c602759c
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
-  returned_agent_count: 0
+  returned_agent_count: 2
   reviewer_output_refs:
-    - none
+    - agent:019f6470-4c72-7de2-ac27-5d27a7fdf93b => round-11 PASS, Critical=0, Important=0, Minor=1
+    - agent:019f6470-6074-7822-991e-734f4aa5bbfd => round-11 PASS, Critical=0, Important=0, Minor=1
   historical_reviewer_output_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
@@ -469,20 +474,23 @@ post_implementation_review:
     - lifecycle evidence proves gateway processing before the deadline with first_stream_chunk_at_ms
     - expected stream termination preserves its fact but rechecks total then first-progress after synchronous terminal preparation and before irreversible forwarding
     - the lifecycle delayed-timer regression uses a 500ms deadline, 60 events and delayed 300..500ms timers
-  completion_status: review-fix-batch-11-source-snapshot-35756df-ready-awaiting-two-reviewers
+  accepted_minor_findings:
+    - gateway.mjs:12028 still passes an ignored nowMs argument to writeClientChunk; no runtime or telemetry effect, defer as maintenance-only cleanup
+  completion_status: review-fix-batch-11-two-reviewer-pass-pr-gate-open
   parent_resolution:
-    status: blocked
-    reason: round-11-source-snapshot-35756df-ready-awaiting-two-fresh-reviewer-verdicts
-  implementation_freeze_status: active
+    status: passed
+    reason: two-fresh-reviewers-returned-pass-with-zero-critical-and-zero-important
+  implementation_freeze_status: active-source-frozen-pr-gate-open
   allowed_ops:
     - local-review
     - evidence-reconciliation
     - project-doc-write
     - commit
-  forbidden_ops:
-    - source-edit
+    - push
     - pr
     - merge
+  forbidden_ops:
+    - source-edit
     - claim-done
 post_implementation_review_policy:
   review_phase: post-implementation
@@ -660,7 +668,7 @@ review_fix_batch_11_green_evidence:
   - delayed lifecycle fault window uses 500ms, 60 lifecycle events and delayed 300..500ms timers to prove chunks on both sides without bucket collisions
   - gateway E2E initial GREEN and stability replay 3/3 GREEN
   - install-restore, Windows launch, Unix launch, six JS syntax, three PowerShell AST, full diff check and temporary process audit PASS
-full_verification_status: review-fix-batch-11-source-snapshot-35756df-ready-awaiting-two-reviewers
+full_verification_status: review-fix-batch-11-two-reviewer-pass-pr-gate-open
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
@@ -668,6 +676,8 @@ review_refs:
   - agent:019f622a-ffce-7980-92b3-ef6b51ca9b73
   - agent:019f6266-a7c6-7571-8982-73d9a90d2393
   - agent:019f6266-bbcd-7870-9e23-2838fd017498
+  - agent:019f6470-4c72-7de2-ac27-5d27a7fdf93b
+  - agent:019f6470-6074-7822-991e-734f4aa5bbfd
 pr_ref: pending
 merge_ref: pending
 rollout_ref: pending

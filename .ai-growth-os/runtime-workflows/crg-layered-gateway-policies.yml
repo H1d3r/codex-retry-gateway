@@ -121,14 +121,15 @@ post_implementation_review:
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
   implementation_snapshot_ref: git:35756dfe5cc423d8e668890d3bb24eb6c602759c
   last_mutation_ref: git:35756dfe5cc423d8e668890d3bb24eb6c602759c
-  review_after_last_mutation: false
+  review_after_last_mutation: true
   changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..35756dfe5cc423d8e668890d3bb24eb6c602759c
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
-  returned_agent_count: 0
+  returned_agent_count: 2
   same_question: 可叠加策略是否在所有流式/非流式、重试预算、已写响应、配置迁移和详细采集边界下安全，且没有破坏 516、final-only、压缩豁免、续写与真实路由语义
   reviewer_output_refs:
-    - none
+    - agent:019f6470-4c72-7de2-ac27-5d27a7fdf93b => round-11 PASS, Critical=0, Important=0, Minor=1
+    - agent:019f6470-6074-7822-991e-734f4aa5bbfd => round-11 PASS, Critical=0, Important=0, Minor=1
   historical_reviewer_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
@@ -153,22 +154,25 @@ post_implementation_review:
     - streaming ensureClientHeaders checks total before header copy instead of immediately before writeHead
     - timeout after an earlier finalizeModelInsights call can submit the same attempt insights twice
     - lifecycle evidence records upstream send timing but not gateway processing before the deadline
-  parent_review_status: review-fix-batch-11-source-snapshot-35756df-ready-awaiting-two-reviewers
+  accepted_minor_findings:
+    - gateway.mjs:12028 still passes an ignored nowMs argument to writeClientChunk; no runtime or telemetry effect, defer as maintenance-only cleanup
+  parent_review_status: review-fix-batch-11-two-reviewer-pass-pr-gate-open
   reject_if_hits:
     - unresolved-round-8-review-findings
   parent_resolution:
-    status: blocked
-    reason: round-11-source-snapshot-35756df-ready-awaiting-two-fresh-reviewer-verdicts
-  implementation_freeze_status: active
+    status: passed
+    reason: two-fresh-reviewers-returned-pass-with-zero-critical-and-zero-important
+  implementation_freeze_status: active-source-frozen-pr-gate-open
   allowed_ops:
     - local-review
     - evidence-reconciliation
     - project-doc-write
     - commit
-  forbidden_ops:
-    - source-edit
+    - push
     - pr
     - merge
+  forbidden_ops:
+    - source-edit
     - claim-done
   review_fix_evidence:
     - Retry-After deadline and 1MiB hard-limit RED reproduced
