@@ -299,12 +299,13 @@ function createSseResponseWithPauseBeforeOutput(
   });
 }
 
-function createTerminatedSseResponse(res, chunks, destroyDelayMs = 20) {
+function createTerminatedSseResponse(res, chunks, destroyDelayMs = 20, extraHeaders = {}) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache",
     connection: "keep-alive",
     "x-upstream-test": "sse-terminated",
+    ...extraHeaders,
   });
 
   for (const chunk of chunks) {
@@ -3592,7 +3593,9 @@ function startFakeUpstream(port) {
         if (parsed.test_force_terminate_before_progress) {
           createTerminatedSseResponse(res, [
             'data: {"type":"response.created","response":{"id":"resp_terminated","model":"gpt-5.4"}}\n\n',
-          ], parsed.test_terminate_delay_ms ?? 20);
+          ], parsed.test_terminate_delay_ms ?? 20, parsed.test_termination_header_copy_stall
+            ? { "x-test-termination-header-copy-stall": "1" }
+            : {});
           return;
         }
         if (parsed.test_force_terminate) {
@@ -8182,6 +8185,7 @@ async function run() {
         "const stalledExpectedTerminationModelFinalizes = new Set();",
         "let stalledRateLimitHeaderCopy = false;",
         "let stalledStreamHeaderCopy = false;",
+        "let stalledTerminationHeaderCopy = false;",
         "global.setTimeout = function patchedSetTimeout(callback, delay, ...args) {",
         "  const numericDelay = Number(delay);",
         "  if (numericDelay >= 35 && numericDelay <= 40 && !delayedFetchRejectionFirstProgress) {",
@@ -8192,18 +8196,19 @@ async function run() {
         "      while (Date.now() < releaseAt) {}",
         "    }, delay);",
         "  }",
+        "  if (numericDelay >= 300 && numericDelay <= 500) {",
+        "    return originalSetTimeout(callback, 800, ...args);",
+        "  }",
         "  const delayedFirstProgressBucket = numericDelay >= 43 && numericDelay <= 45",
         "    ? 45",
         "    : numericDelay >= 46 && numericDelay <= 47",
         "      ? 47",
-        "      : numericDelay >= 120 && numericDelay <= 150",
-        "        ? 150",
-        "        : numericDelay >= 198 && numericDelay <= 200",
-        "          ? 200",
-        "          : null;",
+        "      : numericDelay >= 198 && numericDelay <= 200",
+        "        ? 200",
+        "        : null;",
         "  if (delayedFirstProgressBucket && !delayedFirstProgressTimers.has(delayedFirstProgressBucket)) {",
         "    delayedFirstProgressTimers.add(delayedFirstProgressBucket);",
-        "    return originalSetTimeout(callback, delayedFirstProgressBucket === 200 ? 500 : delayedFirstProgressBucket === 150 ? 400 : 200, ...args);",
+        "    return originalSetTimeout(callback, delayedFirstProgressBucket === 200 ? 500 : 200, ...args);",
         "  }",
         "  if (delayedTotalTimerCount < 9 && numericDelay >= 55 && numericDelay <= 70) {",
         "    delayedTotalTimerCount += 1;",
@@ -8249,6 +8254,11 @@ async function run() {
         "  }",
         "  if (!stalledStreamHeaderCopy && `${this.get('content-type') || ''}`.includes('x-test-header-copy-stall=1') && new Error().stack.includes('copyHeadersToClient')) {",
         "    stalledStreamHeaderCopy = true;",
+        "    const releaseAt = Date.now() + 100;",
+        "    while (Date.now() < releaseAt) {}",
+        "  }",
+        "  if (!stalledTerminationHeaderCopy && this.get('x-test-termination-header-copy-stall') === '1' && new Error().stack.includes('copyHeadersToClient')) {",
+        "    stalledTerminationHeaderCopy = true;",
         "    const releaseAt = Date.now() + 100;",
         "    while (Date.now() < releaseAt) {}",
         "  }",
@@ -8610,7 +8620,7 @@ async function run() {
             guard_retry_attempts: 0,
             latency_guard: {
               enabled: true,
-              first_progress_timeout_ms: 150,
+              first_progress_timeout_ms: 500,
               first_progress_action: "return_502",
               total_timeout_ms: 0,
             },
@@ -8625,7 +8635,7 @@ async function run() {
           stream: true,
           test_sequence_key: "delayed-first-progress-metadata-wall-clock",
           test_include_stream_lifecycle: true,
-          test_stream_lifecycle_repeat_count: 24,
+          test_stream_lifecycle_repeat_count: 60,
           test_stream_initial_delay_ms: 0,
           test_stream_chunk_delay_ms: 10,
           test_record_stream_chunk_sent_at_ms: true,
@@ -8639,14 +8649,14 @@ async function run() {
         delayedMetadataUpstreamRequest?.stream_chunk_sent_at_ms || [];
       assert(
         delayedMetadataResponse.status === 502 &&
-          delayedMetadataElapsedMs >= 150 &&
-          delayedMetadataElapsedMs < 260 &&
+          delayedMetadataElapsedMs >= 500 &&
+          delayedMetadataElapsedMs < 700 &&
           delayedMetadataChunkTimes.length >= 2 &&
           delayedMetadataChunkTimes.some(
-            (sentAtMs) => sentAtMs - delayedMetadataUpstreamRequest.received_at_ms < 150,
+            (sentAtMs) => sentAtMs - delayedMetadataUpstreamRequest.received_at_ms < 500,
           ) &&
           delayedMetadataChunkTimes.some(
-            (sentAtMs) => sentAtMs - delayedMetadataUpstreamRequest.received_at_ms >= 150,
+            (sentAtMs) => sentAtMs - delayedMetadataUpstreamRequest.received_at_ms >= 500,
           ),
         `前序 lifecycle 必须实际在 deadline 前发送，后续 chunk 首次跨线并立即超时: ${JSON.stringify({
           status: delayedMetadataResponse.status,
@@ -8668,7 +8678,7 @@ async function run() {
         Number.isFinite(delayedMetadataSample?.first_stream_chunk_at_ms) &&
           Number.isFinite(delayedMetadataSample?.upstream_fetch_started_at_ms) &&
           delayedMetadataSample.first_stream_chunk_at_ms -
-            delayedMetadataSample.upstream_fetch_started_at_ms < 150 &&
+            delayedMetadataSample.upstream_fetch_started_at_ms < 500 &&
           delayedMetadataSample.timeout_phase === "first_progress",
         `lifecycle 反例必须由 gateway 自身时钟证明前序 chunk 已在 deadline 前处理: ${JSON.stringify(delayedMetadataSample)}`,
       );
@@ -8860,6 +8870,64 @@ async function run() {
           total_sample: terminationPreparationTotalSample,
           first_progress_response: terminationPreparationFirstProgressResponse,
           first_progress_sample: terminationPreparationFirstProgressSample,
+        })}`,
+      );
+
+      const terminationClientTimingConfigResponse = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 0,
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 500,
+              first_progress_action: "return_502",
+              total_timeout_ms: 0,
+            },
+          }),
+        },
+      );
+      assert(
+        terminationClientTimingConfigResponse.status === 200,
+        "termination 客户端首写时序配置失败",
+      );
+      const terminationClientTimingKey = "expected-termination-client-write-after-headers";
+      const terminationClientTimingResponse = await readSseUntilClose(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/responses`,
+        {
+          stream: true,
+          test_sequence_key: terminationClientTimingKey,
+          test_force_terminate_before_progress: true,
+          test_terminate_delay_ms: 10,
+          test_termination_header_copy_stall: true,
+        },
+      );
+      const terminationClientTimingAnalytics = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      const terminationClientTimingSample = (
+        terminationClientTimingAnalytics.recent_samples || []
+      ).find((sample) =>
+        `${sample.request_payload_excerpt || ""}`.includes(terminationClientTimingKey),
+      );
+      assert(
+        terminationClientTimingResponse.status === 200 &&
+          terminationClientTimingResponse.headers.get(
+            "x-test-termination-header-copy-stall",
+          ) === "1" &&
+          terminationClientTimingResponse.text.includes("response.created") &&
+          Number.isFinite(terminationClientTimingSample?.client_headers_sent_at_ms) &&
+          Number.isFinite(terminationClientTimingSample?.client_first_write_at_ms) &&
+          terminationClientTimingSample.client_headers_sent_at_ms -
+            terminationClientTimingSample.upstream_fetch_started_at_ms >= 90 &&
+          terminationClientTimingSample.client_headers_sent_at_ms <=
+            terminationClientTimingSample.client_first_write_at_ms,
+        `同步 header copy 后的客户端首写时间不得早于发头时间: ${JSON.stringify({
+          response: terminationClientTimingResponse,
+          sample: terminationClientTimingSample,
         })}`,
       );
 

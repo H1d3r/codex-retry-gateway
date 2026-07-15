@@ -11617,17 +11617,17 @@ async function handleStreaming({
     markReasoningSampleClientHeadersSent(reasoningSample);
   };
 
-  const writeClientChunk = (chunk, timestampMs = Date.now()) => {
+  const writeClientChunk = (chunk) => {
     ensureClientHeaders();
     wroteAnyChunk = true;
-    markReasoningSampleClientWrite(reasoningSample, timestampMs);
+    markReasoningSampleClientWrite(reasoningSample);
     res.write(chunk);
   };
 
-  const flushBufferedChunksToClient = (timestampMs = Date.now(), options = {}) => {
+  const flushBufferedChunksToClient = (options = {}) => {
     ensureClientHeaders(options);
     for (const chunk of bufferedChunks.splice(0)) {
-      writeClientChunk(chunk, timestampMs);
+      writeClientChunk(chunk);
     }
     bufferedBytes = 0;
   };
@@ -11704,7 +11704,7 @@ async function handleStreaming({
           });
         } else {
           if (bufferedChunks.length > 0) {
-            flushBufferedChunksToClient(Date.now(), {
+            flushBufferedChunksToClient({
               enforceFirstProgressDeadline: true,
             });
           } else {
@@ -12091,18 +12091,18 @@ async function handleStreaming({
           reasoningSample.timeout_response_control_lost = true;
         }
         if (bufferedChunks.length > 0) {
-          flushBufferedChunksToClient(nowMs);
+          flushBufferedChunksToClient();
         }
-        writeClientChunk(chunkBuffer, nowMs);
+        writeClientChunk(chunkBuffer);
       } else {
         bufferedChunks.push(chunkBuffer);
         bufferedBytes += chunkBuffer.length;
         if (chunkHasMeaningfulProgress) {
-          flushBufferedChunksToClient(nowMs);
+          flushBufferedChunksToClient();
         }
       }
     } else {
-      writeClientChunk(chunkBuffer, nowMs);
+      writeClientChunk(chunkBuffer);
     }
   }
 }
