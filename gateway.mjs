@@ -11523,6 +11523,12 @@ async function handleStreaming({
     }
   };
 
+  const throwIfFirstProgressDeadlineExpired = (message) => {
+    if (latencyGuard?.expireFirstProgressDeadlineIfNeeded()) {
+      throw new Error(message);
+    }
+  };
+
   const finishReasoningSample = (options = {}) => {
     if (sampleRecorded) {
       return;
@@ -11590,13 +11596,23 @@ async function handleStreaming({
     return { handled: true };
   };
 
-  const ensureClientHeaders = () => {
+  const ensureClientHeaders = (options = {}) => {
     if (res.headersSent) {
       throwIfTotalDeadlineExpired("upstream total deadline expired before client forwarding");
+      if (options.enforceFirstProgressDeadline) {
+        throwIfFirstProgressDeadlineExpired(
+          "upstream first progress deadline expired before client forwarding",
+        );
+      }
       return;
     }
     copyHeadersToClient(upstreamResponse.headers, res);
     throwIfTotalDeadlineExpired("upstream total deadline expired before client forwarding");
+    if (options.enforceFirstProgressDeadline) {
+      throwIfFirstProgressDeadlineExpired(
+        "upstream first progress deadline expired before client forwarding",
+      );
+    }
     res.writeHead(upstreamResponse.status);
     markReasoningSampleClientHeadersSent(reasoningSample);
   };
@@ -11608,8 +11624,8 @@ async function handleStreaming({
     res.write(chunk);
   };
 
-  const flushBufferedChunksToClient = (timestampMs = Date.now()) => {
-    ensureClientHeaders();
+  const flushBufferedChunksToClient = (timestampMs = Date.now(), options = {}) => {
+    ensureClientHeaders(options);
     for (const chunk of bufferedChunks.splice(0)) {
       writeClientChunk(chunk, timestampMs);
     }
@@ -11654,6 +11670,7 @@ async function handleStreaming({
         throw error;
       }
       if (isExpectedStreamTermination(error)) {
+        reasoningSample.upstream_stream_terminated = true;
         if (!inspectedRecorded) {
           recordInspectedResponseForSample(
             monitor,
@@ -11668,12 +11685,17 @@ async function handleStreaming({
         finalizeModelInsights(monitor, pathname, modelContext);
         if (strict502Mode) {
           logger?.(`[stream] upstream terminated before completion path=${pathname} action=status_502`);
+          const terminatedBody = buildGatewayErrorBody("upstream stream terminated before completion");
+          throwIfTotalDeadlineExpired(
+            "upstream total deadline expired during stream termination preparation",
+          );
+          throwIfFirstProgressDeadlineExpired(
+            "upstream first progress deadline expired during stream termination preparation",
+          );
           res.writeHead(502, { "content-type": "application/json; charset=utf-8" });
           markReasoningSampleClientHeadersSent(reasoningSample);
-          const terminatedBody = buildGatewayErrorBody("upstream stream terminated before completion");
           markReasoningSampleClientWrite(reasoningSample);
           res.end(terminatedBody);
-          reasoningSample.upstream_stream_terminated = true;
           finishReasoningSample({
             finalAction: "upstream_stream_terminated",
             clientHttpStatus: 502,
@@ -11682,12 +11704,13 @@ async function handleStreaming({
           });
         } else {
           if (bufferedChunks.length > 0) {
-            flushBufferedChunksToClient();
+            flushBufferedChunksToClient(Date.now(), {
+              enforceFirstProgressDeadline: true,
+            });
           } else {
-            ensureClientHeaders();
+            ensureClientHeaders({ enforceFirstProgressDeadline: true });
           }
           res.end();
-          reasoningSample.upstream_stream_terminated = true;
           finishReasoningSample({
             finalAction: "upstream_stream_terminated",
             clientHttpStatus: upstreamResponse.status,
