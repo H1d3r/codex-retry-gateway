@@ -1620,6 +1620,31 @@
      - lifecycle 反例记录上游 chunk 实际发送时间，硬证明既有 deadline 前 chunk，也有首次跨线的后续 chunk。
      - 2026-07-15 gateway E2E 首轮 GREEN 并连续 3/3 稳定复跑；install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留全部 PASS。
 
+49. total 与 first-progress 的真源必须是首次真实 fetch，语义完成和模型洞察都只能收口一次
+   - 现象：
+     - 请求级 total 在循环前建立；首次 header clone 跨过极小 deadline 时，上游请求数为 0，但 timeout handler 增加 inspected 并持久化 `upstream_fetch_started_at_ms=null` 的 attempt，破坏计数恒等式。
+     - current guard 虽已移到 header clone 后，仍早于最终 total gate 和 fetch；该窄窗口阻塞可派发一个在上游调用前就过期的 first-progress attempt。
+     - 非流式 body 与 EOF 事件在 deadline 前到达后，代码先清 first-progress timer，再做 JSON/SSE 语义解析；解析跨线仍返回 200。
+     - 流式 `ensureClientHeaders()` 先检查 total、后复制 header；header copy 跨线仍会执行不可撤回 `writeHead(200)`。
+     - 非流式终态在 `finalizeModelInsights()` 后跨 total，timeout catch 再提交一次模型洞察，单 attempt 的 local model 与 consistency 计数增加 2。
+   - 根因：
+     - total 和 attempt guard 的创建点描述“候选 attempt”，没有绑定真实 `fetch()` 派发事实；pending gate 与后续派发时间又使用不同的墙钟采样。
+     - first-progress 窗口按“字节到达”提前关闭，而规则定义需要等语义解析确定是否为有效输出。
+     - header copy 和模型洞察提交缺少统一幂等/不可撤回边界。
+   - 处理：
+     - 首次 `upstreamFetchStartedAtMs` 捕获后建立请求级 total；同一时间值传入 `createAttemptLatencyGuard()`，first-progress 绝对截止线固定为 `upstreamFetchStartedAtMs + limit`，timer 只按剩余时间唤醒。
+     - pending 的最终 total gate 接受已捕获 `nowMs`，检查通过后立即使用同一时间调用 fetch；首次本地 header 准备不计入上游 total/first-progress。
+     - 非流式与 EOF 在 payload 解析、usage/结构累积后，由 `markFirstProgress()` 或 `endFirstProgressWindow()` 按绝对墙钟收口。
+     - 流式未写头时先复制可撤回 header，再复核 total，统一 timeout handler 清掉尚未发送的上游 header。
+     - 使用 `WeakSet` 按 model context 保证 `finalizeModelInsights()` 每个 attempt 只执行一次。
+   - 防回归：
+     - 首次 header clone 阻塞 80ms、total=40ms，仍应在真实 fetch 后返回 200，并保持 total/inspected 各 +1；旧实现稳定复现 0 次上游、inspected+1。
+     - guard 到 fetch 的 80ms 故障、pending gate 与派发时间分裂故障分别证明首 progress 锚点和单一最终 gate。
+     - 非流式 JSON 与 EOF-only completed 事件各阻塞 100ms，必须返回 first-progress 502；流式 header copy 阻塞 100ms 必须在 writeHead 前返回 total 502。
+     - Capacity timeout 带 `model=gpt-5.4`，精确断言 local model 和 consistency 只增加 1。
+     - lifecycle 样本必须满足 `first_stream_chunk_at_ms - upstream_fetch_started_at_ms < first_progress_timeout_ms`，并最终按 first-progress timeout 收口。
+     - 2026-07-15 gateway E2E 首轮 GREEN 并连续 3/3 稳定复跑；三套生命周期 E2E、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留全部 PASS。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

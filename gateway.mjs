@@ -1939,7 +1939,12 @@ function completeReasoningBehaviorSample({
   recordReasoningBehaviorSample(runtime, sample);
 }
 
-function createAttemptLatencyGuard(config, requestTracking, abortController) {
+function createAttemptLatencyGuard(
+  config,
+  requestTracking,
+  abortController,
+  attemptStartedAtMs = Date.now(),
+) {
   const latencyConfig = config?.latency_guard || DEFAULT_CONFIG.latency_guard;
   let firstProgressTimer = null;
   let firstProgressDeadlineAtMs = null;
@@ -1958,10 +1963,15 @@ function createAttemptLatencyGuard(config, requestTracking, abortController) {
 
   if (latencyConfig.enabled) {
     if (latencyConfig.first_progress_timeout_ms > 0) {
-      firstProgressDeadlineAtMs = Date.now() + latencyConfig.first_progress_timeout_ms;
+      firstProgressDeadlineAtMs =
+        attemptStartedAtMs + latencyConfig.first_progress_timeout_ms;
+      const firstProgressRemainingMs = Math.max(
+        0,
+        firstProgressDeadlineAtMs - Date.now(),
+      );
       firstProgressTimer = setTimeout(
         () => triggerTimeout("first_progress", latencyConfig.first_progress_timeout_ms),
-        latencyConfig.first_progress_timeout_ms,
+        firstProgressRemainingMs,
       );
       firstProgressTimer.unref?.();
     }
@@ -1998,11 +2008,12 @@ function createAttemptLatencyGuard(config, requestTracking, abortController) {
       return timeoutLimitMs;
     },
     expireTotalDeadlineIfNeeded(options = {}) {
+      const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
       if (
         latencyConfig.enabled &&
         latencyConfig.total_timeout_ms > 0 &&
         Number.isFinite(requestTracking?.total_deadline_at_ms) &&
-        Date.now() >= requestTracking.total_deadline_at_ms
+        nowMs >= requestTracking.total_deadline_at_ms
       ) {
         if (!timeoutPhase || options.overrideExisting === true) {
           timeoutPhase = "total";
@@ -4808,7 +4819,13 @@ function pushSuspiciousModelSample(monitor, pathname, context, anomalyType, conf
   }
 }
 
+const finalizedModelInsightContexts = new WeakSet();
+
 function finalizeModelInsights(monitor, pathname, context, errorPayload = null) {
+  if (finalizedModelInsightContexts.has(context)) {
+    return;
+  }
+  finalizedModelInsightContexts.add(context);
   const effectiveLocalModel = context.effectiveLocalModel;
   const effectiveFamily = normalizeModelFamily(effectiveLocalModel);
   const familyBreakdown = getFamilyBreakdownEntry(monitor, effectiveFamily);
@@ -11221,9 +11238,6 @@ async function handleNonStreaming({
   };
   const bodyBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
   throwIfTotalDeadlineExpired("upstream total deadline expired before non-stream completion");
-  if (!latencyGuard?.endFirstProgressWindow()) {
-    throw new Error("upstream first progress deadline expired before non-stream completion");
-  }
   if (bodyBuffer.length > 0) {
     markReasoningSampleFinalChunk(reasoningSample);
   }
@@ -11236,16 +11250,18 @@ async function handleNonStreaming({
     applyParsedUsageToReasoningSample(reasoningSample, parsed);
     applyStructureSignalsFromPayload(parsed, structureAccumulator);
   }
-  if (
+  const hasMeaningfulProgress =
     (parsed && payloadHasMeaningfulProgress(parsed)) ||
-    (!parsed && bodyBuffer.length > 0)
-  ) {
+    (!parsed && bodyBuffer.length > 0);
+  if (hasMeaningfulProgress) {
     const progressAtMs = Date.now();
     if (!latencyGuard?.markFirstProgress()) {
       throw new Error("upstream first progress deadline expired before non-stream progress");
     }
     markReasoningSampleFirstProgress(reasoningSample, progressAtMs);
     markReasoningSampleFirstContent(reasoningSample, progressAtMs);
+  } else if (!latencyGuard?.endFirstProgressWindow()) {
+    throw new Error("upstream first progress deadline expired before non-stream completion");
   }
   const reasoning = parsed ? extractReasoningTokens(parsed) : null;
   const ruleMatch = buildInterceptRuleMatch(config, reasoning, reasoningSample, structureAccumulator);
@@ -11575,11 +11591,12 @@ async function handleStreaming({
   };
 
   const ensureClientHeaders = () => {
-    throwIfTotalDeadlineExpired("upstream total deadline expired before client forwarding");
     if (res.headersSent) {
+      throwIfTotalDeadlineExpired("upstream total deadline expired before client forwarding");
       return;
     }
     copyHeadersToClient(upstreamResponse.headers, res);
+    throwIfTotalDeadlineExpired("upstream total deadline expired before client forwarding");
     res.writeHead(upstreamResponse.status);
     markReasoningSampleClientHeadersSent(reasoningSample);
   };
@@ -11688,10 +11705,8 @@ async function handleStreaming({
       if (latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
         throw new Error("upstream total deadline expired before stream completion");
       }
-      if (!latencyGuard?.endFirstProgressWindow()) {
-        throw new Error("upstream first progress deadline expired before stream completion");
-      }
       const finalPayloadAtMs = Date.now();
+      let eofHasMeaningfulProgress = false;
       for (const payload of flushSsePayloads(sseState)) {
         applyPayloadModelSignals(modelContext, payload, {
           fromStream: true,
@@ -11703,6 +11718,7 @@ async function handleStreaming({
           markReasoningSampleFirstContent(reasoningSample, finalPayloadAtMs);
         }
         if (payloadHasMeaningfulProgress(payload)) {
+          eofHasMeaningfulProgress = true;
           if (!latencyGuard?.markFirstProgress()) {
             throw new Error("upstream first progress deadline expired at stream EOF");
           }
@@ -11712,6 +11728,9 @@ async function handleStreaming({
         if (Number.isInteger(finalPayloadReasoning)) {
           observedReasoning = finalPayloadReasoning;
         }
+      }
+      if (!eofHasMeaningfulProgress && !latencyGuard?.endFirstProgressWindow()) {
+        throw new Error("upstream first progress deadline expired before stream completion");
       }
       const finalRuleMatch = buildInterceptRuleMatch(
         config,
@@ -12192,10 +12211,7 @@ async function proxyRequest(runtime, req, res) {
   requestTracking.strip_encrypted_reasoning_response =
     preparedContinuationRequest.autoAddedEncryptedReasoning === true ||
     shouldStripEncryptedContentFromContinuationResponse(config, pathname, shouldInspect, requestJson);
-  requestTracking.total_deadline_at_ms =
-    shouldInspect && config.latency_guard?.enabled && config.latency_guard.total_timeout_ms > 0
-      ? Date.now() + config.latency_guard.total_timeout_ms
-      : null;
+  requestTracking.total_deadline_at_ms = null;
   let guardRetryAttemptsUsed = 0;
   let pendingRetryDispatch = null;
 
@@ -12285,9 +12301,11 @@ async function proxyRequest(runtime, req, res) {
 
     try {
       const upstreamHeaders = cloneHeadersForUpstream(req.headers);
+      const upstreamFetchStartedAtMs = Date.now();
       if (
         pendingRetryDispatch?.latencyGuard.expireTotalDeadlineIfNeeded({
           overrideExisting: true,
+          nowMs: upstreamFetchStartedAtMs,
         })
       ) {
         const timedOutRetry = pendingRetryDispatch;
@@ -12295,25 +12313,15 @@ async function proxyRequest(runtime, req, res) {
         handlePendingRetryTotalTimeout(timedOutRetry);
         return;
       }
-      latencyGuard = createAttemptLatencyGuard(
-        shouldInspect ? config : { latency_guard: DEFAULT_CONFIG.latency_guard },
-        requestTracking,
-        abortController,
-      );
-      if (latencyGuard.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
-        if (pendingRetryDispatch) {
-          pendingRetryDispatch.latencyGuard.expireTotalDeadlineIfNeeded({
-            overrideExisting: true,
-          });
-          const timedOutRetry = pendingRetryDispatch;
-          pendingRetryDispatch = null;
-          handlePendingRetryTotalTimeout(timedOutRetry);
-          return;
-        }
-        throw new Error("upstream total deadline expired before fetch dispatch");
+      if (
+        !Number.isFinite(requestTracking.total_deadline_at_ms) &&
+        shouldInspect &&
+        config.latency_guard?.enabled &&
+        config.latency_guard.total_timeout_ms > 0
+      ) {
+        requestTracking.total_deadline_at_ms =
+          upstreamFetchStartedAtMs + config.latency_guard.total_timeout_ms;
       }
-
-      const upstreamFetchStartedAtMs = Date.now();
       const upstreamResponseOutcomePromise = fetchUpstreamWithRetry(upstreamUrl, {
         method: req.method,
         headers: upstreamHeaders,
@@ -12326,6 +12334,12 @@ async function proxyRequest(runtime, req, res) {
           headersAtMs: Date.now(),
         }),
         (error) => ({ response: null, error, headersAtMs: null }),
+      );
+      latencyGuard = createAttemptLatencyGuard(
+        shouldInspect ? config : { latency_guard: DEFAULT_CONFIG.latency_guard },
+        requestTracking,
+        abortController,
+        upstreamFetchStartedAtMs,
       );
       reasoningSample.upstream_fetch_started_at_ms = upstreamFetchStartedAtMs;
       reasoningSample.upstream_fetch_started_at = toIsoStringOrNull(

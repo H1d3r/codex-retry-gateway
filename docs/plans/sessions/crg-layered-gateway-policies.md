@@ -240,6 +240,8 @@ agent_lifecycle:
       - 019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
       - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=0
       - 019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=2
+      - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-8 REQUEST_CHANGES, Critical=0, Important=4, Minor=0
+      - 019f6266-bbcd-7870-9e23-2838fd017498 => round-8 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
     idle: []
     timeout: []
     failed: []
@@ -359,10 +361,10 @@ post_implementation_review:
   review_scope: whole-source
   owner_requested_scope: all-source
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
-  implementation_snapshot_ref: git:06067bd1f52243c18aa0e6d2791152de08b09685
-  last_mutation_ref: git:06067bd1f52243c18aa0e6d2791152de08b09685
+  implementation_snapshot_ref: pending-round-9-source-snapshot
+  last_mutation_ref: working-tree:round-9-review-remediation
   review_after_last_mutation: false
-  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..06067bd1f52243c18aa0e6d2791152de08b09685
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..working-tree
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
   returned_agent_count: 0
@@ -379,14 +381,15 @@ post_implementation_review:
     - agent:019f622a-ffce-7980-92b3-ef6b51ca9b73 => round-6 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
     - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=0
     - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=2
+    - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-8 REQUEST_CHANGES, Critical=0, Important=4, Minor=0
+    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-8 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
   latest_rereview_findings:
-    - a pending old attempt can be lost when its first deadline gate passes but the current guard expires before dispatch
-    - non-stream Capacity/429 pass-through, policy 502 and reasoning-block exits lack a final total-deadline gate immediately before writeHead
-    - fetch rejection and post-fetch wall-clock checks do not override an already-selected first-progress timeout with an expired total deadline
-    - continuation-safe Capacity/429 pass-through can forward the original body with encrypted_content instead of the redacted payload
-    - header cloning can cross first-progress deadline without crossing total deadline and still dispatch an upstream attempt
-    - lifecycle timing evidence infers prior chunk timing from total duration instead of recording upstream send timestamps
-    - the full frozen diff contains three trailing-whitespace violations
+    - initial total deadline starts before the first real fetch and can persist an undispatched inspected sample
+    - current first-progress deadline starts before the real fetch and can expire in the remaining pre-dispatch window
+    - non-stream and stream-EOF paths close first-progress before semantic parsing and structure work complete
+    - streaming ensureClientHeaders checks total before header copy instead of immediately before writeHead
+    - timeout after an earlier finalizeModelInsights call can submit the same attempt insights twice
+    - lifecycle evidence records upstream send timing but not gateway processing before the deadline
   reject_if_patterns:
     - retry-or-502-after-downstream-forwarding
     - total-deadline-reset-across-attempts
@@ -397,7 +400,7 @@ post_implementation_review:
     - incomplete-attempt-telemetry
     - protected-feature-regression
   reject_if_hits:
-    - pending-original-reviewer-rereview
+    - unresolved-round-8-review-findings
   resolved_findings_pending_rereview:
     - upload disconnect is client_disconnected with actual bytes, not request_rejected 413
     - unfinished SSE event and pre-progress buffers are bounded at 1MiB
@@ -443,10 +446,17 @@ post_implementation_review:
     - continuation-safe Capacity/429 pass-through strips encrypted_content on pass and retry exhaustion
     - lifecycle regression records actual upstream chunk send timestamps on both sides of the deadline
     - full baseline diff has no trailing-whitespace violations
-  completion_status: review-fix-batch-8-full-local-verification-passed-awaiting-original-reviewer-rereview
+    - initial total deadline starts at the first real fetch and no undispatched inspected sample is created
+    - current first-progress deadline is anchored to upstream_fetch_started_at_ms after fetch invocation
+    - pending retry uses the captured dispatch time for its single final total gate
+    - non-stream and EOF semantic processing finish before first-progress closes
+    - stream header copy is followed by a final total gate immediately before writeHead
+    - model insights are idempotent per attempt model context
+    - lifecycle evidence proves gateway processing before the deadline with first_stream_chunk_at_ms
+  completion_status: review-fix-batch-9-full-local-verification-passed-awaiting-source-snapshot
   parent_resolution:
     status: blocked
-    reason: round-8-fixes-verified-awaiting-stable-source-snapshot-and-original-reviewer-rereview
+    reason: round-9-fixes-verified-awaiting-stable-source-snapshot-and-original-reviewer-rereview
   implementation_freeze_status: active
   allowed_ops:
     - local-review
@@ -524,6 +534,11 @@ verification_results:
   - 2026-07-15 round-8 six JS syntax and three PowerShell AST checks => PASS
   - 2026-07-15 round-8 full baseline diff check => PASS
   - 2026-07-15 round-8 temporary gateway process audit => 0 leftovers
+  - 2026-07-15 round-9 gateway E2E initial GREEN and stability replay => 3/3 PASS
+  - 2026-07-15 round-9 install-restore, Windows launch and Unix launch E2E => PASS
+  - 2026-07-15 round-9 six JS syntax and three PowerShell AST checks => PASS
+  - 2026-07-15 round-9 full baseline diff check => PASS
+  - 2026-07-15 round-9 temporary gateway process audit => 0 leftovers
 review_fix_batch_3_red_evidence:
   - next attempt reached upstream at 239ms with a 220ms total deadline when synchronous retry sample closeout ran before real dispatch
   - terminal CR-only completed SSE returned 200 instead of intercepting reasoning_tokens=516
@@ -590,7 +605,22 @@ review_fix_batch_8_green_evidence:
   - Capacity pass-through and retry-exhaustion bodies are redacted in continuation safety mode
   - lifecycle evidence contains actual upstream chunk send times before and after the first-progress deadline
   - gateway E2E stability replay 3/3, three lifecycle E2E suites, syntax, AST, diff and process audit all pass
-full_verification_status: review-fix-batch-8-full-local-verification-passed-awaiting-original-reviewer-rereview
+review_fix_batch_9_red_evidence:
+  - initial header preparation produced zero upstream requests but one inspected timeout sample
+  - an old guard-to-fetch stall dispatched an already-expired first-progress attempt
+  - non-stream JSON and EOF SSE semantic parsing crossed first-progress but returned 200
+  - stream header copy crossed total deadline and still wrote a complete 200 SSE
+  - one Capacity timeout attempt incremented local model and consistency counters twice
+  - a split pending gate and dispatch-time clock sent a second upstream request and persisted attempt 2
+review_fix_batch_9_green_evidence:
+  - initial total and current first-progress are anchored to the first real fetch timestamp
+  - pending final gate uses the same captured dispatch timestamp and preserves attempt 1
+  - non-stream and EOF semantic parsing return first-progress 502 after crossing the wall clock
+  - stream header copy returns total-timeout before writeHead
+  - model insights increment exactly once per attempt
+  - gateway first_stream_chunk_at_ms proves a lifecycle chunk was processed before timeout
+  - gateway E2E stability replay 3/3, three lifecycle E2E suites, syntax, AST, diff and process audit all pass
+full_verification_status: review-fix-batch-9-full-local-verification-passed-awaiting-source-snapshot
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc

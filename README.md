@@ -247,7 +247,7 @@ Issue #26 收口说明：
 
 - `intercept_rule_mode=none` 只关闭 reasoning 规则，Capacity、HTTP 429、响应超时与全量采集仍可独立叠加；未启用首 progress 控制时，流式响应边读边透传。
 - Capacity、HTTP 429、reasoning、Responses 续写恢复和首 progress 超时共用 `guard_retry_attempts`，同一次上游响应只由优先级最高的策略接管一次。
-- 每次上游 attempt 都落独立样本；上传阶段客户端断连、Retry-After 等待中断连、总超时、已透传后断连和 observe-only 命中会按最终事实收口，不伪装成 413、重复失败或丢失规则命中事实。非流式 observe-only 会在实际写头/写 body 后再冻结样本，客户端首写与 forwarding 字段不会保持空值。
+- 每次真实上游 attempt 都落独立样本；首次 total 与 current 首 progress 都以真实 fetch 的 `upstream_fetch_started_at_ms` 为锚点，未派发候选不会伪装成 inspected sample。上传阶段客户端断连、Retry-After 等待中断连、总超时、已透传后断连和 observe-only 命中会按最终事实收口，不伪装成 413、重复失败或丢失规则命中事实。非流式 observe-only 会在实际写头/写 body 后再冻结样本，客户端首写与 forwarding 字段不会保持空值；模型洞察每个 attempt 只提交一次。
 - 合法配置比较忽略对象成员顺序但保留数组值和顺序，Windows/Unix 复用启动不会因 `latency_guard` 等对象仅换序而重写配置或重启健康 gateway，也不会把 `endpoints`、`reasoning_equals` 这类字符串/数字/布尔数组错误归一化为对象。
 - 本次可叠加策略由 GitHub Issue #26 跟踪：`https://github.com/nonononull/codex-retry-gateway/issues/26`。
 

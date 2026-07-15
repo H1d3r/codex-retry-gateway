@@ -789,6 +789,9 @@ function buildResponsesStreamChunks(parsed, reasoning, sequenceCount = 0) {
   if (Number.isInteger(parsed.test_stream_completed_padding_bytes)) {
     completedPayload.response.test_padding = "x".repeat(parsed.test_stream_completed_padding_bytes);
   }
+  if (parsed.test_response_fault_marker) {
+    completedPayload.test_response_fault_marker = parsed.test_response_fault_marker;
+  }
   if (parsed.test_include_final_answer_only) {
     completedPayload.response.output = [
       {
@@ -7365,6 +7368,7 @@ async function run() {
         "const originalUnshift = Array.prototype.unshift;",
         "const originalObjectEntries = Object.entries;",
         "const originalDateNow = Date.now;",
+        "const originalFetch = global.fetch;",
         "let acceleratedTotalDeadline = false;",
         "let stalledRetryDelay = false;",
         "let dispatchWindowDeadlineAt = 0;",
@@ -7372,23 +7376,36 @@ async function run() {
         "const stalledRetrySampleActions = new Set();",
         "let finalDispatchHeaderCloneCount = 0;",
         "let splitTotalGateHeaderCloneCount = 0;",
-        "let splitTotalGateActive = false;",
-        "let splitTotalGateNowCallCount = 0;",
+        "let splitTotalGateStage = 0;",
+        "let splitTotalGateForcedNow = 0;",
         "let firstProgressHeaderCloneCount = 0;",
+        "let initialHeaderCloneStalled = false;",
+        "let guardToFetchStallActive = false;",
         "Date.now = function patchedDateNow() {",
-        "  if (splitTotalGateActive && new Error().stack.includes('expireTotalDeadlineIfNeeded')) {",
-        "    splitTotalGateNowCallCount += 1;",
-        "    if (splitTotalGateNowCallCount === 1) {",
-        "      return 0;",
-        "    }",
-        "    if (splitTotalGateNowCallCount <= 3) {",
-        "      if (splitTotalGateNowCallCount === 3) {",
-        "        splitTotalGateActive = false;",
-        "      }",
-        "      return Number.MAX_SAFE_INTEGER;",
-        "    }",
+        "  const stack = new Error().stack;",
+        "  if (splitTotalGateStage === 1 && stack.includes('expireTotalDeadlineIfNeeded')) {",
+        "    splitTotalGateStage = 2;",
+        "    return 0;",
+        "  }",
+        "  if ((splitTotalGateStage === 1 || splitTotalGateStage === 2) && stack.includes('proxyRequest')) {",
+        "    splitTotalGateStage = 0;",
+        "    splitTotalGateForcedNow = originalDateNow() + 1000;",
+        "    return splitTotalGateForcedNow;",
+        "  }",
+        "  if (guardToFetchStallActive && new Error().stack.includes('expireTotalDeadlineIfNeeded')) {",
+        "    guardToFetchStallActive = false;",
+        "    const capturedNow = originalDateNow();",
+        "    const releaseAt = capturedNow + 80;",
+        "    while (originalDateNow() < releaseAt) {}",
+        "    return capturedNow;",
         "  }",
         "  return originalDateNow();",
+        "};",
+        "global.fetch = function patchedFetch(input, init) {",
+        "  if (init?.headers?.get?.('x-test-guard-to-fetch-stall') === '1') {",
+        "    guardToFetchStallActive = false;",
+        "  }",
+        "  return Reflect.apply(originalFetch, this, [input, init]);",
         "};",
         "global.setTimeout = function patchedSetTimeout(callback, delay, ...args) {",
         "  const numericDelay = Number(delay);",
@@ -7439,8 +7456,7 @@ async function run() {
         "  if (value && value['x-test-split-total-gate'] === '1' && new Error().stack.includes('cloneHeadersForUpstream')) {",
         "    splitTotalGateHeaderCloneCount += 1;",
         "    if (splitTotalGateHeaderCloneCount === 2) {",
-        "      splitTotalGateActive = true;",
-        "      splitTotalGateNowCallCount = 0;",
+        "      splitTotalGateStage = 1;",
         "    }",
         "  }",
         "  if (value && value['x-test-first-progress-header-stall'] === '1' && new Error().stack.includes('cloneHeadersForUpstream')) {",
@@ -7449,6 +7465,14 @@ async function run() {
         "      const releaseAt = originalDateNow() + 80;",
         "      while (originalDateNow() < releaseAt) {}",
         "    }",
+        "  }",
+        "  if (value && value['x-test-initial-header-stall'] === '1' && new Error().stack.includes('cloneHeadersForUpstream') && !initialHeaderCloneStalled) {",
+        "    initialHeaderCloneStalled = true;",
+        "    const releaseAt = originalDateNow() + 80;",
+        "    while (originalDateNow() < releaseAt) {}",
+        "  }",
+        "  if (value && value['x-test-guard-to-fetch-stall'] === '1' && new Error().stack.includes('cloneHeadersForUpstream')) {",
+        "    guardToFetchStallActive = true;",
         "  }",
         "  return Reflect.apply(originalObjectEntries, Object, [value]);",
         "};",
@@ -7785,6 +7809,105 @@ async function run() {
         `最终 deadline 跨过后不得增加预算、attempt 或真实上游请求: body=${JSON.stringify(finalDispatchGapBody)} requests=${JSON.stringify(finalDispatchGapRequests)} before=${JSON.stringify(finalDispatchGapMetricsBefore.metrics)} after=${JSON.stringify(finalDispatchGapMetricsAfter.metrics)}`,
       );
 
+      const initialDispatchAnchorConfigResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 0,
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 0,
+              first_progress_action: "return_502",
+              total_timeout_ms: 40,
+            },
+          }),
+        },
+      );
+      assert(initialDispatchAnchorConfigResponse.status === 200, "首次 total 派发锚点配置失败");
+      const initialDispatchAnchorMetricsBefore = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/status`,
+      ).then((response) => response.json());
+      const initialDispatchAnchorKey = "latency-total-starts-at-first-real-fetch";
+      const initialDispatchAnchorResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/responses`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-initial-header-stall": "1",
+          },
+          body: JSON.stringify({ test_sequence_key: initialDispatchAnchorKey }),
+          signal: AbortSignal.timeout(1500),
+        },
+      );
+      const initialDispatchAnchorBody = await initialDispatchAnchorResponse.json();
+      const initialDispatchAnchorMetricsAfter = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/status`,
+      ).then((response) => response.json());
+      const initialDispatchAnchorRequests = upstream.responseRequests.filter(
+        (entry) => entry.body?.test_sequence_key === initialDispatchAnchorKey,
+      );
+      assert(
+        initialDispatchAnchorResponse.status === 200 &&
+          initialDispatchAnchorBody?.usage?.output_tokens_details?.reasoning_tokens === 128 &&
+          initialDispatchAnchorRequests.length === 1 &&
+          initialDispatchAnchorMetricsAfter.metrics.total_proxy_request_count ===
+            initialDispatchAnchorMetricsBefore.metrics.total_proxy_request_count + 1 &&
+          initialDispatchAnchorMetricsAfter.metrics.inspected_response_count ===
+            initialDispatchAnchorMetricsBefore.metrics.inspected_response_count + 1,
+        `首次 total 必须从真实 fetch 派发建立，本地 header 准备不得产生未派发 inspected sample: ${JSON.stringify({
+          status: initialDispatchAnchorResponse.status,
+          body: initialDispatchAnchorBody,
+          requests: initialDispatchAnchorRequests,
+          before: initialDispatchAnchorMetricsBefore.metrics,
+          after: initialDispatchAnchorMetricsAfter.metrics,
+        })}`,
+      );
+
+      const guardToFetchAnchorConfigResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 0,
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 40,
+              first_progress_action: "return_502",
+              total_timeout_ms: 300,
+            },
+          }),
+        },
+      );
+      assert(guardToFetchAnchorConfigResponse.status === 200, "首 progress 真实 fetch 锚点配置失败");
+      const guardToFetchAnchorKey = "latency-first-progress-starts-at-real-fetch";
+      const guardToFetchAnchorResponse = await fetch(
+        `http://127.0.0.1:${policyDeadlineGatewayPort}/responses`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-test-guard-to-fetch-stall": "1",
+          },
+          body: JSON.stringify({ test_sequence_key: guardToFetchAnchorKey }),
+          signal: AbortSignal.timeout(1500),
+        },
+      );
+      const guardToFetchAnchorBody = await guardToFetchAnchorResponse.json();
+      assert(
+        guardToFetchAnchorResponse.status === 200 &&
+          guardToFetchAnchorBody?.usage?.output_tokens_details?.reasoning_tokens === 128 &&
+          upstream.responseRequests.filter(
+            (entry) => entry.body?.test_sequence_key === guardToFetchAnchorKey,
+          ).length === 1,
+        `current 首 progress 必须锚定真实 fetch，guard 到 fetch 的同步停顿不得派发过期 attempt: status=${guardToFetchAnchorResponse.status} body=${JSON.stringify(guardToFetchAnchorBody)}`,
+      );
+
       const splitTotalGateConfigResponse = await fetch(
         `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
         {
@@ -7803,11 +7926,11 @@ async function run() {
           }),
         },
       );
-      assert(splitTotalGateConfigResponse.status === 200, "pending/current 双闸门归属配置失败");
+      assert(splitTotalGateConfigResponse.status === 200, "pending 最终闸门归属配置失败");
       const splitTotalGateMetricsBefore = await fetch(
         `http://127.0.0.1:${policyDeadlineGatewayPort}/__codex_retry_gateway/api/status`,
       ).then((response) => response.json());
-      const splitTotalGateKey = "latency-pending-owner-between-total-gates";
+      const splitTotalGateKey = "latency-pending-owner-at-final-total-gate";
       const splitTotalGateResponse = await fetch(
         `http://127.0.0.1:${policyDeadlineGatewayPort}/responses`,
         {
@@ -7849,7 +7972,7 @@ async function run() {
             splitTotalGateMetricsBefore.metrics.total_proxy_request_count + 1 &&
           splitTotalGateMetricsAfter.metrics.inspected_response_count ===
             splitTotalGateMetricsBefore.metrics.inspected_response_count + 1,
-        `两个 total gate 之间过期时必须由已检查的 pending attempt 收口: ${JSON.stringify({
+        `pending 最终 total gate 过期时必须由已检查的旧 attempt 收口: ${JSON.stringify({
           body: splitTotalGateBody,
           samples: splitTotalGateSamples,
           requests: splitTotalGateRequests,
@@ -8055,9 +8178,10 @@ async function run() {
         "let stalledCapacityTerminalBody = false;",
         "let stalledReasoningTerminalBody = false;",
         "let stalledRateLimitHeaderCopy = false;",
+        "let stalledStreamHeaderCopy = false;",
         "global.setTimeout = function patchedSetTimeout(callback, delay, ...args) {",
         "  const numericDelay = Number(delay);",
-        "  if (numericDelay === 40 && !delayedFetchRejectionFirstProgress) {",
+        "  if (numericDelay >= 35 && numericDelay <= 40 && !delayedFetchRejectionFirstProgress) {",
         "    delayedFetchRejectionFirstProgress = true;",
         "    return originalSetTimeout(() => {",
         "      callback(...args);",
@@ -8065,11 +8189,18 @@ async function run() {
         "      while (Date.now() < releaseAt) {}",
         "    }, delay);",
         "  }",
-        "  if ([45, 47, 200].includes(numericDelay) && !delayedFirstProgressTimers.has(numericDelay)) {",
-        "    delayedFirstProgressTimers.add(numericDelay);",
-        "    return originalSetTimeout(callback, numericDelay === 200 ? 500 : 200, ...args);",
+        "  const delayedFirstProgressBucket = numericDelay >= 43 && numericDelay <= 45",
+        "    ? 45",
+        "    : numericDelay >= 46 && numericDelay <= 47",
+        "      ? 47",
+        "      : numericDelay >= 198 && numericDelay <= 200",
+        "        ? 200",
+        "        : null;",
+        "  if (delayedFirstProgressBucket && !delayedFirstProgressTimers.has(delayedFirstProgressBucket)) {",
+        "    delayedFirstProgressTimers.add(delayedFirstProgressBucket);",
+        "    return originalSetTimeout(callback, delayedFirstProgressBucket === 200 ? 500 : 200, ...args);",
         "  }",
-        "  if (delayedTotalTimerCount < 8 && numericDelay >= 60 && numericDelay <= 70) {",
+        "  if (delayedTotalTimerCount < 9 && numericDelay >= 55 && numericDelay <= 70) {",
         "    delayedTotalTimerCount += 1;",
         "    return originalSetTimeout(callback, 200, ...args);",
         "  }",
@@ -8096,10 +8227,17 @@ async function run() {
         "    const releaseAt = Date.now() + 100;",
         "    while (Date.now() < releaseAt) {}",
         "  }",
+        "  if (!stalledStreamHeaderCopy && `${this.get('content-type') || ''}`.includes('x-test-header-copy-stall=1') && new Error().stack.includes('copyHeadersToClient')) {",
+        "    stalledStreamHeaderCopy = true;",
+        "    const releaseAt = Date.now() + 100;",
+        "    while (Date.now() < releaseAt) {}",
+        "  }",
         "  return Reflect.apply(originalHeadersEntries, this, []);",
         "};",
         "let stalledNonStreamDeadlineParse = false;",
         "let stalledStreamDeadlineParse = false;",
+        "let stalledNonStreamFirstProgressParse = false;",
+        "let stalledEofFirstProgressParse = false;",
         "JSON.parse = function patchedJsonParse(value, ...args) {",
         "  const result = Reflect.apply(originalJsonParse, JSON, [value, ...args]);",
         "  const text = typeof value === 'string' ? value : '';",
@@ -8110,6 +8248,16 @@ async function run() {
         "  }",
         "  if (!stalledStreamDeadlineParse && text.includes('\\\"type\\\":\\\"response.output_text.delta\\\"') && text.includes('stream-total-parse-marker')) {",
         "    stalledStreamDeadlineParse = true;",
+        "    const releaseAt = Date.now() + 100;",
+        "    while (Date.now() < releaseAt) {}",
+        "  }",
+        "  if (!stalledNonStreamFirstProgressParse && text.includes('\\\"id\\\":\\\"resp_test\\\"') && text.includes('non-stream-first-progress-parse')) {",
+        "    stalledNonStreamFirstProgressParse = true;",
+        "    const releaseAt = Date.now() + 100;",
+        "    while (Date.now() < releaseAt) {}",
+        "  }",
+        "  if (!stalledEofFirstProgressParse && text.includes('\\\"type\\\":\\\"response.completed\\\"') && text.includes('eof-first-progress-parse')) {",
+        "    stalledEofFirstProgressParse = true;",
         "    const releaseAt = Date.now() + 100;",
         "    while (Date.now() < releaseAt) {}",
         "  }",
@@ -8206,15 +8354,33 @@ async function run() {
             body?.error?.code === "upstream_total_timeout",
           `${key} 在首次 writeHead 前跨过 total deadline 时必须由 timeout 收口: status=${response.status} body=${JSON.stringify(body)}`,
         );
+        return { response, body };
       };
 
+      const capacityInsightStatusBefore = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/status`,
+      ).then((response) => response.json());
       await assertTerminalDeadlineWins({
         key: "total-deadline-before-capacity-policy-502-write",
         requestBody: {
+          model: "gpt-5.4",
           test_capacity_error_attempts: 1,
           test_retry_after: "0",
         },
       });
+      const capacityInsightStatusAfter = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/status`,
+      ).then((response) => response.json());
+      assert(
+        (capacityInsightStatusAfter.model_insights?.local_model_counts?.["gpt-5.4"] || 0) ===
+          (capacityInsightStatusBefore.model_insights?.local_model_counts?.["gpt-5.4"] || 0) + 1 &&
+          capacityInsightStatusAfter.model_insights?.consistency?.total_checked ===
+            capacityInsightStatusBefore.model_insights?.consistency?.total_checked + 1,
+        `同一 timeout attempt 的模型洞察只能提交一次: ${JSON.stringify({
+          before: capacityInsightStatusBefore.model_insights,
+          after: capacityInsightStatusAfter.model_insights,
+        })}`,
+      );
       await assertTerminalDeadlineWins({
         key: "total-deadline-before-http-429-pass-through-write",
         requestBody: {
@@ -8222,6 +8388,26 @@ async function run() {
           test_retry_after: "0",
         },
       });
+
+      const streamHeaderDeadlineResponse = await readSseUntilClose(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/responses`,
+        {
+          stream: true,
+          test_sequence_key: "total-deadline-during-stream-header-copy",
+          test_stream_text: "stream-header-copy",
+          test_stream_chunk_delay_ms: 0,
+          test_stream_response_content_type:
+            "text/event-stream; charset=utf-8; x-test-header-copy-stall=1",
+        },
+      );
+      assert(
+        streamHeaderDeadlineResponse.status === 502 &&
+          streamHeaderDeadlineResponse.headers.get("x-codex-retry-gateway-reason") ===
+            "upstream-total-timeout" &&
+          JSON.parse(streamHeaderDeadlineResponse.text)?.error?.code ===
+            "upstream_total_timeout",
+        `流式 header copy 跨过 total deadline 后必须在 writeHead 前返回 timeout 502: ${JSON.stringify(streamHeaderDeadlineResponse)}`,
+      );
       await assertTerminalDeadlineWins({
         key: "total-deadline-before-reasoning-block-write",
         requestBody: {
@@ -8280,6 +8466,84 @@ async function run() {
           before: fetchRejectionMetricsBefore.metrics,
           after: fetchRejectionMetricsAfter.metrics,
         })}`,
+      );
+
+      const nonStreamFirstProgressParseConfigResponse = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 0,
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 41,
+              first_progress_action: "return_502",
+              total_timeout_ms: 0,
+            },
+          }),
+        },
+      );
+      assert(nonStreamFirstProgressParseConfigResponse.status === 200, "非流式首 progress 解析边界配置失败");
+      const nonStreamFirstProgressParseResponse = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/responses`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            test_sequence_key: "first-progress-crossed-during-non-stream-parse",
+            test_response_fault_marker: "non-stream-first-progress-parse",
+          }),
+        },
+      );
+      const nonStreamFirstProgressParseBody = await nonStreamFirstProgressParseResponse.json();
+      assert(
+        nonStreamFirstProgressParseResponse.status === 502 &&
+          nonStreamFirstProgressParseResponse.headers.get("x-codex-retry-gateway-reason") ===
+            "upstream-first-progress-timeout" &&
+          nonStreamFirstProgressParseBody?.error?.code === "upstream_first_progress_timeout",
+        `非流式语义解析跨过首 progress deadline 后不得因提前清 timer 返回 200: status=${nonStreamFirstProgressParseResponse.status} body=${JSON.stringify(nonStreamFirstProgressParseBody)}`,
+      );
+
+      const eofFirstProgressParseConfigResponse = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/config`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            intercept_rule_mode: "none",
+            guard_retry_attempts: 0,
+            latency_guard: {
+              enabled: true,
+              first_progress_timeout_ms: 42,
+              first_progress_action: "return_502",
+              total_timeout_ms: 0,
+            },
+          }),
+        },
+      );
+      assert(eofFirstProgressParseConfigResponse.status === 200, "EOF 首 progress 解析边界配置失败");
+      const eofFirstProgressParseResponse = await readSseUntilClose(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/responses`,
+        {
+          stream: true,
+          test_sequence_key: "first-progress-crossed-during-eof-parse",
+          test_reasoning_tokens: 128,
+          test_include_final_answer_only: true,
+          test_stream_only_completed_event: true,
+          test_stream_event_separator: "\r\r",
+          test_stream_chunk_delay_ms: 0,
+          test_response_fault_marker: "eof-first-progress-parse",
+        },
+      );
+      const eofFirstProgressParseBody = JSON.parse(eofFirstProgressParseResponse.text);
+      assert(
+        eofFirstProgressParseResponse.status === 502 &&
+          eofFirstProgressParseResponse.headers.get("x-codex-retry-gateway-reason") ===
+            "upstream-first-progress-timeout" &&
+          eofFirstProgressParseBody?.error?.code === "upstream_first_progress_timeout",
+        `EOF SSE 语义解析跨过首 progress deadline 后不得因提前清 timer 返回 200: ${JSON.stringify(eofFirstProgressParseResponse)}`,
       );
 
       const restoreFirstProgressCompletionConfigResponse = await fetch(
@@ -8370,6 +8634,23 @@ async function run() {
           upstream_received_at_ms: delayedMetadataUpstreamRequest?.received_at_ms ?? null,
           stream_chunk_sent_at_ms: delayedMetadataChunkTimes,
         })}`,
+      );
+      const delayedMetadataAnalytics = await fetch(
+        `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
+      ).then((response) => response.json());
+      const delayedMetadataSample = (delayedMetadataAnalytics.recent_samples || []).find(
+        (sample) =>
+          `${sample.request_payload_excerpt || ""}`.includes(
+            "delayed-first-progress-metadata-wall-clock",
+          ),
+      );
+      assert(
+        Number.isFinite(delayedMetadataSample?.first_stream_chunk_at_ms) &&
+          Number.isFinite(delayedMetadataSample?.upstream_fetch_started_at_ms) &&
+          delayedMetadataSample.first_stream_chunk_at_ms -
+            delayedMetadataSample.upstream_fetch_started_at_ms < 47 &&
+          delayedMetadataSample.timeout_phase === "first_progress",
+        `lifecycle 反例必须由 gateway 自身时钟证明前序 chunk 已在 deadline 前处理: ${JSON.stringify(delayedMetadataSample)}`,
       );
 
       const synchronousDeadlineConfigResponse = await fetch(

@@ -120,7 +120,7 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - Capacity/429 的 trigger 在分类时计数，retry/pass-through/502 在动作确定时分别计数；Retry-After 等待被客户端断连或 total deadline 中断时，trigger 仍必须保留且 retry 不得增加。
 - Windows canonical 配置比较必须保留字符串、数字、布尔数组的值和顺序，同时只忽略对象键顺序。
 - SSE framing 必须覆盖字段名与 JSON 跨 chunk、fallback 后尾随候选、独立/同块/UTF-8 字节级跨 chunk 的 BOM、首个事件即超大的误标候选、LF/CR/CRLF 混合空行和 EOF 纯 CR 终态；检查上限优先于同一 chunk 中迟到的 first-progress timeout；reasoning 保护下的超大事件在未写响应时返回专用 502，在已写响应时 fail-closed 断连；EOF 才命中的 disconnect 规则也必须实际断连。
-- 每个已启动 attempt 必须且只能归入 inspected、bypassed、failed 或 active；已有前序 inspected attempt 时，后续 fetch failure 仍单独增加 failed，保持 `total = inspected + bypassed + failed + active`。
+- 每个真实 fetch 已启动的 attempt 必须且只能归入 inspected、bypassed、failed 或 active；未派发候选不得增加 inspected 或持久化伪 attempt，模型洞察每个 attempt 只提交一次；已有前序 inspected attempt 时，后续 fetch failure 仍单独增加 failed，保持 `total = inspected + bypassed + failed + active`。
 - none + latency guard 的首 progress 前导缓冲是严格 `1MiB` 硬上限；越界 chunk 不能先进入缓冲数组。
 - `retry_upstream_capacity_errors` 只用于旧配置迁移；新动作字段是最终真源。
 
