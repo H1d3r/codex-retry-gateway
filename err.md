@@ -1391,6 +1391,291 @@
    - 验证：
      - 报告返回 `TEST_MATRIX_STATUS=ready`、`SIBLING_REGRESSION_GUARD_STATUS=passed` 和 `TEST_GOVERNANCE_MATRIX_OK`。
 
+38. 严格 reasoning 全流缓冲会把客户端首字时间拖到接近响应完成，直接透传与超时改写必须按是否已写客户端分流
+   - 现象：
+     - 上游已经持续产生 SSE，但客户端长时间看不到首个有效输出，观测上首字时间接近整轮完成时间。
+     - 如果为降低延迟直接提前写响应头，后续命中规则、Capacity、429 或 timeout 时已无法安全改写为 `502`。
+   - 根因：
+     - 既有 strict reasoning 路径必须在完整解析后才能判断 token/结构命中，因此会缓存整轮 SSE。
+     - 上游首 chunk、首 content 与客户端首写是三个不同时间点；旧采集没有完整区分。
+     - HTTP 响应一旦开始透传，状态码和已写字节不可撤回，不能在同一响应里重新派发并拼接第二轮结果。
+   - 处理：
+     - `intercept_rule_mode=none` 禁用 reasoning 命中、续写和专用剥离，未启用 latency guard 时直接边读边透传。
+     - none + latency guard 只缓存首个有效输出前的 lifecycle/metadata，固定上限 `1MiB`；文字、commentary、final、tool/function call 才算 progress。
+     - 总 deadline 从第一次上游派发开始并跨内部 attempt 保持不变；首 progress 重试与 reasoning、续写、Capacity、429 共用 `guard_retry_attempts`。
+     - 未透传时 timeout 可返回稳定 `502`；已透传后只取消上游并断开连接，记录 `timeout_disconnected_after_forward`，不得伪装为 502。
+     - analytics schema 升级为 `3`，补充 `policy_*`、`retry_*`、客户端首写、timeout 和 forwarding 字段；旧样本缺字段统一保持 `null`。
+     - Windows/Unix 启动控制面保留合法 `none`、动作枚举和嵌套 `latency_guard`；旧 Capacity 布尔仅在新动作缺失时参与迁移，正确配置二次启动保持配置字节、mtime 和 PID 不变。
+   - 验证：
+     - `node .\scripts\test-gateway-e2e.mjs`
+     - `node .\scripts\test-install-restore.mjs`
+     - `node .\scripts\test-launch-ui.mjs`
+     - `node .\scripts\test-launch-ui-unix.mjs`
+     - `node --check .\gateway.mjs`
+     - `node --check .\scripts\admin-lib.mjs`
+     - PowerShell Parser AST 检查 `common.ps1`、`install-for-current-provider.ps1`、`launch-ui.ps1`
+     - `git diff --check`
+
+39. Retry-After 等待、客户端断连和前导缓冲必须在同一 attempt 内按最终事实收口
+   - 现象：
+     - 已完整收到 429 并进入 Retry-After 等待后，总 deadline 到期会从外层直接 `return`，客户端既收不到 502，也没有结束响应。
+     - 该 attempt 在等待前已被落成 `http_429_internal_retry`，再次走 timeout 会产生重复或矛盾样本。
+     - none + latency guard 会先把越界 chunk 压入前导数组，再发现已超过 `1MiB` 并刷新，因此固定值不是严格内存上限。
+     - 客户端主动断开与上游断流共用 AbortError，若不先检查客户端信号会误记为 upstream terminated。
+   - 根因：
+     - 策略 handler 过早完成 retry 计数、模型统计和 attempt 样本，等待结果不再拥有可收口的原始 sample。
+     - 外层只把 `waitForRetryDelay=false` 当作停止信号，没有区分 total timeout 与 client disconnect。
+     - 前导缓冲在 push 后才比较累计字节数，单个网络 chunk 可以让数组瞬时越界。
+   - 处理：
+     - 策略 handler 只返回 retry 意图；等待真正完成后才记录策略 retry、扣共享预算并创建下一 attempt。
+     - 等待被总 deadline 中断时，用同一未完成 sample 调用 timeout 收口并返回 `upstream-total-timeout` 502；客户端断开则记录 `client_disconnected`。
+     - 前导 chunk 在 push 前计算累计值；将越界时先刷已有块，当前 chunk 直接写给客户端。
+     - `endpoints` 作为 reasoning、Capacity、429、latency 的统一管理边界；timer 阈值限制为 `0..2_147_483_647`。
+   - 防回归：
+     - `node .\scripts\test-gateway-e2e.mjs` 使用两个独立临时网关做确定性故障注入，分别覆盖 deadline 中断等待和前导数组硬上限。
+     - deadline 用例要求 HTTP 502、`upstream_total_timeout`、只发一次上游请求且只落一个 `total_timeout_returned_502` sample。
+     - 缓冲用例要求大于 `1MiB` 的无 progress 元数据仍返回 200，并记录 `timeout_response_control_lost=true` 与 `response_forwarding_started=true`。
+
+40. 分层策略的 attempt 统计、流解析和配置幂等必须覆盖断连与非标准响应
+   - 现象：
+     - 客户端在上传请求体时断连会被误记成 `request_rejected + 413`，看起来像请求体超限。
+     - SSE 长时间没有事件分隔符时，未完成事件字符串可持续增长；慢速 `text/plain` 等非 SSE 流也不会结束首 progress 计时。
+     - timeout、Retry-After 等待中断连和 observe-only 命中后断连会出现 inspected/failed 重复、timeout 不进 inspected 分母或 `matched_current_rule` 丢失。
+     - `latency_guard` 等对象仅调整成员顺序时，安装/启动脚本仍会写盘，并可能重启已经健康的 gateway。
+   - 根因：
+     - 请求体读取异常统一走 413 分支，没有区分 `ECONNRESET` / request abort，也没有保留实际已读字节。
+     - SSE parser 只等待分隔符后再切块，非 SSE chunk 又没有作为有效输出信号。
+     - inspected 计数散落在多个 timeout、策略等待和 stream catch 分支，没有 attempt 级幂等；断连收口使用了默认 `matched=false`。
+     - 配置比较直接比较序列化文本，错误地把对象键顺序当成配置语义；数组顺序则必须继续保留。
+   - 处理：
+     - 请求体读取错误携带 `requestBodyBytesRead`；只有真实超过上限才记录 `413 request_rejected`，客户端断连记录 `client_disconnected` 和实际读取字节。
+     - SSE 未完成事件超过 `1MiB` 后进入 bounded discard 状态，只保留识别后续边界所需的尾部；非 SSE 的首个非空 chunk 直接标记 first content/progress。
+     - 使用 attempt sample 级 `recordInspectedResponseForSample()` 去重；取得上游响应后的 timeout 计入 inspected，Retry-After 断连不再同时增加 failed，observe-only 断连复用已经观察到的规则命中事实。
+     - Node 与 PowerShell 配置比较都递归排序对象键，但保持数组原顺序，合法配置仅成员换序时不写盘、不改 mtime、不重启 PID。
+   - 防回归：
+     - `test-gateway-e2e.mjs` 覆盖上传断连、慢速非 SSE、超大无分隔 SSE、Retry-After 断连、timeout 计数恒等式和 observe-only 命中后断连。
+     - `test-install-restore.mjs`、`test-launch-ui.mjs`、`test-launch-ui-unix.mjs` 都覆盖嵌套配置成员换序后的字节、mtime 与 PID 幂等。
+
+41. Windows 已退出进程对象仍可能存在，不能只凭 Get-Process 判断存活
+   - 现象：
+     - `test-launch-ui.mjs` 稳定失败于 `PowerShell failed-start cleanup left its child PID file behind`。
+     - PowerShell cleanup helper 已返回，子进程也确实停止，但 PID 文件没有删除。
+   - 根因：
+     - Windows 上已终止进程在父进程仍持有句柄时，`Get-Process -Id` 短时间仍能返回对象，此时对象的 `HasExited=true`。
+     - `Test-ProcessAlive` 旧实现只要 `Get-Process` 成功就返回 true，导致 `Stop-FailedGatewayStart` 跳过 PID 文件清理。
+   - 处理：
+     - `Test-ProcessAlive` 改为返回 `-not $process.HasExited`；找不到进程时仍返回 false。
+   - 防回归：
+     - RED：`node .\scripts\test-launch-ui.mjs` 稳定失败于失败启动 PID 文件残留。
+     - GREEN：同一命令通过 `PASS launch-ui flow`；随后四套 E2E 串行 fresh 通过。
+
+42. SSE 检查与 Retry-After 必须防止协议误标、超大事件和 timer 排序绕过
+   - 现象：
+     - 精确 Capacity 特征优先于通用 429 后，Capacity 429 会忽略正值 `Retry-After` 并立即重试。
+     - 事件循环阻塞时，Retry-After timer 可在总 deadline timer 回调前恢复 continuation，导致 deadline 已过仍派发新 attempt。
+     - SSE parser 只识别 `\n\n` / `\r\n\r\n`，误标为 `text/plain` 的合法 JSON SSE、`\n\r\n` 混合空行和单个超过 1 MiB 的 completed 事件会丢失 reasoning/结构信号。
+     - parser 旧实现先拼接完整字符串再检查长度，不是严格 1 MiB 状态上限；observe-only 命中后 timeout 又会把样本 `matched_current_rule` 覆盖为 false。
+   - 根因：
+     - Retry-After 解析错误地依赖策略 trigger，而不是实际 HTTP 429 状态；等待结束后只依赖 timer abort，没有按墙钟复核 deadline。
+     - SSE framing 使用字符串固定分隔符和 Content-Type 单一判定；超限事件被静默丢弃，严格保护把“无法检查”误当成“未命中”。
+     - inspected helper 只更新计数，不把已经观察到的命中事实写回 attempt sample；timeout 收口硬编码 `matched=false`。
+   - 处理：
+     - 所有实际 HTTP 429（包括 Capacity）统一解析 `Retry-After`；等待完成后调用 latency guard 墙钟检查，过期时复用当前 attempt 返回总 timeout 502。
+     - parser 改为 Buffer 字节级 framing，支持 LF、CR、CRLF 混合空行；正常状态最多保存 1 MiB，discard 状态最多保存 3 字节边界尾巴，并按 64 KiB 分片扫描输入。
+     - 非 JSON 流式响应同时做有界 `data: {json}` 识别；普通非 SSE 非空 chunk 仍算首 progress。
+     - `none`/observe-only 的超大事件保持透传并记录检查失败；严格 reasoning 保护返回 `502 response_inspection_limit_exceeded`，样本落 `final_action=response_inspection_limit_exceeded` 与同码 failure summary。
+     - attempt inspected helper 一旦观察到命中即写回 sample；timeout 三个最终分支继承该值。
+   - 防回归：
+     - `test-gateway-e2e.mjs` 新增 Capacity 正值等待、late timer deadline、混合换行、误标 Content-Type、超大 protected completed、parser 硬上限故障注入和 observe-only timeout 七组反例。
+     - 2026-07-15 Codex bundled Node 四套 E2E 串行 PASS，六个 JS syntax、PowerShell AST、`git diff --check` 与临时进程审计 PASS。
+
+43. 策略重试的同步收口、SSE EOF 和 disconnect 检查失败必须按不可撤回边界处理
+   - 现象：
+     - Retry-After timer 恢复时虽然 deadline 尚余约 20 ms，但旧 retry attempt 的同步 analytics 入库可以阻塞事件循环；第二次上游请求最终在总 deadline 之后才真正到达。
+     - 误标 `text/plain` 的 SSE 首 chunk 只有 `data:`、JSON 位于下一 chunk 时，会被当成普通文本 progress。
+     - 唯一 `response.completed` 事件用 `\r\r` 结束后立即 EOF 时，最后一个 CR 一直被保留等待潜在 LF，516 可绕过最终规则判断。
+     - `stream_action=disconnect` 已发送 200 响应头后遇到超过 1 MiB 的受保护事件，旧超限分支因不是 strict-502 模式而继续透传。
+   - 根因：
+     - “调用 `fetch()` 返回 Promise”不等于请求已经离开 Node/Undici 事件循环；在其后立即同步收口仍可能挡住真实网络派发。
+     - 误标 SSE 嗅探只接受 `data: {` 或 `data: [DONE]`，没有在字段前缀阶段切换到 SSE framing。
+     - chunk 解析必须把末尾 CR 保留到下一块判断 CRLF，但 EOF 分支没有允许尾随 CR 的 final flush。
+     - 检查上限只受 `strict502Mode` 控制，没有覆盖 reasoning 规则启用但响应已不可改写的 disconnect 模式。
+   - 处理：
+     - policy retry 等待完成后先保留旧 attempt 上下文；下一轮在派发前做最终墙钟检查。过期时用旧 sample 返回总 timeout；未过期时启动下一 fetch 并让出两个有界事件循环轮次，再按预先捕获的旧 attempt 结束时间同步完成日志、计数和样本，不等待下一响应头。
+     - `total_proxy_request_count` 与 active 计数移动到实际 fetch attempt，未派发的 deadline 分支不计数，也不记录新 attempt。
+     - 误标 SSE 从行首 `data:` / `event:` / `id:` / `retry:` / comment 前缀开始识别；EOF 使用只在终止阶段允许尾随 CR 的 `flushSsePayloads()`，完整事件继续进入模型、usage、结构与 reasoning 累积。
+     - reasoning 流式保护启用且检查超限时统一 fail-closed：未写响应返回专用 502；已写响应取消 reader/upstream、销毁下游并记录 `response_inspection_limit_disconnected_after_forward`。
+   - 防回归：
+     - deadline 故障注入让旧 `http_429_internal_retry` 样本同步入库跨过总 deadline，并断言第二次上游实际接收时间仍早于 deadline；第一版仅提前创建 fetch Promise 仍以 239 ms 对 220 ms 失败，最终后移同步收口后转绿。
+     - E2E 覆盖 `data:` 与 JSON 跨 chunk并暂停、纯 CR completed 后立即 EOF、disconnect 已写响应后的受保护超大事件断连和专用样本。
+     - 2026-07-15 Codex bundled Node 四套 E2E 串行 PASS，六个 JS syntax、三份 PowerShell AST、`git diff --check` 与仓库临时 Node 进程 0 残留。
+
+44. 所有共享 retry、误标 SSE 和 attempt 计数必须使用统一状态机口径
+   - 现象：
+     - 第三批最终 deadline 闸门只覆盖 Capacity/429；reasoning guard、续写和首 progress timeout 的同步折叠、日志或样本收口仍可跨过 deadline 后继续派发。
+     - 旧 policy sample 等到下一 fetch 返回响应头才落盘；下一 fetch 挂起时旧样本长期不可见，duration/TPS 还包含下一 attempt 的等待。
+     - 误标 SSE 只识别完整字段前缀，首 chunk 为 `d` / `eve` / `i` / `ret` 会被误算普通文本 progress；反向把完整 `id:` / `retry:` / comment 普通文本永久当 SSE。
+     - 流首 UTF-8 BOM 会让首行变成 `\uFEFFdata:`，唯一 completed 事件中的 516 被漏掉。
+     - EOF flush 才确认命中时，disconnect 模式因不能返回 502 而被降成 observe-only；final-answer-only 同样受影响。
+     - 前一 attempt 已记 inspected 后，下一 fetch failure 只记录样本却不增加 failed，破坏 `total = inspected + bypassed + failed + active`。
+   - 根因：
+     - retry 的预算递增、样本完成和继续循环分散在四个分支，没有统一的“未派发 pending -> deadline gate -> 已派发”状态。
+     - 用 fetch Promise resolve 当作派发确认会把旧 attempt 生命周期绑定到下一响应头；只创建 Promise 或只让出一次 `setImmediate` 又不足以让 Node/Undici 在确定性故障注入下写出请求。
+     - Content-Type 误标本身存在协议歧义，需要待判态，而不是遇到完整保留字段就永久切换布尔值。
+     - request-level outcome 不能替代 attempt-level inspected/failed 分类。
+   - 处理：
+     - 四种 retry 都生成 `pendingRetryDispatch`，不提前扣预算或完成 sample；下一轮可覆盖首 progress timeout 地复核总 deadline。允许派发时先启动 fetch 并连续让出两个 check/poll 轮次，再完成旧 sample；过期时仍用旧 sample 返回总 timeout。
+     - pending 对象捕获 `requestFinishedAtMs` 与 `latestLogSeq`；旧样本不等待下一响应头，挂起 fetch 下仍及时可见，duration/TPS 不跨 attempt。续写次数与 timeout retry 次数也只在进入派发轮次后增加。
+     - parser 使用有界 tri-state：字段名部分前缀保持待判，JSON data 确认为 SSE，完整不可识别事件回退普通文本；parser 副本忽略可跨 chunk 的流首 UTF-8 BOM，原始下游字节不改。
+     - EOF 最终命中且 `stream_action=disconnect` 时统一记录实际 blocked/matched，取消上游并 `res.destroy()`；reasoning 与 final-only 共用该分支。
+     - 当前 attempt 尚未 inspected 而失败时在内层 catch 单独增加 failed 并写 request outcome，外层兜底不再因前序 inspected 状态漏计或重复计数。
+   - 防回归：
+     - 同一计时故障模块分别让 `http_429_internal_retry`、`internal_retry`、`continuation_recovery`、`first_progress_timeout_internal_retry` 的同步入库跨过 220 ms deadline，四类第二次上游请求都必须在 deadline 前实际收到。
+     - 第二 fetch 延迟 800 ms 且 latency guard 关闭时，旧 429 sample 必须在 250 ms 观测窗口内出现，且自身 duration 小于 500 ms。
+     - E2E 覆盖 `d/eve/i/ret` 字段内部拆分、`id:`/comment 普通文本回退、BOM completed 516、纯 CR EOF reasoning/final-only disconnect，以及 429 后连续 fetch failure 的全局计数恒等式。
+
+45. SSE 候选组合与 latency 完成路径不能依赖剩余 buffer 或 timer 回调顺序
+   - 现象：
+     - 误标 `text/plain` 的首个 completed 事件超过 1 MiB 时，超限瞬间尚未解析 JSON，`sse_like=false`，516 事件被 discard 后可按未命中透传。
+     - UTF-8 BOM 单独占一个 chunk 时，parser 删除 BOM 后 buffer 为空，但原始 chunk 非空，旧逻辑会错误清除首 progress timer。
+     - 同一 chunk 为 `id: ordinary\n\nd` 时，完整非 JSON block 已应回退普通文本；parser 消费该 block 后只剩候选 `d`，旧逻辑重新进入 pending 并返回错误的首 progress 502。
+     - timer 回调被事件循环延迟时，非流式 body 或流式 progress/EOF 可先恢复并清 timer，使 first-progress 或 total 硬阈值失效。
+   - 根因：
+     - `sse_like` 只表达已确认 SSE，无法表达“超限前是候选”；progress 又只从解析后剩余 buffer 反推，丢失 BOM removal 与本 chunk fallback 事实。
+     - latency guard 只有 timer phase，没有保存首 progress 绝对截止时间；完成路径默认 timer 已按时执行。
+   - 处理：
+     - parser state 增加 BOM removal、unrecognized event、active candidate 与 oversized candidate 计数；`inspectSseChunk()` 返回本 chunk 事实。候选超限参与 inspection failure，BOM-only 不算 progress，unrecognized fallback 优先于尾随候选。
+     - guard 保存 `firstProgressDeadlineAtMs`；`markFirstProgress()` / `endFirstProgressWindow()` 先按墙钟判定。非流式 body、流式 chunk 和 EOF 先复核 total（可覆盖已触发 first-progress），再清 timer或写客户端。
+     - 未派发 total timeout 的 `retry_trigger/retry_delay_ms` 明确保持 `null`；policy 旧 sample 使用派发前捕获的 evidence 上界，不把下一 attempt 日志纳入自身范围。
+   - 防回归：
+     - E2E 覆盖 standalone BOM 后暂停、ordinary fallback + 尾随 `d`、误标超大 completed 516。
+     - 独立 fault gateway 把 45 ms first-progress 与 70 ms total timer 回调延迟到 200 ms；上游分别在 80/100 ms 产生 progress/body，仍必须按墙钟返回对应 502。
+     - pending sample 额外断言唯一性、`request_finished_at_ms` 早于第二次上游接收、duration 与 evidence 上界存在；未派发 Retry-After timeout 断言 retry 字段为空。
+
+46. 检查上限必须先于 progress/timeout，测试证据不能依赖预热事件或跨进程毫秒墙钟
+   - 现象：
+     - “误标首个超大候选”用例默认先生成普通输出，parser 已进入 confirmed SSE，无法证明首个事件超过 `1MiB` 时仍会 fail-closed。
+     - 超大候选在同一 chunk 完成边界后可能先被当成普通文本 progress；first-progress 已过期时又可能先走 timeout，绕过专用检查失败收口。
+     - timer 回调延迟时，连续 lifecycle/metadata chunk 不会主动复核 first-progress 墙钟，要等有效输出、EOF 或迟到 timer 才超时。
+     - JavaScript 字符切分只能覆盖完整 BOM 独立成块，不能覆盖 `EF BB BF` 三个 UTF-8 字节跨网络 chunk。
+     - pending sample 测试严格比较 gateway 与假上游两个进程的 `Date.now()`；Windows 实测出现 4ms 回拨，导致因果顺序正确但断言偶发失败。
+   - 根因：
+     - 测试 fixture 没有关闭默认输出事件；生产分支又把检查上限放在 progress 与 timeout 处理之后。
+     - first-progress 的绝对截止时间只在有效 progress/EOF 路径复核，没有覆盖每个已到达的流式 chunk。
+     - 字符切分与网络字节切分不是同一层语义；跨进程墙钟也不是单调因果时钟。
+   - 处理：
+     - 超大候选用例设置 `test_stream_only_completed_event=true`，保证首个且唯一事件就是带 516 的超大 completed。
+     - 抽出统一检查上限收口函数，并在 progress/first-progress timeout 之前执行；随后每个 chunk 在 progress 分类前调用 first-progress 墙钟复核。
+     - fake upstream 增加 Buffer 字节切分，直接覆盖 BOM 三字节跨 chunk。
+     - pending sample 断言增加日志游标，要求 `evidence_log_seq_range.to` 早于本次 `internal_retry` 完成日志；跨进程时间比较只保留 50ms 时钟容差，不放宽样本唯一性、duration 或 evidence 顺序。
+   - 防回归：
+     - fault gateway 将 200ms first-progress timer 延迟到 500ms，并在超大候选累积到 `1MiB` 时阻塞 230ms，断言检查上限仍先返回 `response-inspection-limit-exceeded`。
+     - 47ms first-progress timer 被延迟时，上游 80ms 后连续发送 lifecycle，首个过期 chunk 必须立即返回 502。
+     - 修正后 `test-gateway-e2e.mjs` 单轮 GREEN，并连续 3 轮稳定性复跑全部 GREEN；此前五轮稳定性基线也全部 GREEN。
+
+47. 总 deadline 必须覆盖同步处理、真实派发和异常终态，采集/配置比较要按最终事实
+   - 现象：
+     - pending retry 在 loop 顶部通过 deadline 检查后，header clone 等同步工作仍可跨线，随后错误增加预算、代理总数并真实派发第二次上游请求。
+     - 上游 body/chunk 在 deadline 前到达，但 JSON/SSE 解析或结构遍历跨线后仍可写出 200；reader 在 deadline 后异常且 timer 回调被阻塞时会被误记为普通 stream termination。
+     - 非流式 observe-only 在客户端写入前先 clone/落盘，导致 `client_*` 与 `response_forwarding_started` 永久为空。
+     - Capacity/429 trigger 与最终 outcome 一起延后，Retry-After 等待中断时 trigger 漏计。
+     - PowerShell canonical helper 把函数参数里的字符串、数字、布尔当成对象，字符串数组变成 `Length` 对象，标量数组变成 `{}`。
+   - 根因：
+     - deadline 复核没有紧邻真实 fetch 和不可撤回客户端写入，过度依赖 timer 在同步 JavaScript 执行期间抢占。
+     - attempt 计数早于 fetch；observe-only 样本早于 `markReasoningSampleClient*`；策略 trigger/outcome 由一个 helper 同时累加。
+     - PowerShell 的参数包装让标量在递归函数里可能命中 `PSCustomObject` 分支，标量判断顺序错误。
+   - 处理：
+     - 先完成 header/request 准备，再执行 pending/current total deadline 最终闸门；调用 fetch 后才更新预算、total 和 active。
+     - 非流式解析/脱敏后、流式解析/结构后、EOF、reader catch 与每次 forwarding 前复核 total；reader catch 同时复核 first-progress。
+     - observe-only 样本在 `res.end()` 后完成；策略分类时记 trigger，动作完成时分别记 retry/pass/502。
+     - canonical helper 在对象递归前直接返回 `string` 与 CLR `ValueType`，数组继续按原序递归。
+   - 防回归：
+     - header clone 故障注入只阻塞第二次真实 dispatch 到 deadline 后，断言只发 1 次上游、预算仍为 0、代理总数只加 1。
+     - JSON 与完整 SSE payload 解析分别阻塞 100ms，70ms timer 延迟到 200ms；reader 在 100ms 断流，三种路径都必须返回 total-timeout 502。
+     - observe-only 断言客户端首写字段；Retry-After 断连断言 trigger+1/retry 不变；Windows launch 断言标量数组 canonical JSON。
+     - gateway E2E 连续 3 轮 GREEN，三套生命周期 E2E 全部 GREEN，临时 gateway 进程残留为 0。
+
+48. 未派发 current attempt 不能抢走 pending 终态，首 progress 和最终写入必须绑定真实边界
+   - 现象：
+     - pending 旧 guard 首次 total 检查尚未过期、current guard 紧接着过期时，旧 sample 丢失，落盘的是 `upstream_fetch_started_at_ms=null` 的伪 attempt 2，inspected 还重复增加。
+     - current 首 progress timer 在 header clone 前启动；同步准备跨过首 progress 但未跨 total 时，第二次上游仍被派发并错误返回 first-progress 502。
+     - 非流式 Capacity/429 502、策略透传和 reasoning block 在最后一次 total 检查后仍会执行 logger、模型归档、错误体构造或 header copy；同步工作跨线后仍写原策略响应。
+     - fetch 被 first-progress abort 后，rejection 直到 total deadline 之后才恢复时，旧代码仍按 first-progress 收口。
+     - 续写安全模式的 Capacity/429 pass-through 直接发送原始 `bodyBuffer`，可泄露 `encrypted_content`。
+   - 根因：
+     - pending 与 current 各自做 deadline 检查，但第二个闸门的 timeout 分支固定绑定 current 局部 sample；current guard 又早于真实 fetch 创建。
+     - 非流式多个早退分支没有统一的“同步准备完成 -> 最终墙钟复核 -> 首次 writeHead”不可撤回边界。
+     - fetch outcome 先抛 rejection、后检查 total，且策略透传绕过普通非流式脱敏出口。
+   - 处理：
+     - 第二个 total gate 过期且存在 pending 时，强制用 pending 的 guard、sample、模型和结构收口；current attempt 只有真实 fetch 后才记预算、代理总数和 active。
+     - current latency guard 在 header/request 准备完成后创建，首 progress 从真实派发邻近位置开始；请求级 total deadline 仍跨 attempt 不重置。
+     - 非流式所有未写终态先完成模型归档、错误体或 header 准备，再紧邻 `writeHead` 复核 total；timeout 写入前清理尚未发送的上游 header，策略 outcome/blocked 只在闸门通过后计数。
+     - fetch resolve/reject 以及 catch 都先以 `overrideExisting=true` 复核 total，再复核 first-progress；总 deadline 已过时覆盖较早 phase。
+     - Capacity/429 pass-through 在续写安全模式下复用 `stripEncryptedContentFromBodyBuffer()`；none 模式不启用该标志。
+   - 防回归：
+     - 故障注入让 pending 检查看到 deadline 前 1ms、current 检查看到已过期，断言只落 attempt 1、只发一次上游、预算仍为 0 且 attempt 恒等式成立。
+     - 第二次 header clone 阻塞 80ms，first-progress=40ms、total=220ms；正常第二次上游必须返回 200，证明本地准备不消耗首 progress 窗口。
+     - Capacity 502、HTTP 429 pass-through 与 reasoning block 分别在最终同步准备中阻塞 100ms，延迟 timer 回调后仍统一返回 total-timeout 502。
+     - first-progress=40ms、total=60ms 的 fetch rejection 被阻塞到 80ms，最终只能增加 total timeout；续写 Capacity pass/retry-exhaust 两条路径都不得出现 key 或 secret。
+     - lifecycle 反例记录上游 chunk 实际发送时间，硬证明既有 deadline 前 chunk，也有首次跨线的后续 chunk。
+     - 2026-07-15 gateway E2E 首轮 GREEN 并连续 3/3 稳定复跑；install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留全部 PASS。
+
+49. total 与 first-progress 的真源必须是首次真实 fetch，语义完成和模型洞察都只能收口一次
+   - 现象：
+     - 请求级 total 在循环前建立；首次 header clone 跨过极小 deadline 时，上游请求数为 0，但 timeout handler 增加 inspected 并持久化 `upstream_fetch_started_at_ms=null` 的 attempt，破坏计数恒等式。
+     - current guard 虽已移到 header clone 后，仍早于最终 total gate 和 fetch；该窄窗口阻塞可派发一个在上游调用前就过期的 first-progress attempt。
+     - 非流式 body 与 EOF 事件在 deadline 前到达后，代码先清 first-progress timer，再做 JSON/SSE 语义解析；解析跨线仍返回 200。
+     - 流式 `ensureClientHeaders()` 先检查 total、后复制 header；header copy 跨线仍会执行不可撤回 `writeHead(200)`。
+     - 非流式终态在 `finalizeModelInsights()` 后跨 total，timeout catch 再提交一次模型洞察，单 attempt 的 local model 与 consistency 计数增加 2。
+   - 根因：
+     - total 和 attempt guard 的创建点描述“候选 attempt”，没有绑定真实 `fetch()` 派发事实；pending gate 与后续派发时间又使用不同的墙钟采样。
+     - first-progress 窗口按“字节到达”提前关闭，而规则定义需要等语义解析确定是否为有效输出。
+     - header copy 和模型洞察提交缺少统一幂等/不可撤回边界。
+   - 处理：
+     - 首次 `upstreamFetchStartedAtMs` 捕获后建立请求级 total；同一时间值传入 `createAttemptLatencyGuard()`，first-progress 绝对截止线固定为 `upstreamFetchStartedAtMs + limit`，timer 只按剩余时间唤醒。
+     - pending 的最终 total gate 接受已捕获 `nowMs`，检查通过后立即使用同一时间调用 fetch；首次本地 header 准备不计入上游 total/first-progress。
+     - 非流式与 EOF 在 payload 解析、usage/结构累积后，由 `markFirstProgress()` 或 `endFirstProgressWindow()` 按绝对墙钟收口。
+     - 流式未写头时先复制可撤回 header，再复核 total，统一 timeout handler 清掉尚未发送的上游 header。
+     - 使用 `WeakSet` 按 model context 保证 `finalizeModelInsights()` 每个 attempt 只执行一次。
+   - 防回归：
+     - 首次 header clone 阻塞 80ms、total=40ms，仍应在真实 fetch 后返回 200，并保持 total/inspected 各 +1；旧实现稳定复现 0 次上游、inspected+1。
+     - guard 到 fetch 的 80ms 故障、pending gate 与派发时间分裂故障分别证明首 progress 锚点和单一最终 gate。
+     - 非流式 JSON 与 EOF-only completed 事件各阻塞 100ms，必须返回 first-progress 502；流式 header copy 阻塞 100ms 必须在 writeHead 前返回 total 502。
+     - Capacity timeout 带 `model=gpt-5.4`，精确断言 local model 和 consistency 只增加 1。
+     - lifecycle 样本必须满足 `first_stream_chunk_at_ms - upstream_fetch_started_at_ms < first_progress_timeout_ms`，并最终按 first-progress timeout 收口。
+     - 2026-07-15 gateway E2E 首轮 GREEN 并连续 3/3 稳定复跑；三套生命周期 E2E、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留全部 PASS。
+
+50. 预期流终止的同步收尾仍必须服从最终 deadline，故障 timer 区间必须按实际剩余时间隔离
+   - 现象：
+     - `reader.read()` 在 deadline 前抛出 `TypeError("terminated")` 后，首次 total/first-progress 检查通过；模型归档、日志或错误体构造同步跨线时，strict 模式仍返回普通 `gateway_error` termination 502。
+     - `none + latency_guard` 在首 progress 前收到 lifecycle 并随后断流；模型归档同步跨过 first-progress 后，旧代码仍 flush 前导块并以 200 正常结束，样本 `timeout_phase=null`。
+     - 原 47ms lifecycle 反例偶发在 guard 建立时只剩约 45ms，与前一个已消费的 timer fault bucket 碰撞；timer 抢先触发后，上游没有形成 deadline 后 chunk，测试会非确定性失败。
+   - 根因：
+     - expected-termination 分支只在同步终态准备前复核 deadline；strict 分支直接 `writeHead(502)`，非 strict header helper 只最终复核 total，没有最终复核 first-progress。
+     - timer fault 按配置阈值设计相邻区间，但真实 guard timer 使用 `deadline - Date.now()` 的剩余时间，创建开销会把 47ms 压入 45ms 区间。
+   - 处理：
+     - reader 终止事实先写入 `upstream_stream_terminated`；模型归档、日志和错误体保持可撤回，strict 写头前按 `total -> first-progress` 最终复核。
+     - 非 strict 只在 expected-termination flush 路径启用 first-progress 最终 gate；可撤回 header copy 后、`writeHead` 前复核，避免影响普通流式首写。
+     - lifecycle 故障注入最终改用 500ms 阈值和 60 个 lifecycle 事件，并将 `300..500ms` timer 统一延迟到 800ms，避开一次性 bucket 被同值 timer 提前消费。
+   - 防回归：
+     - 错误体构造阻塞 100ms 必须把 strict termination 收成 `upstream_total_timeout` 502；指定模型归档阻塞 100ms 必须把 lifecycle-only termination 收成 `upstream_first_progress_timeout` 502。
+     - 两条 timeout 样本必须保留 `upstream_stream_terminated=true`，并分别落 `total_timeout_returned_502` 与 `first_progress_timeout_returned_502`；500ms 内正常前导断流仍为 200。
+     - 2026-07-15 Codex bundled Node gateway E2E 首轮 GREEN、连续 3/3 稳定复跑 GREEN，最终遥测断言补强后再次 GREEN；round-11 扩大到 500ms 后再次首轮 GREEN 与 3/3 稳定复跑 GREEN。install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留均通过。
+
+51. 客户端首写采集必须取真实写入时刻，不能复用 header copy 前的缓冲时间
+   - 现象：
+     - `flushBufferedChunksToClient(Date.now())` 在 `ensureClientHeaders()` 前捕获时间；同步 header copy 较慢时，`markReasoningSampleClientWrite()` 会把这个旧值写成 `client_first_write_at_ms`。
+     - 两名独立 reviewer 均确认该路径可产生 `client_first_write_at_ms < client_headers_sent_at_ms`，虽不改变 HTTP 行为，却会低估首写耗时并污染后续时序分析。
+   - 根因：
+     - 同一个 timestamp 参数同时承担“上游 chunk 处理时刻”和“客户端真实写入时刻”；前者应保存在 `first_stream_chunk_at_ms/final_chunk_at_ms`，后者必须由客户端写边界单独采样。
+   - 处理：
+     - `writeClientChunk()` 在 `ensureClientHeaders()` 返回后调用无显式时间参数的 `markReasoningSampleClientWrite()`，由它紧邻 `res.write()` 现取 `Date.now()`。
+     - `flushBufferedChunksToClient()` 不再接收或传播旧 timestamp；普通直写、首 progress flush、缓冲上限 flush 和 expected-termination flush 共用同一真实写边界。
+   - 防回归：
+     - fake upstream 为 termination 响应附加专用测试 header；fault preload 在 `copyHeadersToClient()` 阻塞 100ms，并断言响应仍为 200、阻塞真实发生、`client_headers_sent_at_ms <= client_first_write_at_ms`。
+     - RED 精确复现 header 在 `1784095029696ms` 发送、首写却记录为 `1784095029596ms`；GREEN 后完整 gateway E2E 首轮通过并连续 3/3 稳定复跑。
+     - 2026-07-15 install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留全部通过。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

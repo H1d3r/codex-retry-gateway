@@ -126,6 +126,123 @@ function Read-JsonFile {
   return $raw | ConvertFrom-Json
 }
 
+function Get-OptionalPropertyValue {
+  param(
+    $Object,
+    [Parameter(Mandatory = $true)]
+    [string]$Name,
+    $DefaultValue = $null
+  )
+
+  if ($null -eq $Object) {
+    return $DefaultValue
+  }
+  $property = $Object.PSObject.Properties[$Name]
+  if ($null -eq $property -or $null -eq $property.Value) {
+    return $DefaultValue
+  }
+  return $property.Value
+}
+
+function Normalize-UpstreamErrorAction {
+  param(
+    $Value,
+    [Parameter(Mandatory = $true)]
+    [string]$DefaultValue
+  )
+
+  $normalized = ([string]$Value).Trim().ToLowerInvariant()
+  if (@("pass_through", "return_502", "retry_then_pass_through", "retry_then_502") -contains $normalized) {
+    return $normalized
+  }
+  return $DefaultValue
+}
+
+function Normalize-LatencyGuardInteger {
+  param(
+    $Value,
+    [long]$DefaultValue = 0
+  )
+
+  $parsed = [long]0
+  if (
+    $null -ne $Value -and
+    [long]::TryParse(([string]$Value).Trim(), [ref]$parsed) -and
+    $parsed -ge 0 -and
+    $parsed -le 2147483647
+  ) {
+    return $parsed
+  }
+  return $DefaultValue
+}
+
+function Normalize-LatencyGuard {
+  param($Value)
+
+  $enabledValue = Get-OptionalPropertyValue -Object $Value -Name "enabled" -DefaultValue $false
+  $enabled = if ($enabledValue -is [bool]) { [bool]$enabledValue } else { $false }
+  $firstProgressTimeoutMs = Normalize-LatencyGuardInteger `
+    -Value (Get-OptionalPropertyValue -Object $Value -Name "first_progress_timeout_ms")
+  $firstProgressAction = Normalize-UpstreamErrorAction `
+    -Value (Get-OptionalPropertyValue -Object $Value -Name "first_progress_action") `
+    -DefaultValue "return_502"
+  if (@("return_502", "retry_then_502") -notcontains $firstProgressAction) {
+    $firstProgressAction = "return_502"
+  }
+  $totalTimeoutMs = Normalize-LatencyGuardInteger `
+    -Value (Get-OptionalPropertyValue -Object $Value -Name "total_timeout_ms")
+  if ($enabled -and $firstProgressTimeoutMs -eq 0 -and $totalTimeoutMs -eq 0) {
+    $enabled = $false
+  }
+
+  return [pscustomobject][ordered]@{
+    enabled = $enabled
+    first_progress_timeout_ms = $firstProgressTimeoutMs
+    first_progress_action = $firstProgressAction
+    total_timeout_ms = $totalTimeoutMs
+  }
+}
+
+function ConvertTo-CanonicalJsonNode {
+  param($Value)
+
+  if ($null -eq $Value) {
+    return $null
+  }
+  if ($Value -is [string] -or $Value.GetType().IsValueType) {
+    return $Value
+  }
+  if ($Value -is [System.Collections.IDictionary]) {
+    $ordered = [ordered]@{}
+    foreach ($key in @($Value.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive)) {
+      $ordered[$key] = ConvertTo-CanonicalJsonNode -Value $Value[$key]
+    }
+    return [pscustomobject]$ordered
+  }
+  if ($Value -is [pscustomobject]) {
+    $ordered = [ordered]@{}
+    foreach ($property in @($Value.PSObject.Properties | Sort-Object -Property Name -CaseSensitive)) {
+      $ordered[$property.Name] = ConvertTo-CanonicalJsonNode -Value $property.Value
+    }
+    return [pscustomobject]$ordered
+  }
+  if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+    $items = @($Value | ForEach-Object { ConvertTo-CanonicalJsonNode -Value $_ })
+    return ,$items
+  }
+  return $Value
+}
+
+function ConvertTo-CanonicalJson {
+  param(
+    [Parameter(Mandatory = $true)]
+    $Value
+  )
+
+  $canonical = ConvertTo-CanonicalJsonNode -Value $Value
+  return ($canonical | ConvertTo-Json -Depth 20 -Compress)
+}
+
 function Write-JsonFile {
   param(
     [Parameter(Mandatory = $true)]
@@ -214,8 +331,8 @@ function Test-ProcessAlive {
   )
 
   try {
-    $null = Get-Process -Id $ProcessId -ErrorAction Stop
-    return $true
+    $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    return -not $process.HasExited
   } catch {
     return $false
   }

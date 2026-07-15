@@ -331,13 +331,79 @@ async function run() {
       gatewayConfig.stream_action === "continuation_recovery",
       "Unix launch did not write default stream_action=continuation_recovery",
     );
+    assert(
+      gatewayConfig.capacity_error_action === "retry_then_pass_through" &&
+        gatewayConfig.http_429_action === "pass_through",
+      "Unix launch did not write upstream error policy defaults",
+    );
+    assert(
+      JSON.stringify(gatewayConfig.latency_guard) ===
+        JSON.stringify({
+          enabled: false,
+          first_progress_timeout_ms: 0,
+          first_progress_action: "return_502",
+          total_timeout_ms: 0,
+        }),
+      "Unix launch did not write disabled latency_guard defaults",
+    );
+    const saveLayeredPolicyResponse = await fetch(
+      `${gatewayBaseUrl}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          intercept_streaming: false,
+          intercept_non_streaming: false,
+          capacity_error_action: "retry_then_502",
+          http_429_action: "retry_then_pass_through",
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 1234,
+            first_progress_action: "retry_then_502",
+            total_timeout_ms: 9876,
+          },
+          retry_upstream_capacity_errors: false,
+        }),
+      },
+    );
+    assert(
+      saveLayeredPolicyResponse.status === 200,
+      `Unix layered policy setup failed: ${saveLayeredPolicyResponse.status}`,
+    );
     const statePath = path.join(stateRoot, "state.json");
     const gatewayConfigPath = path.join(stateRoot, "config", "config.json");
     const gatewayPidPath = path.join(stateRoot, "gateway.pid");
     const backupDir = path.join(stateRoot, "backups");
     const firstStateRaw = await readFile(statePath, "utf8");
     const firstCodexConfigRaw = await readFile(codexConfigPath, "utf8");
-    const firstGatewayConfigRaw = await readFile(gatewayConfigPath, "utf8");
+    const firstGatewayConfig = JSON.parse(await readFile(gatewayConfigPath, "utf8"));
+    assert(firstGatewayConfig.intercept_rule_mode === "none", "Unix policy setup did not persist none mode");
+    assert(
+      firstGatewayConfig.intercept_streaming === false &&
+        firstGatewayConfig.intercept_non_streaming === false,
+      "Unix policy setup did not persist none mode disabled intercept targets",
+    );
+    assert(
+      firstGatewayConfig.capacity_error_action === "retry_then_502" &&
+        firstGatewayConfig.http_429_action === "retry_then_pass_through",
+      "Unix policy setup did not persist upstream error actions",
+    );
+    assert(
+      firstGatewayConfig.latency_guard?.enabled === true &&
+        firstGatewayConfig.latency_guard?.first_progress_timeout_ms === 1234 &&
+        firstGatewayConfig.latency_guard?.first_progress_action === "retry_then_502" &&
+        firstGatewayConfig.latency_guard?.total_timeout_ms === 9876,
+      "Unix policy setup did not persist latency_guard",
+    );
+    firstGatewayConfig.latency_guard = {
+      total_timeout_ms: 9876,
+      first_progress_action: "retry_then_502",
+      first_progress_timeout_ms: 1234,
+      enabled: true,
+    };
+    const firstGatewayConfigRaw = `${JSON.stringify(firstGatewayConfig, null, 2)}\n`;
+    await writeFile(gatewayConfigPath, firstGatewayConfigRaw, "utf8");
     const firstGatewayPid = (await readFile(gatewayPidPath, "utf8")).trim();
     const firstBackups = (await readdir(backupDir)).sort();
     const firstMtimes = {
@@ -705,6 +771,10 @@ async function run() {
           reasoning_match_mode: "manual",
           continuation_marker_text: "  Unix custom marker  ",
           stream_action: undefined,
+          retry_upstream_capacity_errors: false,
+          capacity_error_action: undefined,
+          http_429_action: undefined,
+          latency_guard: undefined,
         },
         null,
         2,
@@ -736,6 +806,24 @@ async function run() {
     assert(
       reusedGatewayConfig.continuation_marker_text === "  Unix custom marker  ",
       "Unix launch reuse did not preserve custom continuation_marker_text",
+    );
+    assert(
+      reusedGatewayConfig.capacity_error_action === "pass_through",
+      "Unix launch reuse did not map legacy Capacity false to pass_through",
+    );
+    assert(
+      reusedGatewayConfig.http_429_action === "pass_through",
+      "Unix launch reuse did not default missing HTTP 429 action to pass through",
+    );
+    assert(
+      JSON.stringify(reusedGatewayConfig.latency_guard) ===
+        JSON.stringify({
+          enabled: false,
+          first_progress_timeout_ms: 0,
+          first_progress_action: "return_502",
+          total_timeout_ms: 0,
+        }),
+      "Unix launch reuse did not add disabled latency_guard defaults",
     );
 
     const uiResponse = await fetch(`${gatewayBaseUrl}/__codex_retry_gateway/ui`);

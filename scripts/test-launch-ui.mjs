@@ -183,6 +183,27 @@ async function run() {
   assert(!expectedPidParameterMissing, "PowerShell health wait does not support ExpectedProcessId");
   assert(wrongPidHealthRejected, "PowerShell health wait accepted HTTP 200 from the wrong process_id");
 
+  const canonicalArrayCheckScript = path.join(tempRoot, "canonical-array-check.ps1");
+  await writeFile(
+    canonicalArrayCheckScript,
+    [
+      `$ErrorActionPreference = "Stop"`,
+      `. '${commonScriptPath}'`,
+      `Write-Output ("FORWARD=" + (ConvertTo-CanonicalJson -Value @("/responses", "/v1/responses")))`,
+      `Write-Output ("REVERSE=" + (ConvertTo-CanonicalJson -Value @("/v1/responses", "/responses")))`,
+      `Write-Output ("SCALARS=" + (ConvertTo-CanonicalJson -Value @(516, 1034, $true, $false)))`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const canonicalArrayCheck = await runPowerShellScript(canonicalArrayCheckScript, []);
+  assert(
+    canonicalArrayCheck.stdout.includes('FORWARD=["/responses","/v1/responses"]') &&
+      canonicalArrayCheck.stdout.includes('REVERSE=["/v1/responses","/responses"]') &&
+      canonicalArrayCheck.stdout.includes('SCALARS=[516,1034,true,false]'),
+    `PowerShell canonical JSON 必须保留基本类型数组的值与顺序: ${canonicalArrayCheck.stdout}`,
+  );
+
   const failedStartProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     stdio: "ignore",
     windowsHide: true,
@@ -334,10 +355,77 @@ async function run() {
     const gatewayConfigPath = path.join(stateRoot, "config", "config.json");
     const gatewayPidPath = path.join(stateRoot, "gateway.pid");
     const backupDir = path.join(stateRoot, "backups");
+    const installedGatewayConfig = JSON.parse(await readFile(gatewayConfigPath, "utf8"));
+    assert(
+      installedGatewayConfig.capacity_error_action === "retry_then_pass_through" &&
+        installedGatewayConfig.http_429_action === "pass_through",
+      "Windows first launch did not write upstream error policy defaults",
+    );
+    assert(
+      JSON.stringify(installedGatewayConfig.latency_guard) ===
+        JSON.stringify({
+          enabled: false,
+          first_progress_timeout_ms: 0,
+          first_progress_action: "return_502",
+          total_timeout_ms: 0,
+        }),
+      "Windows first launch did not write disabled latency_guard defaults",
+    );
+    const saveLayeredPolicyResponse = await fetch(
+      `${gatewayBaseUrl}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          intercept_streaming: false,
+          intercept_non_streaming: false,
+          capacity_error_action: "retry_then_502",
+          http_429_action: "retry_then_pass_through",
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 1234,
+            first_progress_action: "retry_then_502",
+            total_timeout_ms: 9876,
+          },
+          retry_upstream_capacity_errors: false,
+        }),
+      },
+    );
+    assert(
+      saveLayeredPolicyResponse.status === 200,
+      `Windows layered policy setup failed: ${saveLayeredPolicyResponse.status}`,
+    );
     const firstStateRaw = await readFile(statePath, "utf8");
     const firstState = JSON.parse(firstStateRaw);
     const firstCodexConfigRaw = await readFile(codexConfigPath, "utf8");
-    const firstGatewayConfigRaw = await readFile(gatewayConfigPath, "utf8");
+    const firstGatewayConfig = JSON.parse(await readFile(gatewayConfigPath, "utf8"));
+    assert(firstGatewayConfig.intercept_rule_mode === "none", "Windows policy setup did not persist none mode");
+    assert(
+      firstGatewayConfig.intercept_streaming === false &&
+        firstGatewayConfig.intercept_non_streaming === false,
+      "Windows policy setup did not persist none mode disabled intercept targets",
+    );
+    assert(
+      firstGatewayConfig.capacity_error_action === "retry_then_502" &&
+        firstGatewayConfig.http_429_action === "retry_then_pass_through",
+      "Windows policy setup did not persist upstream error actions",
+    );
+    assert(
+      firstGatewayConfig.latency_guard?.enabled === true &&
+        firstGatewayConfig.latency_guard?.first_progress_timeout_ms === 1234 &&
+        firstGatewayConfig.latency_guard?.first_progress_action === "retry_then_502" &&
+        firstGatewayConfig.latency_guard?.total_timeout_ms === 9876,
+      "Windows policy setup did not persist latency_guard",
+    );
+    firstGatewayConfig.latency_guard = {
+      total_timeout_ms: 9876,
+      first_progress_action: "retry_then_502",
+      first_progress_timeout_ms: 1234,
+      enabled: true,
+    };
+    const firstGatewayConfigRaw = `${JSON.stringify(firstGatewayConfig, null, 2)}\n`;
+    await writeFile(gatewayConfigPath, firstGatewayConfigRaw, "utf8");
     const firstGatewayPid = (await readFile(gatewayPidPath, "utf8")).trim();
     const firstBackups = (await readdir(backupDir)).sort();
     const firstMtimes = {
@@ -653,6 +741,32 @@ async function run() {
     assert(
       (await readFile(gatewayPidPath, "utf8")).trim() === recoveredGatewayPid,
       "Backup repair restarted the healthy gateway",
+    );
+
+    const restoreDefaultPolicyResponse = await fetch(
+      `${gatewayBaseUrl}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          intercept_streaming: true,
+          intercept_non_streaming: true,
+          capacity_error_action: "retry_then_pass_through",
+          http_429_action: "pass_through",
+          latency_guard: {
+            enabled: false,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 0,
+          },
+          retry_upstream_capacity_errors: true,
+        }),
+      },
+    );
+    assert(
+      restoreDefaultPolicyResponse.status === 200,
+      `Restoring Windows default policies failed: ${restoreDefaultPolicyResponse.status}`,
     );
 
     const proxiedModels = await fetch(`${gatewayBaseUrl}/v1/models`);

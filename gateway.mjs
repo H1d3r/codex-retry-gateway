@@ -24,7 +24,7 @@ const RESTORE_API_PATH = `${ADMIN_BASE_PATH}/api/restore`;
 const FAVICON_PATH = "/favicon.ico";
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES = 100 * 1024 * 1024;
 const LEGACY_REQUEST_BODY_LIMIT_BYTES = 10 * 1024 * 1024;
-const REASONING_BEHAVIOR_SCHEMA_VERSION = 2;
+const REASONING_BEHAVIOR_SCHEMA_VERSION = 3;
 const REASONING_BEHAVIOR_RECENT_SAMPLE_LIMIT = 500;
 const REASONING_BEHAVIOR_MAX_INLINE_RANGE_DAYS = 7;
 const REASONING_BEHAVIOR_MAX_EXPORT_RANGE_DAYS = 31;
@@ -35,9 +35,11 @@ const HISTORICAL_IMPORT_SESSION_FILE_LIMIT = 2000;
 const REASONING_ANALYSIS_PROFILE_NAME = "516_candidate_review_v1";
 const INTERCEPT_RULE_MODE_REASONING_TOKENS = "reasoning_tokens";
 const INTERCEPT_RULE_MODE_FINAL_ONLY_HIGH_XHIGH = "final_answer_only_high_xhigh";
+const INTERCEPT_RULE_MODE_NONE = "none";
 const INTERCEPT_RULE_MODES = new Set([
   INTERCEPT_RULE_MODE_REASONING_TOKENS,
   INTERCEPT_RULE_MODE_FINAL_ONLY_HIGH_XHIGH,
+  INTERCEPT_RULE_MODE_NONE,
 ]);
 const REASONING_MATCH_MODE_MANUAL = "manual";
 const REASONING_MATCH_MODE_FORMULA_518N_MINUS_2 = "formula_518n_minus_2";
@@ -64,6 +66,24 @@ const CONTEXT_COMPACTION_MARKERS = [
 ];
 const UPSTREAM_CAPACITY_ERROR_MESSAGE =
   "Selected model is at capacity. Please try a different model.";
+const UPSTREAM_ERROR_ACTION_PASS_THROUGH = "pass_through";
+const UPSTREAM_ERROR_ACTION_RETURN_502 = "return_502";
+const UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH = "retry_then_pass_through";
+const UPSTREAM_ERROR_ACTION_RETRY_THEN_502 = "retry_then_502";
+const UPSTREAM_ERROR_ACTIONS = new Set([
+  UPSTREAM_ERROR_ACTION_PASS_THROUGH,
+  UPSTREAM_ERROR_ACTION_RETURN_502,
+  UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH,
+  UPSTREAM_ERROR_ACTION_RETRY_THEN_502,
+]);
+const FIRST_PROGRESS_ACTIONS = new Set([
+  UPSTREAM_ERROR_ACTION_RETURN_502,
+  UPSTREAM_ERROR_ACTION_RETRY_THEN_502,
+]);
+const MAX_RETRY_AFTER_MS = 60 * 1000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const PRE_PROGRESS_BUFFER_LIMIT_BYTES = 1024 * 1024;
+const SSE_DISCARD_SCAN_CHUNK_BYTES = 64 * 1024;
 const REASONING_ANALYSIS_CORE_FIELDS = [
   "reasoning_tokens",
   "final_answer_only",
@@ -94,6 +114,14 @@ const DEFAULT_CONFIG = {
   intercept_non_streaming: true,
   non_stream_status_code: 502,
   guard_retry_attempts: 5,
+  capacity_error_action: UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH,
+  http_429_action: UPSTREAM_ERROR_ACTION_PASS_THROUGH,
+  latency_guard: {
+    enabled: false,
+    first_progress_timeout_ms: 0,
+    first_progress_action: UPSTREAM_ERROR_ACTION_RETURN_502,
+    total_timeout_ms: 0,
+  },
   retry_upstream_capacity_errors: true,
   stream_action: STREAM_ACTION_CONTINUATION_RECOVERY,
   log_match: true,
@@ -828,6 +856,65 @@ function normalizeGuardRetryAttempts(value) {
   return parsed;
 }
 
+function normalizeUpstreamErrorAction(value, fallback) {
+  if (value === undefined || value === null || `${value}`.trim() === "") {
+    return fallback;
+  }
+  const normalized = `${value}`.trim().toLowerCase();
+  if (!UPSTREAM_ERROR_ACTIONS.has(normalized)) {
+    throw new Error(
+      "上游错误动作必须是 pass_through、return_502、retry_then_pass_through 或 retry_then_502",
+    );
+  }
+  return normalized;
+}
+
+function normalizeLatencyGuardInteger(value, fallback, fieldName) {
+  if (value === undefined || value === null || `${value}`.trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > MAX_TIMER_DELAY_MS) {
+    throw new Error(`${fieldName} 必须是 0-${MAX_TIMER_DELAY_MS} 的整数`);
+  }
+  return parsed;
+}
+
+function normalizeLatencyGuardConfig(input, fallback = DEFAULT_CONFIG.latency_guard) {
+  if (input !== undefined && input !== null && (typeof input !== "object" || Array.isArray(input))) {
+    throw new Error("latency_guard 必须是对象");
+  }
+  const source = input || {};
+  const normalized = {
+    enabled: source.enabled === undefined ? Boolean(fallback.enabled) : Boolean(source.enabled),
+    first_progress_timeout_ms: normalizeLatencyGuardInteger(
+      source.first_progress_timeout_ms,
+      fallback.first_progress_timeout_ms,
+      "latency_guard.first_progress_timeout_ms",
+    ),
+    first_progress_action: normalizeUpstreamErrorAction(
+      source.first_progress_action,
+      fallback.first_progress_action,
+    ),
+    total_timeout_ms: normalizeLatencyGuardInteger(
+      source.total_timeout_ms,
+      fallback.total_timeout_ms,
+      "latency_guard.total_timeout_ms",
+    ),
+  };
+  if (!FIRST_PROGRESS_ACTIONS.has(normalized.first_progress_action)) {
+    throw new Error("latency_guard.first_progress_action 必须是 return_502 或 retry_then_502");
+  }
+  if (
+    normalized.enabled &&
+    normalized.first_progress_timeout_ms === 0 &&
+    normalized.total_timeout_ms === 0
+  ) {
+    throw new Error("启用 latency_guard 时至少一个超时阈值必须大于 0");
+  }
+  return normalized;
+}
+
 function normalizeContinuationMarkerText(value, fallback = CONTINUATION_MARKER_TEXT_DEFAULT) {
   if (typeof value !== "string") {
     return fallback;
@@ -961,37 +1048,224 @@ function buildGatewayErrorBody(message) {
   });
 }
 
-function parseSsePayloads(state, chunk) {
-  const decoded = state.decoder.decode(chunk, { stream: true });
-  state.buffer += decoded;
+function getSseLineEndingLength(buffer, index, allowTrailingCr = false) {
+  const byte = buffer[index];
+  if (byte === 0x0a) {
+    return 1;
+  }
+  if (byte !== 0x0d) {
+    return 0;
+  }
+  if (index + 1 >= buffer.length) {
+    return allowTrailingCr ? 1 : 0;
+  }
+  return buffer[index + 1] === 0x0a ? 2 : 1;
+}
 
-  const blocks = state.buffer.split(/\r?\n\r?\n/);
-  state.buffer = blocks.pop() ?? "";
-  const payloads = [];
-
-  for (const block of blocks) {
-    const lines = block
-      .split(/\r?\n/)
-      .map((line) => line.trimEnd())
-      .filter(Boolean);
-    const dataLines = lines
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.replace(/^data:\s?/, ""));
-
-    if (dataLines.length === 0) {
+function findSseEventBoundary(buffer, allowTrailingCr = false) {
+  for (let index = 0; index < buffer.length; index += 1) {
+    const firstLength = getSseLineEndingLength(buffer, index, allowTrailingCr);
+    if (firstLength === 0) {
       continue;
     }
-    const payloadText = dataLines.join("\n");
-    if (payloadText === "[DONE]") {
-      continue;
-    }
-    try {
-      payloads.push(JSON.parse(payloadText));
-    } catch {
-      // ignore malformed SSE payloads
+    const secondLength = getSseLineEndingLength(
+      buffer,
+      index + firstLength,
+      allowTrailingCr,
+    );
+    if (secondLength > 0) {
+      return { index, length: firstLength + secondLength };
     }
   }
+  return null;
+}
 
+function parseSseBlock(block) {
+  const lines = block
+    .toString("utf8")
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+  if (lines.length > 0) {
+    lines[0] = lines[0].replace(/^\uFEFF/, "");
+  }
+  const dataLines = lines
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.replace(/^data:\s?/, ""));
+  if (dataLines.length === 0) {
+    return { recognized: false, payload: null };
+  }
+  const payloadText = dataLines.join("\n");
+  if (payloadText === "[DONE]") {
+    return { recognized: true, payload: null };
+  }
+  try {
+    return { recognized: true, payload: JSON.parse(payloadText) };
+  } catch {
+    return { recognized: false, payload: null };
+  }
+}
+
+const SSE_FIELD_PREFIXES = ["data:", "event:", "id:", "retry:", ":"];
+
+function bufferCouldBeSseCandidate(buffer, bomPending = false) {
+  if (bomPending) {
+    return true;
+  }
+  if (buffer.length === 0) {
+    return false;
+  }
+  const preview = buffer
+    .subarray(0, Math.min(buffer.length, 4096))
+    .toString("utf8");
+  return preview
+    .split(/\r\n|\r|\n/)
+    .filter((line) => line.length > 0)
+    .every((line) =>
+      SSE_FIELD_PREFIXES.some((prefix) => prefix.startsWith(line) || line.startsWith(prefix)),
+    );
+}
+
+function resolveLeadingSseBom(state) {
+  if (!state.bom_pending) {
+    return;
+  }
+  const bom = [0xef, 0xbb, 0xbf];
+  const compareLength = Math.min(state.buffer.length, bom.length);
+  for (let index = 0; index < compareLength; index += 1) {
+    if (state.buffer[index] !== bom[index]) {
+      state.bom_pending = false;
+      return;
+    }
+  }
+  if (state.buffer.length < bom.length) {
+    return;
+  }
+  state.buffer = Buffer.from(state.buffer.subarray(bom.length));
+  state.bom_pending = false;
+  state.bom_removed_count += 1;
+}
+
+function refreshSseCandidateState(state) {
+  state.sse_candidate =
+    !state.sse_like &&
+    bufferCouldBeSseCandidate(state.buffer, state.bom_pending);
+}
+
+function beginDiscardingOversizedSseEvent(state) {
+  if (state.sse_candidate) {
+    state.oversized_candidate_event_count += 1;
+  }
+  state.discarding_oversized_event = true;
+  state.oversized_event_count += 1;
+  state.buffer = Buffer.from(state.buffer.subarray(Math.max(0, state.buffer.length - 3)));
+}
+
+function consumeDiscardedSseBytes(state, input, startOffset) {
+  let offset = startOffset;
+  while (offset < input.length) {
+    const endOffset = Math.min(input.length, offset + SSE_DISCARD_SCAN_CHUNK_BYTES);
+    const piece = input.subarray(offset, endOffset);
+    const prefixLength = state.buffer.length;
+    const combined = prefixLength > 0
+      ? Buffer.concat([state.buffer, piece], prefixLength + piece.length)
+      : piece;
+    const boundary = findSseEventBoundary(combined);
+    if (boundary) {
+      const consumedFromPiece = Math.max(
+        0,
+        boundary.index + boundary.length - prefixLength,
+      );
+      state.buffer = Buffer.alloc(0);
+      state.discarding_oversized_event = false;
+      state.sse_candidate = false;
+      return offset + consumedFromPiece;
+    }
+    state.buffer = Buffer.from(combined.subarray(Math.max(0, combined.length - 3)));
+    offset = endOffset;
+  }
+  return offset;
+}
+
+function parseSsePayloads(state, chunk) {
+  const input = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  const payloads = [];
+  let offset = 0;
+
+  while (true) {
+    if (state.discarding_oversized_event) {
+      if (offset >= input.length) {
+        break;
+      }
+      offset = consumeDiscardedSseBytes(state, input, offset);
+      continue;
+    }
+
+    const boundary = findSseEventBoundary(state.buffer);
+    if (boundary) {
+      const block = state.buffer.subarray(0, boundary.index);
+      state.buffer = Buffer.from(state.buffer.subarray(boundary.index + boundary.length));
+      const parsedBlock = parseSseBlock(block);
+      if (parsedBlock.recognized) {
+        state.sse_like = true;
+      } else {
+        state.unrecognized_event_count += 1;
+      }
+      if (parsedBlock.payload) {
+        payloads.push(parsedBlock.payload);
+      }
+      refreshSseCandidateState(state);
+      continue;
+    }
+
+    if (state.buffer.length >= PRE_PROGRESS_BUFFER_LIMIT_BYTES) {
+      beginDiscardingOversizedSseEvent(state);
+      continue;
+    }
+    if (offset >= input.length) {
+      break;
+    }
+
+    const remainingBytes = PRE_PROGRESS_BUFFER_LIMIT_BYTES - state.buffer.length;
+    const takeBytes = Math.min(
+      remainingBytes,
+      SSE_DISCARD_SCAN_CHUNK_BYTES,
+      input.length - offset,
+    );
+    const piece = input.subarray(offset, offset + takeBytes);
+    state.buffer = state.buffer.length > 0
+      ? Buffer.concat([state.buffer, piece], state.buffer.length + piece.length)
+      : Buffer.from(piece);
+    resolveLeadingSseBom(state);
+    refreshSseCandidateState(state);
+    offset += takeBytes;
+  }
+  return payloads;
+}
+
+function flushSsePayloads(state) {
+  if (state.discarding_oversized_event) {
+    return [];
+  }
+  const payloads = [];
+  while (true) {
+    const boundary = findSseEventBoundary(state.buffer, true);
+    if (!boundary) {
+      break;
+    }
+    const block = state.buffer.subarray(0, boundary.index);
+    state.buffer = Buffer.from(state.buffer.subarray(boundary.index + boundary.length));
+    const parsedBlock = parseSseBlock(block);
+    if (parsedBlock.recognized) {
+      state.sse_like = true;
+    } else {
+      state.unrecognized_event_count += 1;
+    }
+    if (parsedBlock.payload) {
+      payloads.push(parsedBlock.payload);
+    }
+    refreshSseCandidateState(state);
+  }
   return payloads;
 }
 
@@ -1429,6 +1703,34 @@ function markReasoningSampleFirstContent(sample, timestampMs = Date.now()) {
   sample.first_content_at = toIsoStringOrNull(timestampMs);
 }
 
+function markReasoningSampleFirstProgress(sample, timestampMs = Date.now()) {
+  if (!sample || Number.isFinite(sample.first_progress_at_ms)) {
+    return;
+  }
+  sample.first_progress_at_ms = timestampMs;
+  sample.first_progress_at = toIsoStringOrNull(timestampMs);
+}
+
+function markReasoningSampleClientHeadersSent(sample, timestampMs = Date.now()) {
+  if (!sample || Number.isFinite(sample.client_headers_sent_at_ms)) {
+    return;
+  }
+  sample.client_headers_sent_at_ms = timestampMs;
+  sample.client_headers_sent_at = toIsoStringOrNull(timestampMs);
+}
+
+function markReasoningSampleClientWrite(sample, timestampMs = Date.now()) {
+  if (!sample) {
+    return;
+  }
+  sample.response_forwarding_started = true;
+  if (Number.isFinite(sample.client_first_write_at_ms)) {
+    return;
+  }
+  sample.client_first_write_at_ms = timestampMs;
+  sample.client_first_write_at = toIsoStringOrNull(timestampMs);
+}
+
 function markReasoningSampleFinalChunk(sample, timestampMs = Date.now()) {
   if (!sample) {
     return;
@@ -1443,6 +1745,170 @@ function payloadHasVisibleContent(payload) {
   return Boolean(structure.has_output_text || structure.has_final_answer);
 }
 
+function payloadHasMeaningfulProgress(payload) {
+  const structure = createStructureAccumulator();
+  applyStructureSignalsFromPayload(payload, structure, { fromStream: true });
+  const hasNonEmptyCommentaryText = [
+    payload?.delta,
+    payload?.text,
+    payload?.content,
+    payload?.output_text,
+  ].some((value) => typeof value === "string" && value.trim());
+  return Boolean(
+    structure.has_output_text ||
+    structure.has_final_answer ||
+    (structure.has_commentary && hasNonEmptyCommentaryText) ||
+    structure.has_tool_call
+  );
+}
+
+function classifyUpstreamErrorPolicy(config, upstreamResponse, parsedPayload, bodyBuffer) {
+  if (isUpstreamCapacityErrorResponse(upstreamResponse, parsedPayload, bodyBuffer)) {
+    return {
+      trigger: "capacity",
+      action: normalizeUpstreamErrorAction(
+        config?.capacity_error_action,
+        DEFAULT_CONFIG.capacity_error_action,
+      ),
+      reasonHeader: "upstream-capacity",
+      errorCode: "upstream_capacity_policy_triggered",
+      message: "上游模型容量不足，gateway 已按 Capacity 策略终止本次请求。",
+    };
+  }
+  if (upstreamResponse?.status === 429) {
+    return {
+      trigger: "http_429",
+      action: normalizeUpstreamErrorAction(
+        config?.http_429_action,
+        DEFAULT_CONFIG.http_429_action,
+      ),
+      reasonHeader: "upstream-rate-limited",
+      errorCode: "upstream_rate_limit_policy_triggered",
+      message: "上游返回 HTTP 429，gateway 已按限流策略终止本次请求。",
+    };
+  }
+  return null;
+}
+
+function actionRequestsRetry(action) {
+  return (
+    action === UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH ||
+    action === UPSTREAM_ERROR_ACTION_RETRY_THEN_502
+  );
+}
+
+function actionExhaustsTo502(action) {
+  return (
+    action === UPSTREAM_ERROR_ACTION_RETURN_502 ||
+    action === UPSTREAM_ERROR_ACTION_RETRY_THEN_502
+  );
+}
+
+function parseRetryAfterMs(rawValue, nowMs = Date.now()) {
+  if (rawValue === undefined || rawValue === null) {
+    return null;
+  }
+  const text = `${rawValue}`.trim();
+  if (!text) {
+    return null;
+  }
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    const seconds = Number(text);
+    return Number.isFinite(seconds) ? Math.max(0, Math.round(seconds * 1000)) : null;
+  }
+  const timestampMs = Date.parse(text);
+  return Number.isFinite(timestampMs) ? Math.max(0, timestampMs - nowMs) : null;
+}
+
+function resolveUpstreamPolicyRetryDelay(policy, upstreamResponse, attemptIndex) {
+  if (upstreamResponse?.status !== 429) {
+    return {
+      retryAfterRaw: null,
+      retryAfterMs: null,
+      retryDelayMs: 0,
+      delayAllowed: true,
+    };
+  }
+  const retryAfterRaw = upstreamResponse.headers.get("retry-after");
+  const retryAfterMs = parseRetryAfterMs(retryAfterRaw);
+  if (Number.isFinite(retryAfterMs)) {
+    return {
+      retryAfterRaw,
+      retryAfterMs,
+      retryDelayMs: retryAfterMs,
+      delayAllowed: retryAfterMs <= MAX_RETRY_AFTER_MS,
+    };
+  }
+  const cappedBackoffMs = Math.min(30_000, 1000 * 2 ** Math.max(0, attemptIndex));
+  return {
+    retryAfterRaw,
+    retryAfterMs: null,
+    retryDelayMs: Math.floor(Math.random() * (cappedBackoffMs + 1)),
+    delayAllowed: true,
+  };
+}
+
+function buildUpstreamPolicyErrorBody(policy, requestTracking) {
+  return JSON.stringify({
+    error: {
+      type: "codex_retry_gateway_upstream_policy_error",
+      code: policy.errorCode,
+      message: policy.message,
+    },
+    retry_attempt_index: requestTracking?.guardRetryAttemptsUsed ?? 0,
+    retry_attempts_used: requestTracking?.guardRetryAttemptsUsed ?? 0,
+    retry_attempts_remaining: requestTracking?.guardRetryRemaining ?? 0,
+  });
+}
+
+function createResponseInspectionLimitError(limitBytes) {
+  const error = new Error(`SSE event exceeds inspection limit: ${limitBytes} bytes`);
+  error.code = "response_inspection_limit_exceeded";
+  return error;
+}
+
+function buildResponseInspectionLimitBody(pathname, limitBytes) {
+  return JSON.stringify({
+    error: {
+      message: `codex retry gateway could not safely inspect an oversized SSE event on ${pathname}`,
+      type: "codex_retry_gateway_error",
+      code: "response_inspection_limit_exceeded",
+      inspection_limit_bytes: limitBytes,
+    },
+  });
+}
+
+function waitForRetryDelay(delayMs, signal) {
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    return Promise.resolve(!signal?.aborted);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (completed) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    const timer = setTimeout(() => finish(true), delayMs);
+    if (signal?.aborted) {
+      finish(false);
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function waitForRetryDispatchTurn() {
+  return new Promise((resolve) => {
+    setImmediate(() => setImmediate(resolve));
+  });
+}
+
 function completeReasoningBehaviorSample({
   runtime,
   sample,
@@ -1453,6 +1919,8 @@ function completeReasoningBehaviorSample({
   matchedCurrentRule = false,
   blockedByGateway = false,
   failureSummary = null,
+  requestFinishedAtMs = null,
+  latestLogSeq = null,
 }) {
   applyModelContextToReasoningSample(sample, modelContext);
   finalizeReasoningBehaviorSample(sample, structure, {
@@ -1461,9 +1929,261 @@ function completeReasoningBehaviorSample({
     matched_current_rule: matchedCurrentRule,
     blocked_by_gateway: blockedByGateway,
     failure_summary: failureSummary,
-    latest_log_seq: runtime.monitor.next_log_seq - 1,
+    request_finished_at_ms: Number.isFinite(requestFinishedAtMs)
+      ? requestFinishedAtMs
+      : undefined,
+    latest_log_seq: Number.isInteger(latestLogSeq)
+      ? latestLogSeq
+      : runtime.monitor.next_log_seq - 1,
   });
   recordReasoningBehaviorSample(runtime, sample);
+}
+
+function createAttemptLatencyGuard(
+  config,
+  requestTracking,
+  abortController,
+  attemptStartedAtMs = Date.now(),
+) {
+  const latencyConfig = config?.latency_guard || DEFAULT_CONFIG.latency_guard;
+  let firstProgressTimer = null;
+  let firstProgressDeadlineAtMs = null;
+  let totalDeadlineTimer = null;
+  let timeoutPhase = null;
+  let timeoutLimitMs = null;
+
+  const triggerTimeout = (phase, limitMs) => {
+    if (timeoutPhase) {
+      return;
+    }
+    timeoutPhase = phase;
+    timeoutLimitMs = limitMs;
+    abortController.abort();
+  };
+
+  if (latencyConfig.enabled) {
+    if (latencyConfig.first_progress_timeout_ms > 0) {
+      firstProgressDeadlineAtMs =
+        attemptStartedAtMs + latencyConfig.first_progress_timeout_ms;
+      const firstProgressRemainingMs = Math.max(
+        0,
+        firstProgressDeadlineAtMs - Date.now(),
+      );
+      firstProgressTimer = setTimeout(
+        () => triggerTimeout("first_progress", latencyConfig.first_progress_timeout_ms),
+        firstProgressRemainingMs,
+      );
+      firstProgressTimer.unref?.();
+    }
+    if (
+      latencyConfig.total_timeout_ms > 0 &&
+      Number.isFinite(requestTracking?.total_deadline_at_ms)
+    ) {
+      const remainingMs = Math.max(0, requestTracking.total_deadline_at_ms - Date.now());
+      totalDeadlineTimer = setTimeout(
+        () => triggerTimeout("total", latencyConfig.total_timeout_ms),
+        remainingMs,
+      );
+      totalDeadlineTimer.unref?.();
+    }
+  }
+
+  const expireFirstProgressDeadlineIfNeeded = () => {
+    if (
+      !timeoutPhase &&
+      firstProgressTimer &&
+      Number.isFinite(firstProgressDeadlineAtMs) &&
+      Date.now() >= firstProgressDeadlineAtMs
+    ) {
+      triggerTimeout("first_progress", latencyConfig.first_progress_timeout_ms);
+    }
+    return timeoutPhase === "first_progress";
+  };
+
+  return {
+    get timeoutPhase() {
+      return timeoutPhase;
+    },
+    get timeoutLimitMs() {
+      return timeoutLimitMs;
+    },
+    expireTotalDeadlineIfNeeded(options = {}) {
+      const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+      if (
+        latencyConfig.enabled &&
+        latencyConfig.total_timeout_ms > 0 &&
+        Number.isFinite(requestTracking?.total_deadline_at_ms) &&
+        nowMs >= requestTracking.total_deadline_at_ms
+      ) {
+        if (!timeoutPhase || options.overrideExisting === true) {
+          timeoutPhase = "total";
+          timeoutLimitMs = latencyConfig.total_timeout_ms;
+          abortController.abort();
+        }
+      }
+      return timeoutPhase === "total";
+    },
+    expireFirstProgressDeadlineIfNeeded,
+    markFirstProgress() {
+      if (expireFirstProgressDeadlineIfNeeded() || timeoutPhase) {
+        return false;
+      }
+      if (firstProgressTimer) {
+        clearTimeout(firstProgressTimer);
+        firstProgressTimer = null;
+      }
+      firstProgressDeadlineAtMs = null;
+      return true;
+    },
+    endFirstProgressWindow() {
+      if (expireFirstProgressDeadlineIfNeeded() || timeoutPhase) {
+        return false;
+      }
+      if (firstProgressTimer) {
+        clearTimeout(firstProgressTimer);
+        firstProgressTimer = null;
+      }
+      firstProgressDeadlineAtMs = null;
+      return true;
+    },
+    clear() {
+      if (firstProgressTimer) {
+        clearTimeout(firstProgressTimer);
+        firstProgressTimer = null;
+      }
+      firstProgressDeadlineAtMs = null;
+      if (totalDeadlineTimer) {
+        clearTimeout(totalDeadlineTimer);
+        totalDeadlineTimer = null;
+      }
+    },
+  };
+}
+
+function buildLatencyTimeoutErrorBody(phase, limitMs, requestTracking) {
+  const isFirstProgress = phase === "first_progress";
+  return JSON.stringify({
+    error: {
+      type: "codex_retry_gateway_upstream_policy_error",
+      code: isFirstProgress ? "upstream_first_progress_timeout" : "upstream_total_timeout",
+      message: isFirstProgress
+        ? "上游未在限定时间内产生首个有效输出。"
+        : "上游响应超过本次请求的总 deadline。",
+    },
+    retry_attempt_index: requestTracking?.guardRetryAttemptsUsed ?? 0,
+    retry_attempts_used: requestTracking?.guardRetryAttemptsUsed ?? 0,
+    retry_attempts_remaining: requestTracking?.guardRetryRemaining ?? 0,
+    timeout_limit_ms: limitMs,
+    timeout_phase: phase,
+  });
+}
+
+function handleAttemptLatencyTimeout({
+  runtime,
+  config,
+  monitor,
+  pathname,
+  requestTracking,
+  modelContext,
+  reasoningSample,
+  structureAccumulator,
+  res,
+  latencyGuard,
+  upstreamStatus = null,
+  errorPayload = null,
+  blockedResponseAlreadyRecorded = false,
+  modelInsightsAlreadyFinalized = false,
+}) {
+  const phase = latencyGuard.timeoutPhase;
+  const limitMs = latencyGuard.timeoutLimitMs;
+  const trigger = phase === "first_progress" ? "first_progress_timeout" : "total_timeout";
+  const forwardingStarted = reasoningSample.response_forwarding_started || res.headersSent;
+  const firstProgressAction = config.latency_guard.first_progress_action;
+  const totalRemainingMs = Number.isFinite(requestTracking?.total_deadline_at_ms)
+    ? requestTracking.total_deadline_at_ms - Date.now()
+    : Number.POSITIVE_INFINITY;
+  const canRetry =
+    phase === "first_progress" &&
+    firstProgressAction === UPSTREAM_ERROR_ACTION_RETRY_THEN_502 &&
+    requestTracking?.guardRetryRemaining > 0 &&
+    totalRemainingMs > 0 &&
+    !forwardingStarted;
+
+  reasoningSample.timeout_phase = phase;
+  reasoningSample.timeout_limit_ms = limitMs;
+  reasoningSample.policy_trigger = trigger;
+  reasoningSample.policy_action = phase === "first_progress" ? firstProgressAction : "return_502";
+  reasoningSample.retry_trigger = canRetry ? trigger : null;
+  reasoningSample.retry_delay_ms = canRetry ? 0 : null;
+  reasoningSample.retry_budget_remaining = requestTracking?.guardRetryRemaining ?? 0;
+  reasoningSample.upstream_http_status = upstreamStatus;
+  recordInspectedResponseForSample(
+    monitor,
+    reasoningSample,
+    null,
+    false,
+    reasoningSample.is_streaming ? "stream" : "non-stream",
+  );
+  setRequestTrackingOutcome(requestTracking, "inspected");
+  if (!modelInsightsAlreadyFinalized) {
+    finalizeModelInsights(monitor, pathname, modelContext, errorPayload);
+  }
+  if (!blockedResponseAlreadyRecorded) {
+    recordBlockedResponse(monitor, reasoningSample.is_streaming ? "stream" : "non-stream");
+  }
+
+  const failureSummary = buildFailureSummary(
+    new Error(phase === "first_progress" ? "upstream first progress timeout" : "upstream total timeout"),
+  );
+  if (forwardingStarted) {
+    recordTimeoutOutcome(monitor, phase, "disconnect_after_forward");
+    reasoningSample.timeout_response_control_lost = true;
+    completeReasoningBehaviorSample({
+      runtime,
+      sample: reasoningSample,
+      structure: structureAccumulator,
+      modelContext,
+      finalAction: "timeout_disconnected_after_forward",
+      clientHttpStatus: null,
+      matchedCurrentRule: Boolean(reasoningSample.matched_current_rule),
+      blockedByGateway: true,
+      failureSummary,
+    });
+    res.destroy();
+    return { handled: true };
+  }
+
+  if (canRetry) {
+    return { timeoutRetry: true, failureSummary };
+  }
+
+  const reasonHeader = phase === "first_progress"
+    ? "upstream-first-progress-timeout"
+    : "upstream-total-timeout";
+  const body = buildLatencyTimeoutErrorBody(phase, limitMs, requestTracking);
+  recordTimeoutOutcome(monitor, phase, "return_502");
+  for (const headerName of res.getHeaderNames()) {
+    res.removeHeader(headerName);
+  }
+  res.writeHead(502, {
+    "content-type": "application/json; charset=utf-8",
+    "x-codex-retry-gateway-reason": reasonHeader,
+  });
+  markReasoningSampleClientHeadersSent(reasoningSample);
+  markReasoningSampleClientWrite(reasoningSample);
+  res.end(body);
+  completeReasoningBehaviorSample({
+    runtime,
+    sample: reasoningSample,
+    structure: structureAccumulator,
+    modelContext,
+    finalAction: phase === "first_progress" ? "first_progress_timeout_returned_502" : "total_timeout_returned_502",
+    clientHttpStatus: 502,
+    matchedCurrentRule: Boolean(reasoningSample.matched_current_rule),
+    blockedByGateway: true,
+    failureSummary,
+  });
+  return { handled: true };
 }
 
 function buildReasoningBehaviorAttemptSample(runtime, requestTracking, attemptIndex, requestIsStream) {
@@ -1504,6 +2224,8 @@ function buildReasoningBehaviorAttemptSample(runtime, requestTracking, attemptIn
     first_stream_chunk_at_ms: null,
     first_content_at: null,
     first_content_at_ms: null,
+    first_progress_at: null,
+    first_progress_at_ms: null,
     final_chunk_at: null,
     final_chunk_at_ms: null,
     request_finished_at: null,
@@ -1512,7 +2234,25 @@ function buildReasoningBehaviorAttemptSample(runtime, requestTracking, attemptIn
     upstream_wait_ms: null,
     time_to_first_chunk_ms: null,
     time_to_first_content_ms: null,
+    time_to_first_progress_ms: null,
     stream_duration_ms: null,
+    client_headers_sent_at: null,
+    client_headers_sent_at_ms: null,
+    client_first_write_at: null,
+    client_first_write_at_ms: null,
+    time_to_client_first_write_ms: null,
+    response_forwarding_started: false,
+    policy_trigger: null,
+    policy_action: null,
+    retry_trigger: null,
+    retry_delay_ms: null,
+    retry_after_raw: null,
+    retry_after_ms: null,
+    retry_budget_used: attemptIndex,
+    retry_budget_remaining: null,
+    timeout_phase: null,
+    timeout_limit_ms: null,
+    timeout_response_control_lost: false,
     input_tokens: null,
     reasoning_tokens: null,
     output_tokens: null,
@@ -1622,6 +2362,24 @@ function finalizeReasoningBehaviorSample(sample, structure, overrides = {}) {
     );
   }
   if (
+    Number.isFinite(sample.upstream_fetch_started_at_ms) &&
+    Number.isFinite(sample.first_progress_at_ms)
+  ) {
+    sample.time_to_first_progress_ms = Math.max(
+      0,
+      sample.first_progress_at_ms - sample.upstream_fetch_started_at_ms,
+    );
+  }
+  if (
+    Number.isFinite(sample.upstream_fetch_started_at_ms) &&
+    Number.isFinite(sample.client_first_write_at_ms)
+  ) {
+    sample.time_to_client_first_write_ms = Math.max(
+      0,
+      sample.client_first_write_at_ms - sample.upstream_fetch_started_at_ms,
+    );
+  }
+  if (
     Number.isFinite(sample.first_stream_chunk_at_ms) &&
     Number.isFinite(sample.final_chunk_at_ms)
   ) {
@@ -1672,6 +2430,10 @@ function finalizeReasoningBehaviorSample(sample, structure, overrides = {}) {
   }
   sample.internal_retry_remaining =
     overrides.internal_retry_remaining ?? sample.internal_retry_remaining;
+  sample.retry_budget_remaining =
+    overrides.retry_budget_remaining ??
+    sample.retry_budget_remaining ??
+    sample.internal_retry_remaining;
   sample.matched_current_rule =
     overrides.matched_current_rule ?? sample.matched_current_rule;
   sample.blocked_by_gateway =
@@ -1696,6 +2458,26 @@ function finalizeReasoningBehaviorSample(sample, structure, overrides = {}) {
 function clonePlainSample(sample) {
   const commentaryObserved = Boolean(sample.commentary_observed ?? sample.has_commentary);
   return {
+    policy_trigger: null,
+    policy_action: null,
+    retry_trigger: null,
+    retry_delay_ms: null,
+    retry_after_raw: null,
+    retry_after_ms: null,
+    retry_budget_used: null,
+    retry_budget_remaining: null,
+    first_progress_at: null,
+    first_progress_at_ms: null,
+    time_to_first_progress_ms: null,
+    client_headers_sent_at: null,
+    client_headers_sent_at_ms: null,
+    client_first_write_at: null,
+    client_first_write_at_ms: null,
+    time_to_client_first_write_ms: null,
+    timeout_phase: null,
+    timeout_limit_ms: null,
+    timeout_response_control_lost: null,
+    response_forwarding_started: null,
     ...sample,
     commentary_observed: commentaryObserved,
     commentary_not_observed: !commentaryObserved,
@@ -2395,9 +3177,29 @@ function buildReasoningBehaviorCsv(samples) {
     "has_final_answer",
     "has_tool_call",
     "has_reasoning_item",
+    "policy_trigger",
+    "policy_action",
+    "retry_trigger",
+    "retry_delay_ms",
+    "retry_after_raw",
+    "retry_after_ms",
+    "retry_budget_used",
+    "retry_budget_remaining",
     "time_to_first_chunk_ms",
     "time_to_first_content_ms",
+    "first_progress_at",
+    "first_progress_at_ms",
+    "time_to_first_progress_ms",
+    "client_headers_sent_at",
+    "client_headers_sent_at_ms",
+    "client_first_write_at",
+    "client_first_write_at_ms",
+    "time_to_client_first_write_ms",
     "stream_duration_ms",
+    "timeout_phase",
+    "timeout_limit_ms",
+    "timeout_response_control_lost",
+    "response_forwarding_started",
     "matched_current_rule",
     "blocked_by_gateway",
     "upstream_stream_terminated",
@@ -2438,9 +3240,29 @@ function buildReasoningBehaviorCsv(samples) {
       sample.has_final_answer,
       sample.has_tool_call,
       sample.has_reasoning_item,
+      sample.policy_trigger,
+      sample.policy_action,
+      sample.retry_trigger,
+      sample.retry_delay_ms,
+      sample.retry_after_raw,
+      sample.retry_after_ms,
+      sample.retry_budget_used,
+      sample.retry_budget_remaining,
       sample.time_to_first_chunk_ms,
       sample.time_to_first_content_ms,
+      sample.first_progress_at,
+      sample.first_progress_at_ms,
+      sample.time_to_first_progress_ms,
+      sample.client_headers_sent_at,
+      sample.client_headers_sent_at_ms,
+      sample.client_first_write_at,
+      sample.client_first_write_at_ms,
+      sample.time_to_client_first_write_ms,
       sample.stream_duration_ms,
+      sample.timeout_phase,
+      sample.timeout_limit_ms,
+      sample.timeout_response_control_lost,
+      sample.response_forwarding_started,
       sample.matched_current_rule,
       sample.blocked_by_gateway,
       sample.upstream_stream_terminated,
@@ -3621,6 +4443,19 @@ function createMonitor() {
     blocked_non_streaming_count: 0,
     continuation_recovery_count: 0,
     continuation_recovery_success_count: 0,
+    capacity_trigger_count: 0,
+    capacity_retry_count: 0,
+    capacity_pass_through_count: 0,
+    capacity_return_502_count: 0,
+    http_429_trigger_count: 0,
+    http_429_retry_count: 0,
+    http_429_pass_through_count: 0,
+    http_429_return_502_count: 0,
+    first_progress_timeout_count: 0,
+    total_timeout_count: 0,
+    timeout_retry_count: 0,
+    timeout_return_502_count: 0,
+    timeout_disconnect_after_forward_count: 0,
     observed_reasoning_counts: {},
     local_model_counts: {},
     upstream_model_counts: {},
@@ -3735,12 +4570,63 @@ function recordInspectedResponse(monitor, reasoning, matched, streamKind = null)
   }
 }
 
+const inspectedReasoningSamples = new WeakSet();
+
+function recordInspectedResponseForSample(
+  monitor,
+  sample,
+  reasoning,
+  matched,
+  streamKind = null,
+) {
+  if (matched) {
+    sample.matched_current_rule = true;
+  }
+  if (inspectedReasoningSamples.has(sample)) {
+    return false;
+  }
+  inspectedReasoningSamples.add(sample);
+  recordInspectedResponse(monitor, reasoning, matched, streamKind);
+  return true;
+}
+
 function recordBlockedResponse(monitor, streamKind) {
   monitor.blocked_response_count += 1;
   if (streamKind === "stream") {
     monitor.blocked_streaming_count += 1;
   } else if (streamKind === "non-stream") {
     monitor.blocked_non_streaming_count += 1;
+  }
+}
+
+function recordUpstreamPolicyTrigger(monitor, trigger) {
+  const prefix = trigger === "capacity" ? "capacity" : "http_429";
+  monitor[`${prefix}_trigger_count`] += 1;
+}
+
+function recordUpstreamPolicyOutcome(monitor, trigger, outcome) {
+  const prefix = trigger === "capacity" ? "capacity" : "http_429";
+  if (outcome === "retry") {
+    monitor[`${prefix}_retry_count`] += 1;
+  } else if (outcome === "pass_through") {
+    monitor[`${prefix}_pass_through_count`] += 1;
+  } else if (outcome === "return_502") {
+    monitor[`${prefix}_return_502_count`] += 1;
+  }
+}
+
+function recordTimeoutOutcome(monitor, phase, outcome) {
+  if (phase === "first_progress") {
+    monitor.first_progress_timeout_count += 1;
+  } else {
+    monitor.total_timeout_count += 1;
+  }
+  if (outcome === "retry") {
+    monitor.timeout_retry_count += 1;
+  } else if (outcome === "return_502") {
+    monitor.timeout_return_502_count += 1;
+  } else if (outcome === "disconnect_after_forward") {
+    monitor.timeout_disconnect_after_forward_count += 1;
   }
 }
 
@@ -3933,7 +4819,13 @@ function pushSuspiciousModelSample(monitor, pathname, context, anomalyType, conf
   }
 }
 
+const finalizedModelInsightContexts = new WeakSet();
+
 function finalizeModelInsights(monitor, pathname, context, errorPayload = null) {
+  if (finalizedModelInsightContexts.has(context)) {
+    return;
+  }
+  finalizedModelInsightContexts.add(context);
   const effectiveLocalModel = context.effectiveLocalModel;
   const effectiveFamily = normalizeModelFamily(effectiveLocalModel);
   const familyBreakdown = getFamilyBreakdownEntry(monitor, effectiveFamily);
@@ -4031,6 +4923,19 @@ function buildMetricsSnapshot(monitor) {
     continuation_recovery_success_count: continuationRecoverySuccessCount,
     continuation_recovery_success_ratio:
       continuationRecoveryCount === 0 ? 0 : continuationRecoverySuccessCount / continuationRecoveryCount,
+    capacity_trigger_count: monitor.capacity_trigger_count,
+    capacity_retry_count: monitor.capacity_retry_count,
+    capacity_pass_through_count: monitor.capacity_pass_through_count,
+    capacity_return_502_count: monitor.capacity_return_502_count,
+    http_429_trigger_count: monitor.http_429_trigger_count,
+    http_429_retry_count: monitor.http_429_retry_count,
+    http_429_pass_through_count: monitor.http_429_pass_through_count,
+    http_429_return_502_count: monitor.http_429_return_502_count,
+    first_progress_timeout_count: monitor.first_progress_timeout_count,
+    total_timeout_count: monitor.total_timeout_count,
+    timeout_retry_count: monitor.timeout_retry_count,
+    timeout_return_502_count: monitor.timeout_return_502_count,
+    timeout_disconnect_after_forward_count: monitor.timeout_disconnect_after_forward_count,
     reasoning_516_count: reasoning516Count,
     reasoning_516_ratio:
       inspectedResponseCount === 0 ? 0 : reasoning516Count / inspectedResponseCount,
@@ -4270,7 +5175,27 @@ async function loadConfig(configPath) {
   config.intercept_non_streaming = config.intercept_non_streaming !== false;
   config.guard_retry_attempts = normalizeGuardRetryAttempts(config.guard_retry_attempts);
   config.retry_upstream_capacity_errors = config.retry_upstream_capacity_errors !== false;
-  if (!config.intercept_streaming && !config.intercept_non_streaming) {
+  const legacyCapacityAction =
+    loaded.retry_upstream_capacity_errors === false
+      ? UPSTREAM_ERROR_ACTION_PASS_THROUGH
+      : UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH;
+  config.capacity_error_action = normalizeUpstreamErrorAction(
+    loaded.capacity_error_action,
+    legacyCapacityAction,
+  );
+  config.http_429_action = normalizeUpstreamErrorAction(
+    loaded.http_429_action,
+    DEFAULT_CONFIG.http_429_action,
+  );
+  config.latency_guard = normalizeLatencyGuardConfig(
+    loaded.latency_guard,
+    DEFAULT_CONFIG.latency_guard,
+  );
+  if (
+    config.intercept_rule_mode !== INTERCEPT_RULE_MODE_NONE &&
+    !config.intercept_streaming &&
+    !config.intercept_non_streaming
+  ) {
     throw new Error("流式与非流式至少选择一个拦截目标");
   }
   config.active_probe = normalizeActiveProbeConfig(loaded.active_probe);
@@ -5439,6 +6364,38 @@ function buildEditableConfig(currentConfig, payload) {
     payload.retry_upstream_capacity_errors === undefined
       ? currentConfig.retry_upstream_capacity_errors !== false
       : Boolean(payload.retry_upstream_capacity_errors);
+  const legacyCapacityAction = nextRetryUpstreamCapacityErrors
+    ? UPSTREAM_ERROR_ACTION_RETRY_THEN_PASS_THROUGH
+    : UPSTREAM_ERROR_ACTION_PASS_THROUGH;
+  const nextCapacityErrorAction = normalizeUpstreamErrorAction(
+    payload.capacity_error_action,
+    payload.retry_upstream_capacity_errors === undefined
+      ? currentConfig.capacity_error_action || DEFAULT_CONFIG.capacity_error_action
+      : legacyCapacityAction,
+  );
+  const nextHttp429Action = normalizeUpstreamErrorAction(
+    payload.http_429_action,
+    currentConfig.http_429_action || DEFAULT_CONFIG.http_429_action,
+  );
+  if (
+    payload.latency_guard !== undefined &&
+    (
+      payload.latency_guard === null ||
+      typeof payload.latency_guard !== "object" ||
+      Array.isArray(payload.latency_guard)
+    )
+  ) {
+    throw new Error("latency_guard 必须是对象");
+  }
+  const nextLatencyGuard = normalizeLatencyGuardConfig(
+    payload.latency_guard === undefined
+      ? currentConfig.latency_guard
+      : {
+          ...currentConfig.latency_guard,
+          ...payload.latency_guard,
+        },
+    DEFAULT_CONFIG.latency_guard,
+  );
   const nextStreamAction =
     payload.stream_action === undefined
       ? normalizeStreamAction(currentConfig.stream_action)
@@ -5464,7 +6421,7 @@ function buildEditableConfig(currentConfig, payload) {
         ? Boolean(currentConfig.active_probe?.enabled)
         : Boolean(payload.active_probe.enabled);
 
-  if (nextReasoning.length === 0) {
+  if (nextInterceptRuleMode !== INTERCEPT_RULE_MODE_NONE && nextReasoning.length === 0) {
     throw new Error("reasoning_equals 不能为空");
   }
   if (nextEndpoints.length === 0) {
@@ -5473,7 +6430,11 @@ function buildEditableConfig(currentConfig, payload) {
   if (!Number.isInteger(nextStatusCode) || nextStatusCode < 100 || nextStatusCode > 599) {
     throw new Error("non_stream_status_code 必须是 100-599 的整数");
   }
-  if (!nextInterceptStreaming && !nextInterceptNonStreaming) {
+  if (
+    nextInterceptRuleMode !== INTERCEPT_RULE_MODE_NONE &&
+    !nextInterceptStreaming &&
+    !nextInterceptNonStreaming
+  ) {
     throw new Error("流式与非流式至少选择一个拦截目标");
   }
   if (requestedActiveProbeEnabled && nextActiveProbe.target_families.length === 0) {
@@ -5490,6 +6451,9 @@ function buildEditableConfig(currentConfig, payload) {
     intercept_non_streaming: nextInterceptNonStreaming,
     non_stream_status_code: nextStatusCode,
     guard_retry_attempts: nextGuardRetryAttempts,
+    capacity_error_action: nextCapacityErrorAction,
+    http_429_action: nextHttp429Action,
+    latency_guard: nextLatencyGuard,
     retry_upstream_capacity_errors: nextRetryUpstreamCapacityErrors,
     stream_action: nextStreamAction,
     continuation_marker_text: nextContinuationMarkerText,
@@ -6693,17 +7657,14 @@ function buildManagementHtml() {
 
               <div class="setting-group">
                 <div class="setting-group-title">命中条件</div>
-                <div class="field rule-mode-field">
-                  <label>规则模式</label>
-                  <div class="inline-toggle rule-mode-toggle">
-                    <input id="interceptRuleModeReasoningTokensInput" name="intercept_rule_mode" type="radio" value="reasoning_tokens" />
-                    <label for="interceptRuleModeReasoningTokensInput">reasoning_tokens 长度（推荐）</label>
-                  </div>
-                  <div class="inline-toggle rule-mode-toggle">
-                    <input id="interceptRuleModeFinalOnlyInput" name="intercept_rule_mode" type="radio" value="final_answer_only_high_xhigh" />
-                    <label for="interceptRuleModeFinalOnlyInput">final answer only（实验，排除 0）</label>
-                  </div>
-                  <div class="hint">推荐使用 reasoning_tokens；final answer only 仅作实验收窄规则。</div>
+                <div class="field compact-config-field">
+                  <label for="interceptRuleModeSelect">规则模式</label>
+                  <select id="interceptRuleModeSelect" name="intercept_rule_mode">
+                    <option value="reasoning_tokens">reasoning_tokens 长度（推荐）</option>
+                    <option value="final_answer_only_high_xhigh">final answer only（实验，排除 0）</option>
+                    <option value="none">不使用 reasoning 规则（直接透传）</option>
+                  </select>
+                  <div class="hint">不使用 reasoning 规则时，仍可独立启用 Capacity、HTTP 429 与响应超时保护。</div>
                 </div>
 
                 <div class="field compact-config-field">
@@ -6753,7 +7714,7 @@ function buildManagementHtml() {
                     <input id="statusCodeInput" name="non_stream_status_code" type="number" min="100" max="599" />
                   </div>
                 </div>
-                <div class="hint">所有命中后内部动作共用这里的次数：普通内部重试、Responses 流式续写恢复、以及开启 capacity 选项后的上游 capacity 错误内重试；0 表示不做内部尝试。</div>
+                <div class="hint">所有命中后内部动作共用这里的次数：reasoning、续写恢复、Capacity、HTTP 429 与首个有效输出超时；0 表示不做内部追加尝试。</div>
                 <div class="field rule-mode-field">
                   <label>拦截范围</label>
                   <div class="inline-toggle rule-mode-toggle">
@@ -6768,11 +7729,56 @@ function buildManagementHtml() {
                 </div>
               </div>
 
-              <div class="inline-toggle rule-mode-toggle">
-                <input id="retryUpstreamCapacityErrorsInput" name="retry_upstream_capacity_errors" type="checkbox" />
-                <label for="retryUpstreamCapacityErrorsInput">上游 capacity 错误内重试</label>
+              <div class="setting-group">
+                <div class="setting-group-title">上游错误策略</div>
+                <div class="setting-row">
+                  <div class="field compact-config-field">
+                    <label for="capacityErrorActionSelect">Capacity</label>
+                    <select id="capacityErrorActionSelect" name="capacity_error_action">
+                      <option value="pass_through">直接透传</option>
+                      <option value="return_502">直接返回 502</option>
+                      <option value="retry_then_pass_through">重试，耗尽后透传</option>
+                      <option value="retry_then_502">重试，耗尽后返回 502</option>
+                    </select>
+                  </div>
+                  <div class="field compact-config-field">
+                    <label for="http429ActionSelect">HTTP 429</label>
+                    <select id="http429ActionSelect" name="http_429_action">
+                      <option value="pass_through">直接透传</option>
+                      <option value="return_502">直接返回 502</option>
+                      <option value="retry_then_pass_through">重试，耗尽后透传</option>
+                      <option value="retry_then_502">重试，耗尽后返回 502</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="hint">Capacity 仅匹配明确容量错误；普通 HTTP 429 使用独立动作，二者不会重复扣减重试预算。</div>
               </div>
-              <div class="hint">仅匹配 “Selected model is at capacity. Please try a different model.”，普通 429 / 502 仍按原样透传。</div>
+
+              <div class="setting-group">
+                <div class="setting-group-title">响应超时保护</div>
+                <div class="inline-toggle rule-mode-toggle">
+                  <input id="latencyGuardEnabledInput" name="latency_guard.enabled" type="checkbox" />
+                  <label for="latencyGuardEnabledInput">启用响应超时保护</label>
+                </div>
+                <div class="setting-row">
+                  <div class="field compact-config-field">
+                    <label for="firstProgressTimeoutMsInput">首个有效输出超时（ms）</label>
+                    <input id="firstProgressTimeoutMsInput" name="latency_guard.first_progress_timeout_ms" type="number" min="0" step="1" />
+                  </div>
+                  <div class="field compact-config-field">
+                    <label for="firstProgressActionSelect">首输出超时动作</label>
+                    <select id="firstProgressActionSelect" name="latency_guard.first_progress_action">
+                      <option value="return_502">直接返回 502</option>
+                      <option value="retry_then_502">重试，耗尽后返回 502</option>
+                    </select>
+                  </div>
+                  <div class="field compact-config-field">
+                    <label for="totalTimeoutMsInput">请求总 deadline（ms）</label>
+                    <input id="totalTimeoutMsInput" name="latency_guard.total_timeout_ms" type="number" min="0" step="1" />
+                  </div>
+                </div>
+                <div class="hint">0 表示单独关闭该阈值；启用后至少填写一个大于 0 的阈值。总 deadline 跨内部重试不重置。</div>
+              </div>
 
               <div class="inline-toggle rule-mode-toggle">
                 <input id="logMatchInput" name="log_match" type="checkbox" />
@@ -7328,8 +8334,7 @@ function buildManagementHtml() {
         reasoningEqualsField: document.getElementById('reasoningEqualsField'),
         reasoningEqualsHint: document.getElementById('reasoningEqualsHint'),
         reasoningMatchModeSelect: document.getElementById('reasoningMatchModeSelect'),
-        interceptRuleModeReasoningTokensInput: document.getElementById('interceptRuleModeReasoningTokensInput'),
-        interceptRuleModeFinalOnlyInput: document.getElementById('interceptRuleModeFinalOnlyInput'),
+        interceptRuleModeSelect: document.getElementById('interceptRuleModeSelect'),
         interceptStreamingInput: document.getElementById('interceptStreamingInput'),
         interceptNonStreamingInput: document.getElementById('interceptNonStreamingInput'),
         interceptModeValue: document.getElementById('interceptModeValue'),
@@ -7340,7 +8345,12 @@ function buildManagementHtml() {
         endpointsInput: document.getElementById('endpointsInput'),
         statusCodeInput: document.getElementById('statusCodeInput'),
         guardRetryAttemptsInput: document.getElementById('guardRetryAttemptsInput'),
-        retryUpstreamCapacityErrorsInput: document.getElementById('retryUpstreamCapacityErrorsInput'),
+        capacityErrorActionSelect: document.getElementById('capacityErrorActionSelect'),
+        http429ActionSelect: document.getElementById('http429ActionSelect'),
+        latencyGuardEnabledInput: document.getElementById('latencyGuardEnabledInput'),
+        firstProgressTimeoutMsInput: document.getElementById('firstProgressTimeoutMsInput'),
+        firstProgressActionSelect: document.getElementById('firstProgressActionSelect'),
+        totalTimeoutMsInput: document.getElementById('totalTimeoutMsInput'),
         logMatchInput: document.getElementById('logMatchInput'),
         probeTargetFamily54Input: document.getElementById('probeTargetFamily54Input'),
         probeTargetFamily55Input: document.getElementById('probeTargetFamily55Input'),
@@ -7812,7 +8822,10 @@ function buildManagementHtml() {
       }
 
       function describeRuleTargetFromForm() {
-        if (refs.interceptRuleModeFinalOnlyInput.checked) {
+        if (refs.interceptRuleModeSelect.value === 'none') {
+          return 'reasoning 直接透传';
+        }
+        if (refs.interceptRuleModeSelect.value === 'final_answer_only_high_xhigh') {
           return 'final answer only（high/xhigh，排除普通 0）';
         }
         if (refs.reasoningMatchModeSelect.value === 'formula_518n_minus_2') {
@@ -7827,12 +8840,38 @@ function buildManagementHtml() {
       }
 
       function syncReasoningMatchModeFromForm() {
+        const ruleDisabled = refs.interceptRuleModeSelect.value === 'none';
         const formulaMode = refs.reasoningMatchModeSelect.value === 'formula_518n_minus_2';
-        refs.reasoningInput.disabled = formulaMode;
-        refs.reasoningEqualsField.classList.toggle('is-formula-locked', formulaMode);
-        refs.reasoningEqualsHint.textContent = formulaMode
+        refs.reasoningMatchModeSelect.disabled = ruleDisabled;
+        refs.reasoningInput.disabled = ruleDisabled || formulaMode;
+        refs.reasoningEqualsField.classList.toggle('is-formula-locked', ruleDisabled || formulaMode);
+        refs.reasoningEqualsHint.textContent = ruleDisabled
+          ? '当前不使用 reasoning 规则；这些值会保留，切回规则模式后继续使用。'
+          : formulaMode
           ? '公式模式已接管命中条件：这里仅保留为回退/参考列表，不能直接编辑。'
           : '手动模式下多个值用英文逗号或空格分隔；选择 518*n - 2 规则时，这里只保留为回退/参考列表。';
+      }
+
+      function syncInterceptRuleModeFromForm() {
+        const ruleDisabled = refs.interceptRuleModeSelect.value === 'none';
+        [
+          refs.streamActionStrict502Input,
+          refs.streamActionDisconnectInput,
+          refs.streamActionContinuationRecoveryInput,
+          refs.interceptStreamingInput,
+          refs.interceptNonStreamingInput,
+        ].forEach((control) => {
+          control.disabled = ruleDisabled;
+        });
+        syncReasoningMatchModeFromForm();
+        syncPolicySummaryFromForm();
+      }
+
+      function syncLatencyGuardControlsFromForm() {
+        const disabled = !refs.latencyGuardEnabledInput.checked;
+        refs.firstProgressTimeoutMsInput.disabled = disabled;
+        refs.firstProgressActionSelect.disabled = disabled;
+        refs.totalTimeoutMsInput.disabled = disabled;
       }
 
       function describeStreamActionFromForm() {
@@ -7849,15 +8888,21 @@ function buildManagementHtml() {
       }
 
       function syncPolicySummaryFromForm() {
-        refs.policySummaryValue.textContent =
-          describeRuleTargetFromForm() + ' -> ' + describeStreamActionFromForm();
+        const ruleSummary = refs.interceptRuleModeSelect.value === 'none'
+          ? describeRuleTargetFromForm()
+          : describeRuleTargetFromForm() + ' -> ' + describeStreamActionFromForm();
+        const protectionSummary = [
+          'Capacity: ' + refs.capacityErrorActionSelect.value,
+          'HTTP 429: ' + refs.http429ActionSelect.value,
+        ];
+        if (refs.latencyGuardEnabledInput.checked) {
+          protectionSummary.push('响应超时保护已启用');
+        }
+        refs.policySummaryValue.textContent = ruleSummary + '；' + protectionSummary.join('；');
       }
 
       function getInterceptRuleModeFromForm() {
-        if (refs.interceptRuleModeFinalOnlyInput.checked) {
-          return 'final_answer_only_high_xhigh';
-        }
-        return 'reasoning_tokens';
+        return refs.interceptRuleModeSelect.value;
       }
 
       function getStreamActionFromForm() {
@@ -7873,7 +8918,7 @@ function buildManagementHtml() {
       function collectInterceptPayloadFromForm() {
         const interceptStreaming = Boolean(refs.interceptStreamingInput.checked);
         const interceptNonStreaming = Boolean(refs.interceptNonStreamingInput.checked);
-        if (!interceptStreaming && !interceptNonStreaming) {
+        if (getInterceptRuleModeFromForm() !== 'none' && !interceptStreaming && !interceptNonStreaming) {
           throw new Error('流式与非流式至少选择一个拦截目标。');
         }
         return {
@@ -8021,11 +9066,12 @@ function buildManagementHtml() {
         refs.reasoningMatchModeSelect.value = config?.reasoning_match_mode === 'formula_518n_minus_2'
           ? 'formula_518n_minus_2'
           : 'manual';
-        const interceptRuleMode = config?.intercept_rule_mode === 'final_answer_only_high_xhigh'
-            ? 'final_answer_only_high_xhigh'
-            : 'reasoning_tokens';
-        refs.interceptRuleModeFinalOnlyInput.checked = interceptRuleMode === 'final_answer_only_high_xhigh';
-        refs.interceptRuleModeReasoningTokensInput.checked = interceptRuleMode === 'reasoning_tokens';
+        const interceptRuleMode = ['reasoning_tokens', 'final_answer_only_high_xhigh', 'none'].includes(
+          config?.intercept_rule_mode,
+        )
+          ? config.intercept_rule_mode
+          : 'reasoning_tokens';
+        refs.interceptRuleModeSelect.value = interceptRuleMode;
         const streamAction = config?.stream_action === 'continuation_recovery'
           ? 'continuation_recovery'
           : config?.stream_action === 'disconnect'
@@ -8040,9 +9086,17 @@ function buildManagementHtml() {
         refs.endpointsInput.value = Array.isArray(config?.endpoints) ? config.endpoints.join('\\n') : '';
         refs.statusCodeInput.value = config?.non_stream_status_code ?? 502;
         refs.guardRetryAttemptsInput.value = String(config?.guard_retry_attempts ?? 5);
-        syncReasoningMatchModeFromForm();
-        syncPolicySummaryFromForm();
-        refs.retryUpstreamCapacityErrorsInput.checked = config?.retry_upstream_capacity_errors !== false;
+        refs.capacityErrorActionSelect.value = config?.capacity_error_action || 'retry_then_pass_through';
+        refs.http429ActionSelect.value = config?.http_429_action || 'pass_through';
+        const latencyGuard = config?.latency_guard || {};
+        refs.latencyGuardEnabledInput.checked = Boolean(latencyGuard.enabled);
+        refs.firstProgressTimeoutMsInput.value = String(latencyGuard.first_progress_timeout_ms ?? 0);
+        refs.firstProgressActionSelect.value = latencyGuard.first_progress_action === 'retry_then_502'
+          ? 'retry_then_502'
+          : 'return_502';
+        refs.totalTimeoutMsInput.value = String(latencyGuard.total_timeout_ms ?? 0);
+        syncLatencyGuardControlsFromForm();
+        syncInterceptRuleModeFromForm();
         refs.logMatchInput.checked = Boolean(config?.log_match);
         const activeProbe = config?.active_probe || {};
         const targetFamilies = Array.isArray(activeProbe?.target_families) ? activeProbe.target_families : [];
@@ -8845,7 +9899,14 @@ function buildManagementHtml() {
               ...interceptPayload,
               non_stream_status_code: Number.parseInt(refs.statusCodeInput.value, 10),
               guard_retry_attempts: Number.parseInt(refs.guardRetryAttemptsInput.value, 10),
-              retry_upstream_capacity_errors: refs.retryUpstreamCapacityErrorsInput.checked,
+              capacity_error_action: refs.capacityErrorActionSelect.value,
+              http_429_action: refs.http429ActionSelect.value,
+              latency_guard: {
+                enabled: refs.latencyGuardEnabledInput.checked,
+                first_progress_timeout_ms: Number.parseInt(refs.firstProgressTimeoutMsInput.value, 10),
+                first_progress_action: refs.firstProgressActionSelect.value,
+                total_timeout_ms: Number.parseInt(refs.totalTimeoutMsInput.value, 10),
+              },
               log_match: refs.logMatchInput.checked,
               active_probe: collectActiveProbeFormPayload(),
             }),
@@ -8947,18 +10008,25 @@ function buildManagementHtml() {
       [
         refs.reasoningInput,
         refs.reasoningMatchModeSelect,
-        refs.interceptRuleModeReasoningTokensInput,
-        refs.interceptRuleModeFinalOnlyInput,
+        refs.interceptRuleModeSelect,
         refs.streamActionStrict502Input,
         refs.streamActionDisconnectInput,
         refs.streamActionContinuationRecoveryInput,
         refs.statusCodeInput,
         refs.guardRetryAttemptsInput,
+        refs.capacityErrorActionSelect,
+        refs.http429ActionSelect,
+        refs.latencyGuardEnabledInput,
+        refs.firstProgressTimeoutMsInput,
+        refs.firstProgressActionSelect,
+        refs.totalTimeoutMsInput,
       ].forEach((control) => {
         control.addEventListener('input', syncPolicySummaryFromForm);
         control.addEventListener('change', syncPolicySummaryFromForm);
       });
       refs.reasoningMatchModeSelect.addEventListener('change', syncReasoningMatchModeFromForm);
+      refs.interceptRuleModeSelect.addEventListener('change', syncInterceptRuleModeFromForm);
+      refs.latencyGuardEnabledInput.addEventListener('change', syncLatencyGuardControlsFromForm);
       refs.interceptStreamingInput.addEventListener('change', () => {
         syncInterceptModeValueFromForm();
         syncPolicySummaryFromForm();
@@ -9662,12 +10730,19 @@ function createRequestBodyLimitExceededError(limitBytes) {
 async function readRequestBody(req, limitBytes) {
   const chunks = [];
   let total = 0;
-  for await (const chunk of req) {
-    total += chunk.length;
-    if (total > limitBytes) {
-      throw createRequestBodyLimitExceededError(limitBytes);
+  try {
+    for await (const chunk of req) {
+      total += chunk.length;
+      if (total > limitBytes) {
+        throw createRequestBodyLimitExceededError(limitBytes);
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+  } catch (error) {
+    if (error && typeof error === "object") {
+      error.requestBodyBytesRead = total;
+    }
+    throw error;
   }
   return Buffer.concat(chunks);
 }
@@ -9713,6 +10788,14 @@ function shouldInterceptFinalAnswerOnlyReasoning(reasoning) {
 
 function buildInterceptRuleMatch(config, reasoning, reasoningSample, structure) {
   const mode = normalizeInterceptRuleMode(config?.intercept_rule_mode);
+  if (mode === INTERCEPT_RULE_MODE_NONE) {
+    return {
+      mode,
+      matched: false,
+      reasonForLog: "reasoning_rule=disabled",
+      blockedReasoning: reasoning,
+    };
+  }
   if (
     reasoningSample?.request_kind === REQUEST_KIND_CONTEXT_COMPACTION &&
     isContextCompactionExemptReasoning(reasoning)
@@ -10071,7 +11154,8 @@ function maybePrepareContinuationRecoveryRequestBody(
 
 function shouldStripEncryptedContentFromContinuationResponse(config, pathname, shouldInspect, requestJson) {
   return Boolean(
-    shouldInspect &&
+    normalizeInterceptRuleMode(config?.intercept_rule_mode) !== INTERCEPT_RULE_MODE_NONE &&
+      shouldInspect &&
       isResponsesPath(pathname) &&
       requestJson?.stream &&
       normalizeStreamAction(config.stream_action) === STREAM_ACTION_CONTINUATION_RECOVERY,
@@ -10110,6 +11194,10 @@ async function fetchUpstreamWithRetry(upstreamUrl, init, logger) {
 }
 
 function inspectSseChunk(state, chunk) {
+  const bomRemovedCountBefore = state.bom_removed_count;
+  const oversizedEventCountBefore = state.oversized_event_count;
+  const oversizedCandidateEventCountBefore = state.oversized_candidate_event_count;
+  const unrecognizedEventCountBefore = state.unrecognized_event_count;
   const payloads = parseSsePayloads(state, chunk);
   let reasoning = null;
   for (const payload of payloads) {
@@ -10118,7 +11206,15 @@ function inspectSseChunk(state, chunk) {
       reasoning = extracted;
     }
   }
-  return { reasoning, payloads };
+  return {
+    reasoning,
+    payloads,
+    bomRemoved: state.bom_removed_count > bomRemovedCountBefore,
+    oversizedEvent: state.oversized_event_count > oversizedEventCountBefore,
+    oversizedSseCandidate:
+      state.oversized_candidate_event_count > oversizedCandidateEventCountBefore,
+    unrecognizedEvent: state.unrecognized_event_count > unrecognizedEventCountBefore,
+  };
 }
 
 async function handleNonStreaming({
@@ -10133,8 +11229,18 @@ async function handleNonStreaming({
   structureAccumulator,
   upstreamResponse,
   res,
+  latencyGuard,
 }) {
+  const throwIfTotalDeadlineExpired = (message) => {
+    if (latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
+      throw new Error(message);
+    }
+  };
   const bodyBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
+  throwIfTotalDeadlineExpired("upstream total deadline expired before non-stream completion");
+  if (bodyBuffer.length > 0) {
+    markReasoningSampleFinalChunk(reasoningSample);
+  }
   const parsed = isJsonContentType(upstreamResponse.headers.get("content-type"))
     ? parseJsonSafely(bodyBuffer)
     : null;
@@ -10144,43 +11250,131 @@ async function handleNonStreaming({
     applyParsedUsageToReasoningSample(reasoningSample, parsed);
     applyStructureSignalsFromPayload(parsed, structureAccumulator);
   }
+  const hasMeaningfulProgress =
+    (parsed && payloadHasMeaningfulProgress(parsed)) ||
+    (!parsed && bodyBuffer.length > 0);
+  if (hasMeaningfulProgress) {
+    const progressAtMs = Date.now();
+    if (!latencyGuard?.markFirstProgress()) {
+      throw new Error("upstream first progress deadline expired before non-stream progress");
+    }
+    markReasoningSampleFirstProgress(reasoningSample, progressAtMs);
+    markReasoningSampleFirstContent(reasoningSample, progressAtMs);
+  } else if (!latencyGuard?.endFirstProgressWindow()) {
+    throw new Error("upstream first progress deadline expired before non-stream completion");
+  }
   const reasoning = parsed ? extractReasoningTokens(parsed) : null;
   const ruleMatch = buildInterceptRuleMatch(config, reasoning, reasoningSample, structureAccumulator);
   applyInterceptExemptionToSample(reasoningSample, ruleMatch);
   const matched = ruleMatch.matched;
-  const capacityRetryMatched =
-    config.retry_upstream_capacity_errors !== false &&
-    isUpstreamCapacityErrorResponse(upstreamResponse, parsed, bodyBuffer);
+  const upstreamPolicy = classifyUpstreamErrorPolicy(
+    config,
+    upstreamResponse,
+    parsed,
+    bodyBuffer,
+  );
+  throwIfTotalDeadlineExpired("upstream total deadline expired during non-stream inspection");
 
-  recordInspectedResponse(monitor, reasoning, matched, "non-stream");
+  recordInspectedResponseForSample(
+    monitor,
+    reasoningSample,
+    reasoning,
+    upstreamPolicy ? false : matched,
+    "non-stream",
+  );
   setRequestTrackingOutcome(requestTracking, "inspected");
 
-  if (capacityRetryMatched) {
-    const canGuardRetry = requestTracking?.guardRetryRemaining > 0;
-    if (config.log_match) {
-      const action = canGuardRetry
-        ? `internal_retry remaining=${requestTracking.guardRetryRemaining}`
+  if (upstreamPolicy) {
+    recordUpstreamPolicyTrigger(monitor, upstreamPolicy.trigger);
+    const retryDelay = resolveUpstreamPolicyRetryDelay(
+      upstreamPolicy,
+      upstreamResponse,
+      requestTracking?.guardRetryAttemptsUsed ?? 0,
+    );
+    const retryRequested = actionRequestsRetry(upstreamPolicy.action);
+    const totalDeadlineRemainingMs = Number.isFinite(requestTracking?.total_deadline_at_ms)
+      ? requestTracking.total_deadline_at_ms - Date.now()
+      : Number.POSITIVE_INFINITY;
+    const canGuardRetry =
+      retryRequested &&
+      retryDelay.delayAllowed &&
+      retryDelay.retryDelayMs <= totalDeadlineRemainingMs &&
+      requestTracking?.guardRetryRemaining > 0;
+    reasoningSample.policy_trigger = upstreamPolicy.trigger;
+    reasoningSample.policy_action = upstreamPolicy.action;
+    reasoningSample.retry_trigger = canGuardRetry ? upstreamPolicy.trigger : null;
+    reasoningSample.retry_delay_ms = canGuardRetry ? retryDelay.retryDelayMs : null;
+    reasoningSample.retry_after_raw = retryDelay.retryAfterRaw;
+    reasoningSample.retry_after_ms = retryDelay.retryAfterMs;
+    reasoningSample.retry_budget_remaining = requestTracking?.guardRetryRemaining ?? 0;
+    if (config.log_match && !canGuardRetry) {
+      const action = actionExhaustsTo502(upstreamPolicy.action)
+        ? "return_status_502"
         : "pass_through";
+      const logPrefix = upstreamPolicy.trigger === "capacity" ? "upstream-capacity" : "upstream-429";
       logger(
-        `[upstream-capacity] non-stream path=${pathname} status=${upstreamResponse.status} action=${action}`,
+        `[${logPrefix}] non-stream path=${pathname} status=${upstreamResponse.status} action=${action}`,
       );
     }
     if (canGuardRetry) {
-      recordBlockedResponse(monitor, "non-stream");
+      return {
+        policyRetry: true,
+        upstreamPolicy,
+        errorPayload: parsed,
+        retryDelayMs: retryDelay.retryDelayMs,
+      };
+    }
+    if (actionExhaustsTo502(upstreamPolicy.action)) {
       finalizeModelInsights(monitor, pathname, modelContext, parsed);
+      const policyErrorBody = buildUpstreamPolicyErrorBody(upstreamPolicy, requestTracking);
+      throwIfTotalDeadlineExpired("upstream total deadline expired before policy 502 forwarding");
+      recordUpstreamPolicyOutcome(monitor, upstreamPolicy.trigger, "return_502");
+      recordBlockedResponse(monitor, "non-stream");
+      res.writeHead(502, {
+        "content-type": "application/json; charset=utf-8",
+        "x-codex-retry-gateway-reason": upstreamPolicy.reasonHeader,
+      });
+      markReasoningSampleClientHeadersSent(reasoningSample);
+      markReasoningSampleClientWrite(reasoningSample);
+      res.end(policyErrorBody);
       completeReasoningBehaviorSample({
         runtime,
         sample: reasoningSample,
         structure: structureAccumulator,
         modelContext,
-        finalAction: "upstream_capacity_internal_retry",
-        clientHttpStatus: null,
+        finalAction: `${upstreamPolicy.trigger}_returned_502`,
+        clientHttpStatus: 502,
         matchedCurrentRule: false,
         blockedByGateway: true,
         failureSummary: buildFailureSummary(null, parsed),
       });
-      return { guardRetry: true, retryReason: "upstream_capacity" };
+      return { handled: true };
     }
+    const policyPassThroughBody = requestTracking?.strip_encrypted_reasoning_response
+      ? stripEncryptedContentFromBodyBuffer(bodyBuffer)
+      : bodyBuffer;
+    finalizeModelInsights(monitor, pathname, modelContext, parsed);
+    copyHeadersToClient(upstreamResponse.headers, res);
+    throwIfTotalDeadlineExpired("upstream total deadline expired before policy pass-through forwarding");
+    recordUpstreamPolicyOutcome(monitor, upstreamPolicy.trigger, "pass_through");
+    res.writeHead(upstreamResponse.status);
+    markReasoningSampleClientHeadersSent(reasoningSample);
+    if (policyPassThroughBody.length > 0) {
+      markReasoningSampleClientWrite(reasoningSample);
+    }
+    res.end(policyPassThroughBody);
+    completeReasoningBehaviorSample({
+      runtime,
+      sample: reasoningSample,
+      structure: structureAccumulator,
+      modelContext,
+      finalAction: `${upstreamPolicy.trigger}_passed_through`,
+      clientHttpStatus: upstreamResponse.status,
+      matchedCurrentRule: false,
+      blockedByGateway: false,
+      failureSummary: buildFailureSummary(null, parsed),
+    });
+    return { handled: true };
   }
 
   if (matched) {
@@ -10195,7 +11389,6 @@ async function handleNonStreaming({
       logger(`[match] non-stream path=${pathname} ${ruleMatch.reasonForLog} action=${action} mode=${ruleMatch.mode}`);
     }
     if (shouldIntercept) {
-      recordBlockedResponse(monitor, "non-stream");
       finalizeModelInsights(
         monitor,
         pathname,
@@ -10203,23 +11396,19 @@ async function handleNonStreaming({
         upstreamResponse.status >= 400 ? parsed : null,
       );
       if (canGuardRetry) {
-        completeReasoningBehaviorSample({
-          runtime,
-          sample: reasoningSample,
-          structure: structureAccumulator,
-          modelContext,
-          finalAction: "internal_retry",
-          clientHttpStatus: null,
-          matchedCurrentRule: true,
-          blockedByGateway: true,
-        });
+        throwIfTotalDeadlineExpired("upstream total deadline expired before reasoning retry");
+        recordBlockedResponse(monitor, "non-stream");
         return { guardRetry: true };
       }
       const blockedBody = buildBlockedBody(pathname, ruleMatch.blockedReasoning, config.non_stream_status_code);
+      throwIfTotalDeadlineExpired("upstream total deadline expired before reasoning block forwarding");
+      recordBlockedResponse(monitor, "non-stream");
       res.writeHead(config.non_stream_status_code, {
         "content-type": "application/json; charset=utf-8",
         "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
       });
+      markReasoningSampleClientHeadersSent(reasoningSample);
+      markReasoningSampleClientWrite(reasoningSample);
       res.end(blockedBody);
       completeReasoningBehaviorSample({
         runtime,
@@ -10233,6 +11422,26 @@ async function handleNonStreaming({
       });
       return { handled: true };
     }
+  }
+
+  const finalBody = requestTracking?.strip_encrypted_reasoning_response
+    ? stripEncryptedContentFromBodyBuffer(bodyBuffer)
+    : bodyBuffer;
+  finalizeModelInsights(
+    monitor,
+    pathname,
+    modelContext,
+    upstreamResponse.status >= 400 ? parsed : null,
+  );
+  copyHeadersToClient(upstreamResponse.headers, res);
+  throwIfTotalDeadlineExpired("upstream total deadline expired before non-stream forwarding");
+  res.writeHead(upstreamResponse.status);
+  markReasoningSampleClientHeadersSent(reasoningSample);
+  if (finalBody.length > 0) {
+    markReasoningSampleClientWrite(reasoningSample);
+  }
+  res.end(finalBody);
+  if (matched) {
     completeReasoningBehaviorSample({
       runtime,
       sample: reasoningSample,
@@ -10243,21 +11452,7 @@ async function handleNonStreaming({
       matchedCurrentRule: true,
       blockedByGateway: false,
     });
-  }
-
-  finalizeModelInsights(
-    monitor,
-    pathname,
-    modelContext,
-    upstreamResponse.status >= 400 ? parsed : null,
-  );
-  copyHeadersToClient(upstreamResponse.headers, res);
-  res.writeHead(upstreamResponse.status);
-  const finalBody = requestTracking?.strip_encrypted_reasoning_response
-    ? stripEncryptedContentFromBodyBuffer(bodyBuffer)
-    : bodyBuffer;
-  res.end(finalBody);
-  if (!matched) {
+  } else {
     if (upstreamResponse.status < 400) {
       recordContinuationRecoverySuccess(monitor, requestTracking);
     }
@@ -10288,13 +11483,29 @@ async function handleStreaming({
   upstreamResponse,
   res,
   abortController,
+  latencyGuard,
 }) {
   const streamAction = normalizeStreamAction(config.stream_action);
-  const strict502Mode = streamAction !== STREAM_ACTION_DISCONNECT;
+  const reasoningRulesDisabled =
+    normalizeInterceptRuleMode(config.intercept_rule_mode) === INTERCEPT_RULE_MODE_NONE;
+  const inspectionProtectionEnabled =
+    !reasoningRulesDisabled && config.intercept_streaming !== false;
+  const strict502Mode =
+    !reasoningRulesDisabled && streamAction !== STREAM_ACTION_DISCONNECT;
+  const deferClientForwarding =
+    reasoningRulesDisabled && Boolean(config.latency_guard?.enabled);
+  const parseAsSse = isSseContentType(upstreamResponse.headers.get("content-type"));
   const reader = upstreamResponse.body.getReader();
   const sseState = {
-    decoder: new TextDecoder("utf8"),
-    buffer: "",
+    buffer: Buffer.alloc(0),
+    bom_pending: true,
+    bom_removed_count: 0,
+    discarding_oversized_event: false,
+    oversized_candidate_event_count: 0,
+    oversized_event_count: 0,
+    sse_candidate: parseAsSse,
+    sse_like: parseAsSse,
+    unrecognized_event_count: 0,
   };
 
   let wroteAnyChunk = false;
@@ -10304,6 +11515,19 @@ async function handleStreaming({
   let observedMatchedRule = false;
   let observedOnlyMatchedRule = false;
   const bufferedChunks = [];
+  let bufferedBytes = 0;
+
+  const throwIfTotalDeadlineExpired = (message) => {
+    if (latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
+      throw new Error(message);
+    }
+  };
+
+  const throwIfFirstProgressDeadlineExpired = (message) => {
+    if (latencyGuard?.expireFirstProgressDeadlineIfNeeded()) {
+      throw new Error(message);
+    }
+  };
 
   const finishReasoningSample = (options = {}) => {
     if (sampleRecorded) {
@@ -10323,9 +11547,93 @@ async function handleStreaming({
     });
   };
 
-  if (!strict502Mode) {
+  const handleInspectionLimitExceeded = (inspectionLimitError) => {
+    if (!inspectedRecorded) {
+      recordInspectedResponseForSample(
+        monitor,
+        reasoningSample,
+        observedReasoning,
+        false,
+        "stream",
+      );
+      inspectedRecorded = true;
+    }
+    setRequestTrackingOutcome(requestTracking, "inspected");
+    recordBlockedResponse(monitor, "stream");
+    abortController.abort();
+    reader.cancel().catch(() => {});
+    finalizeModelInsights(monitor, pathname, modelContext);
+    if (!res.headersSent && !wroteAnyChunk) {
+      res.writeHead(502, {
+        "content-type": "application/json; charset=utf-8",
+        "x-codex-retry-gateway-reason": "response-inspection-limit-exceeded",
+      });
+      markReasoningSampleClientHeadersSent(reasoningSample);
+      markReasoningSampleClientWrite(reasoningSample);
+      res.end(
+        buildResponseInspectionLimitBody(
+          pathname,
+          PRE_PROGRESS_BUFFER_LIMIT_BYTES,
+        ),
+      );
+      finishReasoningSample({
+        finalAction: "response_inspection_limit_exceeded",
+        clientHttpStatus: 502,
+        matchedCurrentRule: false,
+        blockedByGateway: true,
+        failureSummary: buildFailureSummary(inspectionLimitError),
+      });
+    } else {
+      res.destroy();
+      finishReasoningSample({
+        finalAction: "response_inspection_limit_disconnected_after_forward",
+        clientHttpStatus: null,
+        matchedCurrentRule: false,
+        blockedByGateway: true,
+        failureSummary: buildFailureSummary(inspectionLimitError),
+      });
+    }
+    return { handled: true };
+  };
+
+  const ensureClientHeaders = (options = {}) => {
+    if (res.headersSent) {
+      throwIfTotalDeadlineExpired("upstream total deadline expired before client forwarding");
+      if (options.enforceFirstProgressDeadline) {
+        throwIfFirstProgressDeadlineExpired(
+          "upstream first progress deadline expired before client forwarding",
+        );
+      }
+      return;
+    }
     copyHeadersToClient(upstreamResponse.headers, res);
+    throwIfTotalDeadlineExpired("upstream total deadline expired before client forwarding");
+    if (options.enforceFirstProgressDeadline) {
+      throwIfFirstProgressDeadlineExpired(
+        "upstream first progress deadline expired before client forwarding",
+      );
+    }
     res.writeHead(upstreamResponse.status);
+    markReasoningSampleClientHeadersSent(reasoningSample);
+  };
+
+  const writeClientChunk = (chunk) => {
+    ensureClientHeaders();
+    wroteAnyChunk = true;
+    markReasoningSampleClientWrite(reasoningSample);
+    res.write(chunk);
+  };
+
+  const flushBufferedChunksToClient = (options = {}) => {
+    ensureClientHeaders(options);
+    for (const chunk of bufferedChunks.splice(0)) {
+      writeClientChunk(chunk);
+    }
+    bufferedBytes = 0;
+  };
+
+  if (!strict502Mode && !deferClientForwarding) {
+    ensureClientHeaders();
   }
 
   while (true) {
@@ -10333,29 +11641,80 @@ async function handleStreaming({
     try {
       readResult = await reader.read();
     } catch (error) {
-      if (isExpectedStreamTermination(error)) {
+      if (requestTracking?.client_disconnect_signal?.aborted) {
         if (!inspectedRecorded) {
-          recordInspectedResponse(monitor, observedReasoning, false, "stream");
+          recordInspectedResponseForSample(
+            monitor,
+            reasoningSample,
+            observedReasoning,
+            observedMatchedRule,
+            "stream",
+          );
+          inspectedRecorded = true;
+        }
+        setRequestTrackingOutcome(requestTracking, "inspected");
+        finalizeModelInsights(monitor, pathname, modelContext);
+        finishReasoningSample({
+          finalAction: "client_disconnected",
+          clientHttpStatus: null,
+          matchedCurrentRule: observedMatchedRule,
+          failureSummary: buildFailureSummary(error),
+        });
+        return;
+      }
+      throwIfTotalDeadlineExpired("upstream total deadline expired before stream error handling");
+      if (latencyGuard?.expireFirstProgressDeadlineIfNeeded()) {
+        throw error;
+      }
+      if (latencyGuard?.timeoutPhase) {
+        throw error;
+      }
+      if (isExpectedStreamTermination(error)) {
+        reasoningSample.upstream_stream_terminated = true;
+        if (!inspectedRecorded) {
+          recordInspectedResponseForSample(
+            monitor,
+            reasoningSample,
+            observedReasoning,
+            observedMatchedRule,
+            "stream",
+          );
           inspectedRecorded = true;
         }
         setRequestTrackingOutcome(requestTracking, "inspected");
         finalizeModelInsights(monitor, pathname, modelContext);
         if (strict502Mode) {
           logger?.(`[stream] upstream terminated before completion path=${pathname} action=status_502`);
+          const terminatedBody = buildGatewayErrorBody("upstream stream terminated before completion");
+          throwIfTotalDeadlineExpired(
+            "upstream total deadline expired during stream termination preparation",
+          );
+          throwIfFirstProgressDeadlineExpired(
+            "upstream first progress deadline expired during stream termination preparation",
+          );
           res.writeHead(502, { "content-type": "application/json; charset=utf-8" });
-          res.end(buildGatewayErrorBody("upstream stream terminated before completion"));
-          reasoningSample.upstream_stream_terminated = true;
+          markReasoningSampleClientHeadersSent(reasoningSample);
+          markReasoningSampleClientWrite(reasoningSample);
+          res.end(terminatedBody);
           finishReasoningSample({
             finalAction: "upstream_stream_terminated",
             clientHttpStatus: 502,
+            matchedCurrentRule: observedMatchedRule,
             failureSummary: buildFailureSummary(error),
           });
         } else {
+          if (bufferedChunks.length > 0) {
+            flushBufferedChunksToClient({
+              enforceFirstProgressDeadline: true,
+            });
+          } else {
+            ensureClientHeaders({ enforceFirstProgressDeadline: true });
+          }
           res.end();
-          reasoningSample.upstream_stream_terminated = true;
           finishReasoningSample({
             finalAction: "upstream_stream_terminated",
             clientHttpStatus: upstreamResponse.status,
+            matchedCurrentRule: observedMatchedRule,
             failureSummary: buildFailureSummary(error),
           });
         }
@@ -10366,6 +11725,36 @@ async function handleStreaming({
 
     const { done, value } = readResult;
     if (done) {
+      if (latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
+        throw new Error("upstream total deadline expired before stream completion");
+      }
+      const finalPayloadAtMs = Date.now();
+      let eofHasMeaningfulProgress = false;
+      for (const payload of flushSsePayloads(sseState)) {
+        applyPayloadModelSignals(modelContext, payload, {
+          fromStream: true,
+          fromFinalResponse: payload?.type === "response.completed",
+        });
+        applyParsedUsageToReasoningSample(reasoningSample, payload);
+        applyStructureSignalsFromPayload(payload, structureAccumulator, { fromStream: true });
+        if (payloadHasVisibleContent(payload)) {
+          markReasoningSampleFirstContent(reasoningSample, finalPayloadAtMs);
+        }
+        if (payloadHasMeaningfulProgress(payload)) {
+          eofHasMeaningfulProgress = true;
+          if (!latencyGuard?.markFirstProgress()) {
+            throw new Error("upstream first progress deadline expired at stream EOF");
+          }
+          markReasoningSampleFirstProgress(reasoningSample, finalPayloadAtMs);
+        }
+        const finalPayloadReasoning = extractReasoningTokens(payload);
+        if (Number.isInteger(finalPayloadReasoning)) {
+          observedReasoning = finalPayloadReasoning;
+        }
+      }
+      if (!eofHasMeaningfulProgress && !latencyGuard?.endFirstProgressWindow()) {
+        throw new Error("upstream first progress deadline expired before stream completion");
+      }
       const finalRuleMatch = buildInterceptRuleMatch(
         config,
         observedReasoning,
@@ -10373,12 +11762,23 @@ async function handleStreaming({
         structureAccumulator,
       );
       applyInterceptExemptionToSample(reasoningSample, finalRuleMatch);
+      throwIfTotalDeadlineExpired("upstream total deadline expired during stream completion");
       if (!inspectedRecorded && finalRuleMatch.matched) {
-        recordInspectedResponse(monitor, observedReasoning, true, "stream");
+        recordInspectedResponseForSample(
+          monitor,
+          reasoningSample,
+          observedReasoning,
+          true,
+          "stream",
+        );
         inspectedRecorded = true;
         setRequestTrackingOutcome(requestTracking, "inspected");
         const shouldIntercept = config.intercept_streaming !== false;
         const canReturnBlockedStatus = strict502Mode;
+        const mustDisconnectAfterForward =
+          shouldIntercept &&
+          streamAction === STREAM_ACTION_DISCONNECT &&
+          (res.headersSent || wroteAnyChunk);
         const canContinuationRecover =
           streamAction === STREAM_ACTION_CONTINUATION_RECOVERY &&
           finalRuleMatch.mode === INTERCEPT_RULE_MODE_REASONING_TOKENS &&
@@ -10393,9 +11793,13 @@ async function handleStreaming({
           !canContinuationRecover &&
           requestTracking?.guardRetryRemaining > 0;
         if (config.log_match) {
-          const action = !shouldIntercept || !canReturnBlockedStatus
+          const action = !shouldIntercept
             ? "observe_only"
-            : canContinuationRecover
+            : mustDisconnectAfterForward
+              ? "disconnect"
+              : !canReturnBlockedStatus
+                ? "observe_only"
+                : canContinuationRecover
               ? `continuation_recovery remaining=${requestTracking.guardRetryRemaining}`
               : canGuardRetry
               ? `internal_retry remaining=${requestTracking.guardRetryRemaining}`
@@ -10410,17 +11814,10 @@ async function handleStreaming({
           finalizeModelInsights(monitor, pathname, modelContext);
           if (canContinuationRecover) {
             appendContinuationRecoveryFoldRound(requestTracking, Buffer.concat(bufferedChunks));
-            recordContinuationRecoveryAttempt(monitor, requestTracking);
             const continuationRequest = buildContinuationRecoveryRequestBody(
               config,
               requestTracking?.continuation_recovery_base_request_json ?? requestTracking?.requestJson,
             );
-            finishReasoningSample({
-              finalAction: "continuation_recovery",
-              clientHttpStatus: null,
-              matchedCurrentRule: true,
-              blockedByGateway: true,
-            });
             return {
               continuationRecovery: true,
               requestBody: continuationRequest.requestBody,
@@ -10428,12 +11825,6 @@ async function handleStreaming({
             };
           }
           if (canGuardRetry) {
-            finishReasoningSample({
-              finalAction: "internal_retry",
-              clientHttpStatus: null,
-              matchedCurrentRule: true,
-              blockedByGateway: true,
-            });
             return { guardRetry: true };
           }
           const blockedBody = buildBlockedBody(
@@ -10441,10 +11832,13 @@ async function handleStreaming({
             finalRuleMatch.blockedReasoning,
             config.non_stream_status_code,
           );
+          throwIfTotalDeadlineExpired("upstream total deadline expired before stream block response");
           res.writeHead(config.non_stream_status_code, {
             "content-type": "application/json; charset=utf-8",
             "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
           });
+          markReasoningSampleClientHeadersSent(reasoningSample);
+          markReasoningSampleClientWrite(reasoningSample);
           res.end(blockedBody);
           finishReasoningSample({
             finalAction: "blocked",
@@ -10454,17 +11848,35 @@ async function handleStreaming({
           });
           return { handled: true };
         }
+        if (mustDisconnectAfterForward) {
+          recordBlockedResponse(monitor, "stream");
+          abortController.abort();
+          reader.cancel().catch(() => {});
+          finalizeModelInsights(monitor, pathname, modelContext);
+          res.destroy();
+          finishReasoningSample({
+            finalAction: "disconnect",
+            clientHttpStatus: null,
+            matchedCurrentRule: true,
+            blockedByGateway: true,
+          });
+          return { handled: true };
+        }
         observedOnlyMatchedRule = true;
       }
       if (!inspectedRecorded) {
-        recordInspectedResponse(monitor, observedReasoning, false, "stream");
+        recordInspectedResponseForSample(
+          monitor,
+          reasoningSample,
+          observedReasoning,
+          observedMatchedRule,
+          "stream",
+        );
         inspectedRecorded = true;
       }
       setRequestTrackingOutcome(requestTracking, "inspected");
       finalizeModelInsights(monitor, pathname, modelContext);
       if (strict502Mode) {
-        copyHeadersToClient(upstreamResponse.headers, res);
-        res.writeHead(upstreamResponse.status);
         const rawFinalBody = buildContinuationRecoveryFoldedBody(
           requestTracking,
           Buffer.concat(bufferedChunks),
@@ -10472,8 +11884,17 @@ async function handleStreaming({
         const finalBody = requestTracking?.strip_encrypted_reasoning_response
           ? stripEncryptedContentFromSseBody(rawFinalBody)
           : rawFinalBody;
+        ensureClientHeaders();
+        if (finalBody.length > 0) {
+          markReasoningSampleClientWrite(reasoningSample);
+        }
         res.end(finalBody);
       } else {
+        if (bufferedChunks.length > 0) {
+          flushBufferedChunksToClient();
+        } else {
+          ensureClientHeaders();
+        }
         res.end();
       }
       if (!observedOnlyMatchedRule && upstreamResponse.status < 400) {
@@ -10489,10 +11910,49 @@ async function handleStreaming({
     }
 
     const nowMs = Date.now();
+    if (latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true })) {
+      throw new Error("upstream total deadline expired before stream chunk processing");
+    }
     const chunkBuffer = Buffer.from(value);
     markReasoningSampleFirstChunk(reasoningSample, nowMs);
     markReasoningSampleFinalChunk(reasoningSample, nowMs);
-    const { reasoning, payloads } = inspectSseChunk(sseState, value);
+    const inspectedChunk = inspectSseChunk(sseState, value);
+    const { reasoning, payloads, oversizedEvent } = inspectedChunk;
+    const inspectionLimitError =
+      oversizedEvent && (sseState.sse_like || inspectedChunk.oversizedSseCandidate)
+      ? createResponseInspectionLimitError(PRE_PROGRESS_BUFFER_LIMIT_BYTES)
+      : null;
+    if (inspectionLimitError) {
+      reasoningSample.failure_summary = buildFailureSummary(inspectionLimitError);
+    }
+    if (inspectionLimitError && inspectionProtectionEnabled) {
+      return handleInspectionLimitExceeded(inspectionLimitError);
+    }
+    throwIfTotalDeadlineExpired("upstream total deadline expired during stream chunk processing");
+    if (latencyGuard?.expireFirstProgressDeadlineIfNeeded()) {
+      throw new Error("upstream first progress deadline expired before stream chunk processing");
+    }
+    const sseDetectionPending =
+      !sseState.sse_like &&
+      sseState.sse_candidate;
+    const chunkContainsOnlyBom =
+      inspectedChunk.bomRemoved &&
+      !sseState.sse_like &&
+      !inspectedChunk.unrecognizedEvent &&
+      payloads.length === 0 &&
+      sseState.buffer.length === 0;
+    let chunkHasMeaningfulProgress =
+      !sseState.sse_like &&
+      !chunkContainsOnlyBom &&
+      (inspectedChunk.unrecognizedEvent || !sseDetectionPending) &&
+      chunkBuffer.length > 0;
+    if (chunkHasMeaningfulProgress) {
+      if (!latencyGuard?.markFirstProgress()) {
+        throw new Error("upstream first progress deadline expired before plain stream progress");
+      }
+      markReasoningSampleFirstContent(reasoningSample, nowMs);
+      markReasoningSampleFirstProgress(reasoningSample, nowMs);
+    }
     for (const payload of payloads) {
       applyPayloadModelSignals(modelContext, payload, {
         fromStream: true,
@@ -10503,23 +11963,37 @@ async function handleStreaming({
       if (payloadHasVisibleContent(payload)) {
         markReasoningSampleFirstContent(reasoningSample, nowMs);
       }
+      if (payloadHasMeaningfulProgress(payload)) {
+        if (!latencyGuard?.markFirstProgress()) {
+          throw new Error("upstream first progress deadline expired before SSE progress");
+        }
+        chunkHasMeaningfulProgress = true;
+        markReasoningSampleFirstProgress(reasoningSample, nowMs);
+      }
     }
     if (Number.isInteger(reasoning)) {
       observedReasoning = reasoning;
     }
     const ruleMatch = buildInterceptRuleMatch(config, reasoning, reasoningSample, structureAccumulator);
     applyInterceptExemptionToSample(reasoningSample, ruleMatch);
+    throwIfTotalDeadlineExpired("upstream total deadline expired during stream inspection");
     if (
       ruleMatch.mode === INTERCEPT_RULE_MODE_REASONING_TOKENS &&
       ruleMatch.matched
     ) {
       if (!inspectedRecorded) {
-        recordInspectedResponse(monitor, reasoning, true, "stream");
+        recordInspectedResponseForSample(
+          monitor,
+          reasoningSample,
+          reasoning,
+          true,
+          "stream",
+        );
         inspectedRecorded = true;
       }
       setRequestTrackingOutcome(requestTracking, "inspected");
       const shouldIntercept = config.intercept_streaming !== false;
-      const canReturnBlockedStatus = strict502Mode || !wroteAnyChunk;
+      const canReturnBlockedStatus = !res.headersSent && !wroteAnyChunk;
       const canContinuationRecover =
         streamAction === STREAM_ACTION_CONTINUATION_RECOVERY &&
         shouldIntercept &&
@@ -10551,8 +12025,7 @@ async function handleStreaming({
         if (strict502Mode) {
           bufferedChunks.push(chunkBuffer);
         } else {
-          wroteAnyChunk = true;
-          res.write(chunkBuffer);
+          writeClientChunk(chunkBuffer, nowMs);
         }
         continue;
       }
@@ -10564,17 +12037,10 @@ async function handleStreaming({
         finalizeModelInsights(monitor, pathname, modelContext);
         if (canContinuationRecover) {
           appendContinuationRecoveryFoldRound(requestTracking, Buffer.concat([...bufferedChunks, chunkBuffer]));
-          recordContinuationRecoveryAttempt(monitor, requestTracking);
           const continuationRequest = buildContinuationRecoveryRequestBody(
             config,
             requestTracking?.continuation_recovery_base_request_json ?? requestTracking?.requestJson,
           );
-          finishReasoningSample({
-            finalAction: "continuation_recovery",
-            clientHttpStatus: null,
-            matchedCurrentRule: true,
-            blockedByGateway: true,
-          });
           return {
             continuationRecovery: true,
             requestBody: continuationRequest.requestBody,
@@ -10582,19 +12048,16 @@ async function handleStreaming({
           };
         }
         if (canGuardRetry) {
-          finishReasoningSample({
-            finalAction: "internal_retry",
-            clientHttpStatus: null,
-            matchedCurrentRule: true,
-            blockedByGateway: true,
-          });
           return { guardRetry: true };
         }
         const blockedBody = buildBlockedBody(pathname, ruleMatch.blockedReasoning, config.non_stream_status_code);
+        throwIfTotalDeadlineExpired("upstream total deadline expired before stream block response");
         res.writeHead(config.non_stream_status_code, {
           "content-type": "application/json; charset=utf-8",
           "x-codex-retry-gateway-reason": "reasoning-guard-triggered",
         });
+        markReasoningSampleClientHeadersSent(reasoningSample);
+        markReasoningSampleClientWrite(reasoningSample);
         res.end(blockedBody);
         finishReasoningSample({
           finalAction: "blocked",
@@ -10619,9 +12082,27 @@ async function handleStreaming({
 
     if (strict502Mode) {
       bufferedChunks.push(chunkBuffer);
+      bufferedBytes += chunkBuffer.length;
+    } else if (deferClientForwarding && !reasoningSample.response_forwarding_started) {
+      const exceedsBufferLimit =
+        bufferedBytes + chunkBuffer.length > PRE_PROGRESS_BUFFER_LIMIT_BYTES;
+      if (exceedsBufferLimit) {
+        if (!chunkHasMeaningfulProgress) {
+          reasoningSample.timeout_response_control_lost = true;
+        }
+        if (bufferedChunks.length > 0) {
+          flushBufferedChunksToClient();
+        }
+        writeClientChunk(chunkBuffer);
+      } else {
+        bufferedChunks.push(chunkBuffer);
+        bufferedBytes += chunkBuffer.length;
+        if (chunkHasMeaningfulProgress) {
+          flushBufferedChunksToClient();
+        }
+      }
     } else {
-      wroteAnyChunk = true;
-      res.write(chunkBuffer);
+      writeClientChunk(chunkBuffer);
     }
   }
 }
@@ -10638,6 +12119,15 @@ async function proxyRequest(runtime, req, res) {
     continuation_recovery_success_recorded: false,
     continuation_recovery_base_request_json: null,
   };
+  const clientDisconnectController = new AbortController();
+  const abortForClientDisconnect = () => {
+    if (!res.writableEnded) {
+      clientDisconnectController.abort();
+    }
+  };
+  req.once("aborted", abortForClientDisconnect);
+  res.once("close", abortForClientDisconnect);
+  requestTracking.client_disconnect_signal = clientDisconnectController.signal;
 
   if (pathname === config.health_path) {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
@@ -10671,19 +12161,44 @@ async function proxyRequest(runtime, req, res) {
   try {
     requestBody = await readRequestBody(req, config.request_body_limit_bytes);
   } catch (error) {
+    const requestBodyLimitExceeded = error?.code === "request_body_limit_exceeded";
+    const clientDisconnected =
+      !requestBodyLimitExceeded &&
+      (
+        requestTracking.client_disconnect_signal?.aborted ||
+        req.aborted ||
+        error?.code === "ECONNRESET"
+      );
+    const bodyBytesRead = Number.isInteger(error?.requestBodyBytesRead)
+      ? Math.max(0, error.requestBodyBytesRead)
+      : null;
     const rejectedSample = buildReasoningBehaviorAttemptSample(runtime, requestTracking, 0, false);
     rejectedSample.request_summary = {
-      body_bytes: config.request_body_limit_bytes,
+      body_bytes: bodyBytesRead,
       body_sha256: null,
       sanitized_headers: sanitizeRequestHeaders(req.headers),
     };
     finalizeReasoningBehaviorSample(rejectedSample, createStructureAccumulator(), {
-      final_action: "request_rejected",
-      client_http_status: Number.isInteger(error?.statusCode) ? error.statusCode : 413,
+      final_action: clientDisconnected
+        ? "client_disconnected"
+        : requestBodyLimitExceeded
+          ? "request_rejected"
+          : "gateway_error",
+      client_http_status: clientDisconnected
+        ? null
+        : Number.isInteger(error?.statusCode)
+          ? error.statusCode
+          : 502,
       failure_summary: buildFailureSummary(error),
       latest_log_seq: runtime.monitor.next_log_seq - 1,
     });
     recordReasoningBehaviorSample(runtime, rejectedSample);
+    runtime.monitor.total_proxy_request_count += 1;
+    if (clientDisconnected) {
+      runtime.monitor.failed_proxy_request_count += 1;
+      setRequestTrackingOutcome(requestTracking, "client_disconnected");
+      return;
+    }
     throw error;
   }
   let requestJson = isJsonContentType(req.headers["content-type"])
@@ -10719,38 +12234,169 @@ async function proxyRequest(runtime, req, res) {
   requestTracking.strip_encrypted_reasoning_response =
     preparedContinuationRequest.autoAddedEncryptedReasoning === true ||
     shouldStripEncryptedContentFromContinuationResponse(config, pathname, shouldInspect, requestJson);
+  requestTracking.total_deadline_at_ms = null;
   let guardRetryAttemptsUsed = 0;
+  let pendingRetryDispatch = null;
+
+  const completePendingRetryDispatch = (pendingRetry) => {
+    if (pendingRetry.kind === "policy") {
+      if (config.log_match) {
+        const logPrefix = pendingRetry.upstreamPolicy.trigger === "capacity"
+          ? "upstream-capacity"
+          : "upstream-429";
+        logger(
+          `[${logPrefix}] non-stream path=${pathname} status=${pendingRetry.reasoningSample.upstream_http_status} action=internal_retry remaining=${pendingRetry.retryRemaining}`,
+        );
+      }
+      recordUpstreamPolicyOutcome(
+        runtime.monitor,
+        pendingRetry.upstreamPolicy.trigger,
+        "retry",
+      );
+      recordBlockedResponse(runtime.monitor, "non-stream");
+      finalizeModelInsights(
+        runtime.monitor,
+        pathname,
+        pendingRetry.modelContext,
+        pendingRetry.errorPayload,
+      );
+    } else if (pendingRetry.kind === "first_progress_timeout") {
+      recordTimeoutOutcome(runtime.monitor, "first_progress", "retry");
+    } else if (pendingRetry.kind === "continuation_recovery") {
+      recordContinuationRecoveryAttempt(runtime.monitor, requestTracking);
+    }
+    completeReasoningBehaviorSample({
+      runtime,
+      sample: pendingRetry.reasoningSample,
+      structure: pendingRetry.structureAccumulator,
+      modelContext: pendingRetry.modelContext,
+      finalAction: pendingRetry.finalAction,
+      clientHttpStatus: null,
+      matchedCurrentRule: pendingRetry.matchedCurrentRule,
+      blockedByGateway: true,
+      failureSummary: pendingRetry.failureSummary,
+      requestFinishedAtMs: pendingRetry.requestFinishedAtMs,
+      latestLogSeq: pendingRetry.latestLogSeq,
+    });
+  };
+
+  const handlePendingRetryTotalTimeout = (pendingRetry) => {
+    handleAttemptLatencyTimeout({
+      runtime,
+      config,
+      monitor: runtime.monitor,
+      pathname,
+      requestTracking,
+      modelContext: pendingRetry.modelContext,
+      reasoningSample: pendingRetry.reasoningSample,
+      structureAccumulator: pendingRetry.structureAccumulator,
+      res,
+      latencyGuard: pendingRetry.latencyGuard,
+      upstreamStatus: pendingRetry.reasoningSample.upstream_http_status,
+      errorPayload: pendingRetry.errorPayload,
+      blockedResponseAlreadyRecorded: pendingRetry.blockedResponseAlreadyRecorded,
+      modelInsightsAlreadyFinalized: pendingRetry.modelInsightsAlreadyFinalized,
+    });
+  };
 
   while (true) {
-    runtime.monitor.total_proxy_request_count += 1;
-    recordActiveProxyRequestStart(runtime.monitor, pathname);
+    const attemptIndex = guardRetryAttemptsUsed + (pendingRetryDispatch ? 1 : 0);
+    let activeProxyRequestStarted = false;
     const abortController = new AbortController();
+    const abortAttemptForClientDisconnect = () => abortController.abort();
+    requestTracking.client_disconnect_signal?.addEventListener(
+      "abort",
+      abortAttemptForClientDisconnect,
+      { once: true },
+    );
+    if (requestTracking.client_disconnect_signal?.aborted) {
+      abortController.abort();
+    }
     const modelContext = createRequestModelContext(localConfigModel, requestJson?.model ?? null);
     const reasoningSample = buildReasoningBehaviorAttemptSample(
       runtime,
       requestTracking,
-      guardRetryAttemptsUsed,
+      attemptIndex,
       requestIsStream,
     );
     const structureAccumulator = createStructureAccumulator();
-    requestTracking.guardRetryRemaining = Math.max(
-      0,
-      Number(config.guard_retry_attempts || 0) - guardRetryAttemptsUsed,
-    );
-    reasoningSample.internal_retry_remaining = requestTracking.guardRetryRemaining;
-    reasoningSample.upstream_fetch_started_at_ms = Date.now();
-    reasoningSample.upstream_fetch_started_at = toIsoStringOrNull(
-      reasoningSample.upstream_fetch_started_at_ms,
-    );
+    let latencyGuard = null;
 
     try {
-      const upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, {
+      const upstreamHeaders = cloneHeadersForUpstream(req.headers);
+      const upstreamFetchStartedAtMs = Date.now();
+      if (
+        pendingRetryDispatch?.latencyGuard.expireTotalDeadlineIfNeeded({
+          overrideExisting: true,
+          nowMs: upstreamFetchStartedAtMs,
+        })
+      ) {
+        const timedOutRetry = pendingRetryDispatch;
+        pendingRetryDispatch = null;
+        handlePendingRetryTotalTimeout(timedOutRetry);
+        return;
+      }
+      if (
+        !Number.isFinite(requestTracking.total_deadline_at_ms) &&
+        shouldInspect &&
+        config.latency_guard?.enabled &&
+        config.latency_guard.total_timeout_ms > 0
+      ) {
+        requestTracking.total_deadline_at_ms =
+          upstreamFetchStartedAtMs + config.latency_guard.total_timeout_ms;
+      }
+      const upstreamResponseOutcomePromise = fetchUpstreamWithRetry(upstreamUrl, {
         method: req.method,
-        headers: cloneHeadersForUpstream(req.headers),
+        headers: upstreamHeaders,
         body: requestBody.length > 0 ? requestBody : undefined,
         signal: abortController.signal,
-      }, logger);
-      reasoningSample.upstream_headers_at_ms = Date.now();
+      }, logger).then(
+        (response) => ({
+          response,
+          error: null,
+          headersAtMs: Date.now(),
+        }),
+        (error) => ({ response: null, error, headersAtMs: null }),
+      );
+      latencyGuard = createAttemptLatencyGuard(
+        shouldInspect ? config : { latency_guard: DEFAULT_CONFIG.latency_guard },
+        requestTracking,
+        abortController,
+        upstreamFetchStartedAtMs,
+      );
+      reasoningSample.upstream_fetch_started_at_ms = upstreamFetchStartedAtMs;
+      reasoningSample.upstream_fetch_started_at = toIsoStringOrNull(
+        upstreamFetchStartedAtMs,
+      );
+      guardRetryAttemptsUsed = attemptIndex;
+      requestTracking.guardRetryRemaining = Math.max(
+        0,
+        Number(config.guard_retry_attempts || 0) - guardRetryAttemptsUsed,
+      );
+      requestTracking.guardRetryAttemptsUsed = guardRetryAttemptsUsed;
+      reasoningSample.internal_retry_remaining = requestTracking.guardRetryRemaining;
+      reasoningSample.retry_budget_remaining = requestTracking.guardRetryRemaining;
+      runtime.monitor.total_proxy_request_count += 1;
+      recordActiveProxyRequestStart(runtime.monitor, pathname);
+      activeProxyRequestStarted = true;
+
+      if (pendingRetryDispatch) {
+        await waitForRetryDispatchTurn();
+        const completedRetry = pendingRetryDispatch;
+        pendingRetryDispatch = null;
+        completePendingRetryDispatch(completedRetry);
+      }
+      const upstreamResponseOutcome = await upstreamResponseOutcomePromise;
+      latencyGuard.expireTotalDeadlineIfNeeded({ overrideExisting: true });
+      latencyGuard.expireFirstProgressDeadlineIfNeeded();
+      if (latencyGuard.timeoutPhase) {
+        throw upstreamResponseOutcome.error || new Error("upstream latency deadline expired after fetch");
+      }
+      if (upstreamResponseOutcome.error) {
+        throw upstreamResponseOutcome.error;
+      }
+      const upstreamResponse = upstreamResponseOutcome.response;
+      reasoningSample.upstream_headers_at_ms = upstreamResponseOutcome.headersAtMs;
       reasoningSample.upstream_headers_at = toIsoStringOrNull(
         reasoningSample.upstream_headers_at_ms,
       );
@@ -10758,8 +12404,11 @@ async function proxyRequest(runtime, req, res) {
 
       const upstreamContentType = upstreamResponse.headers.get("content-type");
       const responseIsStream =
-        isSseContentType(upstreamContentType) ||
-        (requestIsStream && !isJsonContentType(upstreamContentType));
+        upstreamResponse.status < 400 &&
+        (
+          isSseContentType(upstreamContentType) ||
+          (requestIsStream && !isJsonContentType(upstreamContentType))
+        );
 
       if (!shouldInspect) {
         const body = Buffer.from(await upstreamResponse.arrayBuffer());
@@ -10773,6 +12422,10 @@ async function proxyRequest(runtime, req, res) {
             applyPayloadModelSignals(modelContext, parsed, { fromFinalResponse: true });
             applyParsedUsageToReasoningSample(reasoningSample, parsed);
             applyStructureSignalsFromPayload(parsed, structureAccumulator);
+            if (payloadHasMeaningfulProgress(parsed)) {
+              markReasoningSampleFirstProgress(reasoningSample);
+              latencyGuard.markFirstProgress();
+            }
           }
         }
         finalizeModelInsights(
@@ -10785,6 +12438,10 @@ async function proxyRequest(runtime, req, res) {
         );
         copyHeadersToClient(upstreamResponse.headers, res);
         res.writeHead(upstreamResponse.status);
+        markReasoningSampleClientHeadersSent(reasoningSample);
+        if (body.length > 0) {
+          markReasoningSampleClientWrite(reasoningSample);
+        }
         res.end(body);
         recordBypassedProxyRequest(runtime.monitor, pathname);
         setRequestTrackingOutcome(requestTracking, "bypassed");
@@ -10812,6 +12469,7 @@ async function proxyRequest(runtime, req, res) {
             upstreamResponse,
             res,
             abortController,
+            latencyGuard,
           })
         : await handleNonStreaming({
             runtime,
@@ -10825,32 +12483,200 @@ async function proxyRequest(runtime, req, res) {
             structureAccumulator,
             upstreamResponse,
             res,
+            latencyGuard,
           });
+
+      if (
+        handlerResult?.policyRetry &&
+        guardRetryAttemptsUsed < Number(config.guard_retry_attempts || 0)
+      ) {
+        const delayCompleted = await waitForRetryDelay(
+          handlerResult.retryDelayMs,
+          abortController.signal,
+        );
+        if (!delayCompleted) {
+          if (requestTracking.client_disconnect_signal?.aborted) {
+            setRequestTrackingOutcome(requestTracking, "inspected");
+            reasoningSample.retry_trigger = null;
+            finalizeModelInsights(
+              runtime.monitor,
+              pathname,
+              modelContext,
+              handlerResult.errorPayload,
+            );
+            applyModelContextToReasoningSample(reasoningSample, modelContext);
+            finalizeReasoningBehaviorSample(reasoningSample, structureAccumulator, {
+              final_action: "client_disconnected",
+              client_http_status: null,
+              failure_summary: buildFailureSummary(
+                new Error("client disconnected during retry wait"),
+              ),
+              latest_log_seq: runtime.monitor.next_log_seq - 1,
+            });
+            recordReasoningBehaviorSample(runtime, reasoningSample);
+            return;
+          }
+          if (latencyGuard.timeoutPhase) {
+            handleAttemptLatencyTimeout({
+              runtime,
+              config,
+              monitor: runtime.monitor,
+              pathname,
+              requestTracking,
+              modelContext,
+              reasoningSample,
+              structureAccumulator,
+              res,
+              latencyGuard,
+              upstreamStatus: reasoningSample.upstream_http_status,
+              errorPayload: handlerResult.errorPayload,
+            });
+            return;
+          }
+          throw new Error("upstream policy retry wait aborted");
+        }
+        if (latencyGuard.expireTotalDeadlineIfNeeded()) {
+          handleAttemptLatencyTimeout({
+            runtime,
+            config,
+            monitor: runtime.monitor,
+            pathname,
+            requestTracking,
+            modelContext,
+            reasoningSample,
+            structureAccumulator,
+            res,
+            latencyGuard,
+            upstreamStatus: reasoningSample.upstream_http_status,
+            errorPayload: handlerResult.errorPayload,
+          });
+          return;
+        }
+        pendingRetryDispatch = {
+          kind: "policy",
+          finalAction: `${handlerResult.upstreamPolicy.trigger}_internal_retry`,
+          matchedCurrentRule: false,
+          failureSummary: buildFailureSummary(null, handlerResult.errorPayload),
+          requestFinishedAtMs: Date.now(),
+          latestLogSeq: runtime.monitor.next_log_seq - 1,
+          blockedResponseAlreadyRecorded: false,
+          modelInsightsAlreadyFinalized: false,
+          upstreamPolicy: handlerResult.upstreamPolicy,
+          errorPayload: handlerResult.errorPayload,
+          retryRemaining: requestTracking.guardRetryRemaining,
+          latencyGuard,
+          modelContext,
+          reasoningSample,
+          structureAccumulator,
+        };
+        continue;
+      }
 
       if (
         handlerResult?.continuationRecovery &&
         guardRetryAttemptsUsed < Number(config.guard_retry_attempts || 0)
       ) {
         requestTracking.continuation_recovery_attempted = true;
-        guardRetryAttemptsUsed += 1;
         requestBody = handlerResult.requestBody;
         requestJson = handlerResult.requestJson;
         requestTracking.requestJson = requestJson;
         requestTracking.strip_encrypted_reasoning_response = true;
+        pendingRetryDispatch = {
+          kind: "continuation_recovery",
+          finalAction: "continuation_recovery",
+          matchedCurrentRule: true,
+          failureSummary: null,
+          requestFinishedAtMs: Date.now(),
+          latestLogSeq: runtime.monitor.next_log_seq - 1,
+          blockedResponseAlreadyRecorded: true,
+          modelInsightsAlreadyFinalized: true,
+          latencyGuard,
+          modelContext,
+          reasoningSample,
+          structureAccumulator,
+        };
         continue;
       }
 
       if (handlerResult?.guardRetry && guardRetryAttemptsUsed < Number(config.guard_retry_attempts || 0)) {
-        guardRetryAttemptsUsed += 1;
+        pendingRetryDispatch = {
+          kind: "reasoning_guard",
+          finalAction: "internal_retry",
+          matchedCurrentRule: true,
+          failureSummary: null,
+          requestFinishedAtMs: Date.now(),
+          latestLogSeq: runtime.monitor.next_log_seq - 1,
+          blockedResponseAlreadyRecorded: true,
+          modelInsightsAlreadyFinalized: true,
+          latencyGuard,
+          modelContext,
+          reasoningSample,
+          structureAccumulator,
+        };
         continue;
       }
       return;
     } catch (error) {
+      if (requestTracking.client_disconnect_signal?.aborted) {
+        runtime.monitor.failed_proxy_request_count += 1;
+        setRequestTrackingOutcome(requestTracking, "client_disconnected");
+        applyModelContextToReasoningSample(reasoningSample, modelContext);
+        finalizeReasoningBehaviorSample(reasoningSample, structureAccumulator, {
+          final_action: "client_disconnected",
+          client_http_status: null,
+          failure_summary: buildFailureSummary(error),
+          latest_log_seq: runtime.monitor.next_log_seq - 1,
+        });
+        recordReasoningBehaviorSample(runtime, reasoningSample);
+        return;
+      }
+      latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true });
+      latencyGuard?.expireFirstProgressDeadlineIfNeeded();
+      if (latencyGuard?.timeoutPhase) {
+        const timeoutResult = handleAttemptLatencyTimeout({
+          runtime,
+          config,
+          monitor: runtime.monitor,
+          pathname,
+          requestTracking,
+          modelContext,
+          reasoningSample,
+          structureAccumulator,
+          res,
+          latencyGuard,
+          upstreamStatus: reasoningSample.upstream_http_status,
+        });
+        if (
+          timeoutResult?.timeoutRetry &&
+          guardRetryAttemptsUsed < Number(config.guard_retry_attempts || 0)
+        ) {
+          pendingRetryDispatch = {
+            kind: "first_progress_timeout",
+            finalAction: "first_progress_timeout_internal_retry",
+            matchedCurrentRule: Boolean(reasoningSample.matched_current_rule),
+            failureSummary: timeoutResult.failureSummary,
+            requestFinishedAtMs: Date.now(),
+            latestLogSeq: runtime.monitor.next_log_seq - 1,
+            blockedResponseAlreadyRecorded: true,
+            modelInsightsAlreadyFinalized: true,
+            latencyGuard,
+            modelContext,
+            reasoningSample,
+            structureAccumulator,
+          };
+          continue;
+        }
+        return;
+      }
       const failureAction = isRetryableUpstreamFetchError(error)
         ? "upstream_fetch_failed"
         : error?.code === "request_body_limit_exceeded"
           ? "request_rejected"
           : "gateway_error";
+      if (!inspectedReasoningSamples.has(reasoningSample)) {
+        runtime.monitor.failed_proxy_request_count += 1;
+        setRequestTrackingOutcome(requestTracking, "failed");
+      }
       applyModelContextToReasoningSample(reasoningSample, modelContext);
       finalizeReasoningBehaviorSample(reasoningSample, structureAccumulator, {
         final_action: failureAction,
@@ -10865,7 +12691,14 @@ async function proxyRequest(runtime, req, res) {
       recordReasoningBehaviorSample(runtime, reasoningSample);
       throw error;
     } finally {
-      recordActiveProxyRequestEnd(runtime.monitor, pathname);
+      latencyGuard?.clear();
+      requestTracking.client_disconnect_signal?.removeEventListener(
+        "abort",
+        abortAttemptForClientDisconnect,
+      );
+      if (activeProxyRequestStarted) {
+        recordActiveProxyRequestEnd(runtime.monitor, pathname);
+      }
     }
   }
 }
