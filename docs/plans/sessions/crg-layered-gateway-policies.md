@@ -361,10 +361,10 @@ post_implementation_review:
   review_scope: whole-source
   owner_requested_scope: all-source
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
-  implementation_snapshot_ref: pending-round-9-source-snapshot
-  last_mutation_ref: working-tree:round-9-review-remediation
+  implementation_snapshot_ref: git:966ea2c50c764cce9af1bbc59fcba21be5a8d42f
+  last_mutation_ref: git:966ea2c50c764cce9af1bbc59fcba21be5a8d42f
   review_after_last_mutation: false
-  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..working-tree
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..966ea2c50c764cce9af1bbc59fcba21be5a8d42f
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
   returned_agent_count: 0
@@ -453,7 +453,7 @@ post_implementation_review:
     - stream header copy is followed by a final total gate immediately before writeHead
     - model insights are idempotent per attempt model context
     - lifecycle evidence proves gateway processing before the deadline with first_stream_chunk_at_ms
-  completion_status: review-fix-batch-9-full-local-verification-passed-awaiting-source-snapshot
+  completion_status: review-fix-batch-9-full-local-verification-passed-awaiting-original-reviewer-rereview
   parent_resolution:
     status: blocked
     reason: round-9-fixes-verified-awaiting-stable-source-snapshot-and-original-reviewer-rereview
@@ -499,6 +499,7 @@ implementation_commit_refs:
   - git:f789066c685e565fe57cc4292ce346f2d898f9a4
   - git:c1cb042be9ba7938bef9b7983f71b0e5108eadcb
   - git:06067bd1f52243c18aa0e6d2791152de08b09685
+  - git:966ea2c50c764cce9af1bbc59fcba21be5a8d42f
 ```
 
 ## Stop Gates
@@ -620,7 +621,7 @@ review_fix_batch_9_green_evidence:
   - model insights increment exactly once per attempt
   - gateway first_stream_chunk_at_ms proves a lifecycle chunk was processed before timeout
   - gateway E2E stability replay 3/3, three lifecycle E2E suites, syntax, AST, diff and process audit all pass
-full_verification_status: review-fix-batch-9-full-local-verification-passed-awaiting-source-snapshot
+full_verification_status: review-fix-batch-9-full-local-verification-passed-awaiting-original-reviewer-rereview
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
