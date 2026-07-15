@@ -371,6 +371,8 @@ README 写清组合语义、默认值、已透传后的 HTTP 限制和 429 `Retr
 
 第九轮原 reviewer 合并出的 5 个独立 Important 与 1 个证据 Minor 已按 RED/GREEN 关闭：请求级 total 从首次真实 fetch 派发建立，不再因首次 header 准备产生未派发 inspected sample；current first-progress 以同一个 `upstream_fetch_started_at_ms` 为绝对锚点并在 fetch 调用后创建；pending retry 用捕获的派发时间执行唯一最终 total gate；非流式和 EOF 的 first-progress 窗口在语义解析/结构处理后关闭；流式 header copy 后、`writeHead` 前增加最终 total 复核；`finalizeModelInsights()` 按 attempt model context 幂等；lifecycle 反例继续用 gateway 自己的 `first_stream_chunk_at_ms` 证明 deadline 前已处理前序 chunk。对应 RED 分别复现“0 次上游却 inspected+1”、guard-to-fetch 过期派发、JSON/EOF 跨线仍 200、stream header copy 跨线仍 200、模型计数单 attempt +2；GREEN 后 gateway E2E 首轮通过并连续 3 轮稳定复跑，三套生命周期、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程审计全部通过。
 
+第十轮原 reviewer 的 1 个 Important 已按 RED/GREEN 关闭：流式 reader 被识别为预期终止后，先完成模型归档、日志、错误体与可撤回 header 准备，再在不可撤回写出前按 `total -> first-progress` 复核。严格模式错误体构造跨 total 的旧实现会返回普通 `gateway_error` termination 502；`none + latency_guard` 模型归档跨 first-progress 的旧实现会把 lifecycle 以 200 正常结束，两条 RED 同时缺少 timeout outcome。修复后分别返回稳定 total/first-progress 502，样本保留 `upstream_stream_terminated=true` 并落正确 `timeout_phase/final_action`；既有 500ms 内正常前导断流仍透传 200。同步把会与 45ms 剩余 timer 碰撞的 lifecycle fixture 移到独立 150ms bucket，并用 24 个 lifecycle 事件证明 deadline 两侧均有真实 chunk。gateway E2E 首轮通过、连续 3 轮稳定复跑通过，最终遥测断言补强后再次通过；三套生命周期、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程审计通过，等待新源码快照后的双 reviewer 复审。
+
 - [x] **Step 2：执行完整本地验证**
 
 ```powershell

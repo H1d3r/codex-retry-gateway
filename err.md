@@ -1645,6 +1645,23 @@
      - lifecycle 样本必须满足 `first_stream_chunk_at_ms - upstream_fetch_started_at_ms < first_progress_timeout_ms`，并最终按 first-progress timeout 收口。
      - 2026-07-15 gateway E2E 首轮 GREEN 并连续 3/3 稳定复跑；三套生命周期 E2E、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留全部 PASS。
 
+50. 预期流终止的同步收尾仍必须服从最终 deadline，故障 timer 区间必须按实际剩余时间隔离
+   - 现象：
+     - `reader.read()` 在 deadline 前抛出 `TypeError("terminated")` 后，首次 total/first-progress 检查通过；模型归档、日志或错误体构造同步跨线时，strict 模式仍返回普通 `gateway_error` termination 502。
+     - `none + latency_guard` 在首 progress 前收到 lifecycle 并随后断流；模型归档同步跨过 first-progress 后，旧代码仍 flush 前导块并以 200 正常结束，样本 `timeout_phase=null`。
+     - 原 47ms lifecycle 反例偶发在 guard 建立时只剩约 45ms，与前一个已消费的 timer fault bucket 碰撞；timer 抢先触发后，上游没有形成 deadline 后 chunk，测试会非确定性失败。
+   - 根因：
+     - expected-termination 分支只在同步终态准备前复核 deadline；strict 分支直接 `writeHead(502)`，非 strict header helper 只最终复核 total，没有最终复核 first-progress。
+     - timer fault 按配置阈值设计相邻区间，但真实 guard timer 使用 `deadline - Date.now()` 的剩余时间，创建开销会把 47ms 压入 45ms 区间。
+   - 处理：
+     - reader 终止事实先写入 `upstream_stream_terminated`；模型归档、日志和错误体保持可撤回，strict 写头前按 `total -> first-progress` 最终复核。
+     - 非 strict 只在 expected-termination flush 路径启用 first-progress 最终 gate；可撤回 header copy 后、`writeHead` 前复核，避免影响普通流式首写。
+     - lifecycle 故障注入改用独立 `120..150ms` 剩余 timer bucket、150ms 阈值和 24 个 lifecycle 事件，避开既有 45/47/70/200ms 区间。
+   - 防回归：
+     - 错误体构造阻塞 100ms 必须把 strict termination 收成 `upstream_total_timeout` 502；指定模型归档阻塞 100ms 必须把 lifecycle-only termination 收成 `upstream_first_progress_timeout` 502。
+     - 两条 timeout 样本必须保留 `upstream_stream_terminated=true`，并分别落 `total_timeout_returned_502` 与 `first_progress_timeout_returned_502`；500ms 内正常前导断流仍为 200。
+     - 2026-07-15 Codex bundled Node gateway E2E 首轮 GREEN、连续 3/3 稳定复跑 GREEN，最终遥测断言补强后再次 GREEN；install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留均通过。
+
 ### 2026-06-26 实测证据
 
 - 假上游 E2E

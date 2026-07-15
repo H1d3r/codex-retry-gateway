@@ -215,6 +215,8 @@ tdd:
   green_evidence_ref: Task1 2026-07-14 node scripts/test-gateway-e2e.mjs => PASS codex-retry-gateway e2e; node scripts/test-install-restore.mjs => PASS install-restore flow; Task2 node scripts/test-gateway-e2e.mjs => PASS with direct-stream timing, encrypted content preservation and first-progress telemetry; Task3 node scripts/test-gateway-e2e.mjs => PASS with Capacity/429 four-action matrices, Retry-After and shared budget; Task4 node scripts/test-gateway-e2e.mjs => PASS with first-progress/total deadlines, after-forward disconnect, schema v3 metrics and JSON/CSV telemetry, plus install-restore PASS; Task5 node scripts/test-install-restore.mjs、test-launch-ui.mjs、test-launch-ui-unix.mjs => PASS，合法 none/动作/latency 配置保持字节、mtime、PID 不变，PowerShell AST 与 Node syntax 通过; reviewer-fix 2026-07-14 bundled Node gateway E2E => PASS with deadline wait single-sample 502 and strict pre-progress buffer limit; reviewer-round-2 2026-07-15 four sequential E2E PASS with bounded SSE framing, non-SSE progress, upload/Retry-After/observe-only disconnect accounting, canonical config comparison and HasExited cleanup
   reviewer_round_2_red_evidence_ref: 2026-07-15 gateway E2E failed sequentially at Capacity 429 positive Retry-After, late retry timer after total deadline, parser state exceeding 1MiB before discard, and observe-only timeout losing matched_current_rule; mislabeled SSE, mixed newline and oversized protected-event tests were present behind those RED gates
   reviewer_round_2_green_evidence_ref: 2026-07-15 Codex bundled Node four sequential E2E suites PASS with HTTP-status-based Retry-After, wall-clock deadline recheck, byte-bounded mixed-newline SSE framing, content sniffing, dedicated oversized-event 502 and preserved observe-only timeout match
+  reviewer_round_10_red_evidence_ref: 2026-07-15 gateway E2E returned ordinary gateway_error termination 502 after terminal body construction crossed total; with the first assertion temporarily removed, none + latency_guard flushed lifecycle as 200 after model finalization crossed first-progress
+  reviewer_round_10_green_evidence_ref: 2026-07-15 bundled Node gateway E2E initial PASS, stability replay 3/3 PASS, and one final PASS after timeout telemetry assertions; both samples preserve upstream_stream_terminated and record the correct timeout phase/action
   production_edit_before_red: forbidden
   test_files:
     - scripts/test-gateway-e2e.mjs
@@ -242,8 +244,10 @@ agent_lifecycle:
       - 019f6266-bbcd-7870-9e23-2838fd017498 => round-7 REQUEST_CHANGES, Critical=0, Important=3, Minor=2
       - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-8 REQUEST_CHANGES, Critical=0, Important=4, Minor=0
       - 019f6266-bbcd-7870-9e23-2838fd017498 => round-8 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
+      - 019f6266-a7c6-7571-8982-73d9a90d2393 => round-9 REQUEST_CHANGES, Critical=0, Important=1, Minor=0
     idle: []
-    timeout: []
+    timeout:
+      - 019f6266-bbcd-7870-9e23-2838fd017498 => round-9 shutdown without verdict after wait and explicit final-verdict request
     failed: []
   closed_agent_refs:
     - 019f6040-55cb-7dc0-a70d-d8a5c7a03d99
@@ -361,15 +365,16 @@ post_implementation_review:
   review_scope: whole-source
   owner_requested_scope: all-source
   baseline_snapshot_ref: git:b4cac273418377cab380032b633390994507b2d2
-  implementation_snapshot_ref: git:966ea2c50c764cce9af1bbc59fcba21be5a8d42f
-  last_mutation_ref: git:966ea2c50c764cce9af1bbc59fcba21be5a8d42f
+  implementation_snapshot_ref: git:c100c31d73f4ccf20ff387ce71a5008a73ee136d
+  last_mutation_ref: git:c100c31d73f4ccf20ff387ce71a5008a73ee136d
   review_after_last_mutation: false
-  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..966ea2c50c764cce9af1bbc59fcba21be5a8d42f
+  changed_files_ref: git-diff:b4cac273418377cab380032b633390994507b2d2..c100c31d73f4ccf20ff387ce71a5008a73ee136d
   reviewer_input_bundle_ref: docs/plans/sessions/crg-layered-gateway-policies.md+docs/plans/2026-07-14-layered-gateway-policies-design.md+docs/plans/2026-07-14-layered-gateway-policies-implementation.md+git-diff
   required_agent_count: 2
-  returned_agent_count: 0
+  returned_agent_count: 1
   reviewer_output_refs:
-    - none
+    - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-9 REQUEST_CHANGES, Critical=0, Important=1, Minor=0
+    - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-9 shutdown-without-verdict
   historical_reviewer_output_refs:
     - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99 => round-2 REQUEST_CHANGES, Critical=0, Important=5
     - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc => round-2 REQUEST_CHANGES, Critical=0, Important=2
@@ -384,6 +389,7 @@ post_implementation_review:
     - agent:019f6266-a7c6-7571-8982-73d9a90d2393 => round-8 REQUEST_CHANGES, Critical=0, Important=4, Minor=0
     - agent:019f6266-bbcd-7870-9e23-2838fd017498 => round-8 REQUEST_CHANGES, Critical=0, Important=2, Minor=1
   latest_rereview_findings:
+    - expected stream termination can cross total or first-progress deadline during synchronous terminal preparation and still write an ordinary termination 502 or flush a 200 response
     - initial total deadline starts before the first real fetch and can persist an undispatched inspected sample
     - current first-progress deadline starts before the real fetch and can expire in the remaining pre-dispatch window
     - non-stream and stream-EOF paths close first-progress before semantic parsing and structure work complete
@@ -453,10 +459,12 @@ post_implementation_review:
     - stream header copy is followed by a final total gate immediately before writeHead
     - model insights are idempotent per attempt model context
     - lifecycle evidence proves gateway processing before the deadline with first_stream_chunk_at_ms
-  completion_status: review-fix-batch-9-full-local-verification-passed-awaiting-original-reviewer-rereview
+    - expected stream termination preserves its fact but rechecks total then first-progress after synchronous terminal preparation and before irreversible forwarding
+    - the lifecycle delayed-timer regression uses a disjoint 150ms bucket based on actual remaining timer values
+  completion_status: review-fix-batch-10-source-snapshot-ready-awaiting-two-reviewers
   parent_resolution:
     status: blocked
-    reason: round-9-fixes-verified-awaiting-stable-source-snapshot-and-original-reviewer-rereview
+    reason: round-10-source-snapshot-c100c31-ready-awaiting-two-fresh-reviewer-verdicts
   implementation_freeze_status: active
   allowed_ops:
     - local-review
@@ -621,7 +629,20 @@ review_fix_batch_9_green_evidence:
   - model insights increment exactly once per attempt
   - gateway first_stream_chunk_at_ms proves a lifecycle chunk was processed before timeout
   - gateway E2E stability replay 3/3, three lifecycle E2E suites, syntax, AST, diff and process audit all pass
-full_verification_status: review-fix-batch-9-full-local-verification-passed-awaiting-original-reviewer-rereview
+review_fix_batch_10_red_evidence:
+  - strict expected termination returned gateway_error 502 after its error-body JSON.stringify crossed total deadline
+  - none + latency_guard returned lifecycle 200 after model insight finalization crossed first-progress deadline
+  - both old samples used upstream_stream_terminated with timeout_phase null and no timeout outcome
+  - the existing 47ms lifecycle fixture reproduced a remaining-timer bucket collision before the new regression could run
+review_fix_batch_10_green_evidence:
+  - strict expected termination returns upstream_total_timeout 502 after final total-first-progress gate
+  - none + latency_guard returns upstream_first_progress_timeout 502 instead of flushing lifecycle after deadline
+  - timeout samples preserve upstream_stream_terminated true and use total_timeout_returned_502 or first_progress_timeout_returned_502
+  - ordinary lifecycle-only termination inside a 500ms first-progress window still forwards the buffered lifecycle and upstream headers as 200
+  - delayed lifecycle fixture uses a disjoint 120..150ms timer range and 24 events to prove chunks on both sides of the 150ms deadline
+  - gateway E2E initial GREEN, stability replay 3/3 GREEN, and final telemetry-assertion replay GREEN
+  - install-restore, Windows launch, Unix launch, six JS syntax, three PowerShell AST, full diff check and temporary process audit PASS
+full_verification_status: review-fix-batch-10-source-snapshot-c100c31-ready-awaiting-two-reviewers
 review_refs:
   - agent:019f6040-55cb-7dc0-a70d-d8a5c7a03d99
   - agent:019f6040-69fe-72b0-89c9-d24b9e12b6bc
